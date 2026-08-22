@@ -56,8 +56,12 @@ pub fn top_bar(app: &mut CraApp, ctx: &egui::Context) {
 }
 
 pub fn hotkey_bar(app: &mut CraApp, ctx: &egui::Context) {
-    egui::TopBottomPanel::bottom("hotkey_bar").show(ctx, |ui| {
-        ui.horizontal_wrapped(|ui| {
+    // Fixed height + a non-wrapping row: a wrapped row containing a
+    // right-to-left sub-layout re-measures itself every frame, so the panel
+    // oscillated between one and two rows and the bar flickered on any
+    // repaint — including plain mouse movement.
+    egui::TopBottomPanel::bottom("hotkey_bar").exact_height(24.0).show(ctx, |ui| {
+        ui.horizontal_centered(|ui| {
             let k = theme::kbd;
             match app.screen {
                 Screen::RepoPicker => {
@@ -80,15 +84,15 @@ pub fn hotkey_bar(app: &mut CraApp, ctx: &egui::Context) {
                     k(ui, "Esc", "back");
                 }
                 Screen::Review => {
-                    k(ui, "1/2/3", "pick candidate");
-                    k(ui, "K", "keep original");
+                    k(ui, "1/2/3", "pick");
+                    k(ui, "K", "keep");
                     k(ui, "D", "delete");
-                    k(ui, "E", "edit final");
-                    k(ui, "R", "re-run models");
+                    k(ui, "E", "edit");
+                    k(ui, "R", "re-run");
                     k(ui, "P", "prev");
                     k(ui, "N", "skip");
-                    k(ui, "Ctrl+S", "save + continue");
-                    k(ui, "Ctrl+Enter", "commit + continue");
+                    k(ui, "Ctrl+S", "save");
+                    k(ui, "Ctrl+Enter", "commit");
                     k(ui, "Esc", "files");
                 }
                 Screen::Summary => {
@@ -104,7 +108,7 @@ pub fn hotkey_bar(app: &mut CraApp, ctx: &egui::Context) {
             k(ui, "Ctrl+,", "settings");
             k(ui, "Ctrl+Q", "quit");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(theme::dim(&app.status));
+                ui.add(egui::Label::new(theme::dim(&app.status)).truncate());
             });
         });
     });
