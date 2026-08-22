@@ -167,12 +167,30 @@ pub fn checkout(dir: &str, branch: &str) -> Result<(), String> {
     git(dir, &["checkout", branch]).map(|_| ())
 }
 
+/// Git's well-known empty-tree object. Used as the diff base when a branch
+/// has nothing to be compared against (e.g. the default branch of a brand-new
+/// repo), so the whole history becomes reviewable.
+pub const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
+/// Human-readable name for a diff base, for the UI and session log.
+pub fn base_label(base: &str) -> &str {
+    match base {
+        "" => "HEAD",
+        EMPTY_TREE => "root",
+        other => other,
+    }
+}
+
 /// Diff of `base...HEAD` (merge-base) with generous context. When `base` is
-/// empty, diff the working tree against HEAD instead.
+/// empty, diff the working tree against HEAD instead; when it is
+/// [`EMPTY_TREE`], diff the entire history.
 pub fn review_diff(dir: &str, base: &str, context: usize) -> Result<String, String> {
     let u = format!("-U{context}");
     if base.is_empty() {
         git(dir, &["diff", "--no-color", &u, "HEAD"])
+    } else if base == EMPTY_TREE {
+        // A tree object has no merge base, so use a plain two-point diff.
+        git(dir, &["diff", "--no-color", &u, EMPTY_TREE, "HEAD"])
     } else {
         git(dir, &["diff", "--no-color", &u, &format!("{base}...HEAD")])
     }
