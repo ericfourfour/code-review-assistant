@@ -4,10 +4,67 @@
 
 use serde::Deserialize;
 use std::path::Path;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::process::Command;
 
+/// Build a `Command` that will not flash a console window on Windows. The
+/// app is a windowed (no-console) process, so console-subsystem children
+/// (git, gh, model CLIs) would otherwise each open their own terminal.
+pub fn hidden_command<S: AsRef<std::ffi::OsStr>>(program: S) -> Command {
+    #[cfg(windows)]
+    let program = resolve_program(program.as_ref());
+    #[allow(unused_mut)]
+    let mut cmd = Command::new(program);
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    cmd
+}
+
+/// Look a bare program name up on `PATH` the way `cmd.exe` would.
+///
+/// `Command::new("codex")` only ever appends `.exe`, so npm-style `codex.cmd`
+/// shims fail to spawn with "program not found" even though the CLI is
+/// installed. Resolving to a full path here also lets std recognise a
+/// `.cmd`/`.bat` target and route it through `cmd.exe` with its own quoting.
+#[cfg(windows)]
+fn resolve_program(program: &std::ffi::OsStr) -> std::ffi::OsString {
+    use std::path::{Path, PathBuf};
+
+    // Anything that already carries a directory is used verbatim.
+    let p = Path::new(program);
+    if p.components().count() > 1 {
+        return program.to_os_string();
+    }
+    let Some(path) = std::env::var_os("PATH") else {
+        return program.to_os_string();
+    };
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
+    let exts: Vec<&str> = pathext.split(';').filter(|e| !e.is_empty()).collect();
+    let spelled_out = p.extension().is_some();
+
+    for dir in std::env::split_paths(&path) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        let base = dir.join(program);
+        // An explicit extension wins over PATHEXT, as in cmd.exe.
+        if spelled_out && base.is_file() {
+            return base.into_os_string();
+        }
+        for ext in &exts {
+            let mut cand = base.clone().into_os_string();
+            cand.push(ext);
+            if PathBuf::from(&cand).is_file() {
+                return cand;
+            }
+        }
+    }
+    program.to_os_string()
+}
+
 pub fn run(dir: &str, program: &str, args: &[&str]) -> Result<String, String> {
-    let out = Command::new(program)
+    let out = hidden_command(program)
         .args(args)
         .current_dir(dir)
         .output()
@@ -31,7 +88,7 @@ fn git(dir: &str, args: &[&str]) -> Result<String, String> {
 
 pub fn is_git_repo(path: &str) -> bool {
     Path::new(path).is_dir()
-        && Command::new("git")
+        && hidden_command("git")
             .args(["-C", path, "rev-parse", "--git-dir"])
             .output()
             .map(|o| o.status.success())
