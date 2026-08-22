@@ -3,7 +3,7 @@
 
 use serde::Deserialize;
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use crate::settings::ModelSlot;
@@ -120,7 +120,7 @@ fn run_model(slot: &ModelSlot, prompt: &str, timeout: Duration) -> Result<Sugges
         return Err("empty command template".into());
     }
     let started = Instant::now();
-    let mut cmd = Command::new(&argv[0]);
+    let mut cmd = crate::gitio::hidden_command(&argv[0]);
     cmd.args(&argv[1..])
         .stdin(if via_stdin { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
