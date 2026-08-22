@@ -2,8 +2,17 @@
 name = "code-review-assistant"
 version = "0.1.0"
 edition = "2021"
-description = "A local assistant for reviewing code changes"
+description = "Local GUI for reviewing (AI-generated) code comments one at a time, with model-suggested replacements"
 license = "MIT"
 
 [dependencies]
+eframe = "0.29"
+egui = "0.29"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
+dirs = "5"
 
+[profile.release]
+lto = "thin"
