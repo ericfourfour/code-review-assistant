@@ -90,9 +90,17 @@ impl CraApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         crate::ui::theme::apply(&cc.egui_ctx);
         let db = Db::open().expect("failed to open sqlite database");
+        let mut app = CraApp::with_db(db);
+        app.offer_cwd_repo();
+        app.note("app", "started");
+        app
+    }
+
+    /// Construct without eframe context or environment setup.
+    pub fn with_db(db: Db) -> Self {
         let settings = Settings::load(&db);
         let (tx, rx) = channel();
-        let mut app = CraApp {
+        CraApp {
             db,
             settings,
             screen: Screen::RepoPicker,
@@ -122,16 +130,16 @@ impl CraApp {
             focus_editor: false,
             tx,
             rx,
-        };
-        // Offer the cwd if it's a repo and not already remembered.
+        }
+    }
+
+    fn offer_cwd_repo(&mut self) {
         if let Ok(cwd) = std::env::current_dir() {
             let cwd = cwd.to_string_lossy().to_string();
-            if gitio::is_git_repo(&cwd) && !app.settings.recent_repos.contains(&cwd) {
-                app.settings.recent_repos.push(cwd);
+            if gitio::is_git_repo(&cwd) && !self.settings.recent_repos.contains(&cwd) {
+                self.settings.recent_repos.push(cwd);
             }
         }
-        app.note("app", "started");
-        app
     }
 
     pub fn note(&mut self, kind: &str, msg: &str) {
