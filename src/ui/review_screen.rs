@@ -196,7 +196,7 @@ impl CraApp {
 
         // ---- original vs final ----
         let editor_id = egui::Id::new("final_editor");
-        let action = review::final_action(&self.editor, &self.original_text);
+        let action = review::final_action(&self.editor, &self.original_display);
         let mut keep_clicked = false;
         ui.columns(2, |cols| {
             {
@@ -216,7 +216,7 @@ impl CraApp {
                             .max_height(110.0)
                             .auto_shrink([false, true])
                             .show(ui, |ui| {
-                                ui.label(RichText::new(&self.original_text).monospace());
+                                ui.label(RichText::new(&self.original_display).monospace());
                             });
                     });
             }
@@ -260,7 +260,7 @@ impl CraApp {
             chosen_model.as_ref().map(|(n, c)| (n.as_str(), c.as_str())),
             &self.editor,
             self.candidate_baseline.as_deref(),
-            &self.original_text,
+            &self.original_display,
         );
         ui.horizontal(|ui| {
             ui.label(theme::dim("provenance:"));
