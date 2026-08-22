@@ -208,7 +208,16 @@ impl CraApp {
                 return;
             }
         }
-        let base = if branch == default { String::new() } else { default };
+        let base = if branch != default {
+            default
+        } else if gitio::is_dirty(&path) {
+            // Reviewing the default branch itself: fall back to the working-tree
+            // diff when there are uncommitted changes, else review the whole
+            // history so a brand-new repo still has something to show.
+            String::new()
+        } else {
+            gitio::EMPTY_TREE.to_string()
+        };
         self.build_plan(RefKind::Branch, branch.to_string(), base);
     }
 
@@ -254,13 +263,13 @@ impl CraApp {
             self.ref_error = Some(format!(
                 "no reviewable comment hunks in {} (base: {})",
                 ref_name,
-                if base.is_empty() { "HEAD" } else { &base }
+                gitio::base_label(&base)
             ));
             return;
         }
         let session_id =
             self.db
-                .new_session(&path, &kind.label(), &ref_name, if base.is_empty() { "HEAD" } else { &base });
+                .new_session(&path, &kind.label(), &ref_name, gitio::base_label(&base));
         let n_units: usize = extracted.iter().map(|(_, u)| u.len()).sum();
         let review_files = extracted
             .into_iter()
@@ -274,7 +283,7 @@ impl CraApp {
             session_id,
             ref_kind: kind,
             ref_name,
-            base_ref: if base.is_empty() { "HEAD".into() } else { base },
+            base_ref: gitio::base_label(&base).to_string(),
             files: review_files,
             file_idx: 0,
             unit_idx: 0,
