@@ -26,8 +26,14 @@ fn now() -> String {
 
 impl Db {
     pub fn open() -> Result<Self, String> {
-        let path = db_path();
-        let conn = Connection::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        Self::open_at(&db_path())
+    }
+
+    /// Open a database at an explicit path. The `CRA_DB` env var does the same
+    /// job for a whole process; this exists so a test can have its own file
+    /// without a process-global that would race other tests.
+    pub fn open_at(path: &std::path::Path) -> Result<Self, String> {
+        let conn = Connection::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              CREATE TABLE IF NOT EXISTS settings(
