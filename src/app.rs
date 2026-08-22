@@ -78,7 +78,11 @@ pub struct CraApp {
     pub chosen: Option<Choice>,
     pub editor: String,
     pub candidate_baseline: Option<String>,
+    /// The comment exactly as it sits on disk, indentation included.
     pub original_text: String,
+    /// `original_text` dedented — the baseline the editor is compared against,
+    /// since the editor works in dedented space.
+    pub original_display: String,
     pub review_error: Option<String>,
     pub focus_editor: bool,
 
@@ -126,6 +130,7 @@ impl CraApp {
             editor: String::new(),
             candidate_baseline: None,
             original_text: String::new(),
+            original_display: String::new(),
             review_error: None,
             focus_editor: false,
             tx,
@@ -331,7 +336,10 @@ impl CraApp {
             return;
         };
         self.original_text = unit.raw_lines.join("\n");
-        self.editor = self.original_text.clone();
+        // The editor shows the comment flush left; the unit's indentation is
+        // put back by `reindent` when the edit is written to the file.
+        self.original_display = unit.dedent(&self.original_text);
+        self.editor = self.original_display.clone();
 
         let prompt = comments::build_prompt(&unit);
         let timeout = self.settings.model_timeout_secs;
@@ -367,9 +375,9 @@ impl CraApp {
         let s = s.clone();
         let Some(unit) = self.current_unit() else { return };
         let text = match s.action {
-            Action::Keep => self.original_text.clone(),
+            Action::Keep => self.original_display.clone(),
             Action::Delete => String::new(),
-            Action::Rewrite => unit.format_replacement(&s.comment).join("\n"),
+            Action::Rewrite => unit.dedent(&unit.format_replacement(&s.comment).join("\n")),
         };
         self.editor = text.clone();
         self.candidate_baseline = Some(text);
@@ -379,7 +387,7 @@ impl CraApp {
     }
 
     pub fn choose_keep(&mut self) {
-        self.editor = self.original_text.clone();
+        self.editor = self.original_display.clone();
         self.candidate_baseline = None;
         self.chosen = Some(Choice::KeepOriginal);
         self.note("choice", "keep original");
@@ -398,7 +406,7 @@ impl CraApp {
         let Some(unit) = self.current_unit() else { return };
         let Some(repo_path) = self.repo.as_ref().map(|r| r.path.clone()) else { return };
 
-        let action = review::final_action(&self.editor, &self.original_text);
+        let action = review::final_action(&self.editor, &self.original_display);
         let chosen_model = match &self.chosen {
             Some(Choice::Candidate(i)) => {
                 self.settings.models.get(*i).map(|m| (m.name.clone(), m.coauthor.clone()))
@@ -410,7 +418,7 @@ impl CraApp {
             chosen_model.as_ref().map(|(n, c)| (n.as_str(), c.as_str())),
             &self.editor,
             self.candidate_baseline.as_deref(),
-            &self.original_text,
+            &self.original_display,
         );
         let justification = match &self.chosen {
             Some(Choice::Candidate(i)) => match self.candidates.get(*i) {
@@ -421,13 +429,10 @@ impl CraApp {
         };
 
         // Apply to the working tree when the text changed.
+        let new_lines = unit.reindent(&self.editor);
+        let final_text = new_lines.join("\n");
         let mut delta = 0i64;
-        if action != Action::Keep || self.editor != self.original_text {
-            let new_lines: Vec<String> = if self.editor.trim().is_empty() {
-                Vec::new()
-            } else {
-                self.editor.lines().map(|s| s.to_string()).collect()
-            };
+        if action != Action::Keep {
             let Some(plan) = &self.plan else { return };
             let file = &plan.files[plan.file_idx];
             match review::apply_edit(&repo_path, file, &unit, &new_lines) {
@@ -471,7 +476,7 @@ impl CraApp {
             unit.end_line,
             &self.original_text,
             action.as_str(),
-            &self.editor,
+            &final_text,
             &provenance.source_str(),
             matches!(
                 provenance,

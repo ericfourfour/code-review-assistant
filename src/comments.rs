@@ -74,6 +74,37 @@ pub struct CommentUnit {
 }
 
 impl CommentUnit {
+    /// The unit's text with its own indentation stripped, for display and
+    /// editing. Editing at column 0 keeps the comment readable in a narrow
+    /// pane; [`Self::reindent`] puts the indentation back on the way to disk.
+    /// Relative indentation *inside* the comment is preserved.
+    pub fn dedent(&self, text: &str) -> String {
+        let width = self.indent.chars().count();
+        text.lines()
+            .map(|l| {
+                let strip = l.chars().take(width).take_while(|c| c.is_whitespace()).count();
+                l.chars().skip(strip).collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Inverse of [`Self::dedent`]: raw file lines for dedented editor text.
+    pub fn reindent(&self, text: &str) -> Vec<String> {
+        if text.trim().is_empty() {
+            return Vec::new();
+        }
+        text.lines()
+            .map(|l| {
+                if l.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!("{}{l}", self.indent)
+                }
+            })
+            .collect()
+    }
+
     /// Reformat replacement prose into raw file lines matching the unit's
     /// original style and indentation.
     pub fn format_replacement(&self, prose: &str) -> Vec<String> {
