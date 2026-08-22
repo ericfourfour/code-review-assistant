@@ -34,6 +34,13 @@ pub fn action_color(a: Action) -> Color32 {
 }
 
 pub fn apply(ctx: &egui::Context) {
+    // This palette is dark-only, so pin the theme instead of following the
+    // host. egui keeps a separate style per theme and `set_style` only writes
+    // the one that is active *right now* — at startup the system theme is
+    // still unknown, so on a light-mode desktop our style landed in the dark
+    // slot and the light slot's stock widgets got painted under our dark
+    // frames.
+    ctx.set_theme(egui::ThemePreference::Dark);
     let mut style = (*ctx.style()).clone();
     style.spacing.item_spacing = egui::vec2(6.0, 3.0);
     style.spacing.button_padding = egui::vec2(7.0, 2.0);
@@ -62,7 +69,8 @@ pub fn apply(ctx: &egui::Context) {
     v.selection.bg_fill = Color32::from_rgb(31, 58, 94);
     v.hyperlink_color = ACCENT;
     style.visuals = v;
-    ctx.set_style(style);
+    ctx.set_style_of(egui::Theme::Dark, style.clone());
+    ctx.set_style_of(egui::Theme::Light, style);
 }
 
 /// Small colored tag, e.g. an action badge or model name chip.
