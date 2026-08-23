@@ -69,25 +69,18 @@ fn db_path() -> PathBuf {
 /// `ADD COLUMN IF NOT EXISTS`, and blindly retrying the ALTER would mask real
 /// errors, so ask first.
 fn add_column(conn: &Connection, table: &str, column: &str, decl: &str) {
-    let Ok(mut stmt) = conn.prepare(&format!("PRAGMA table_info({table})")) else {
-        return;
-    };
+    let Ok(mut stmt) = conn.prepare(&format!("PRAGMA table_info({table})")) else { return };
     let existing: Vec<String> = stmt
         .query_map([], |r| r.get::<_, String>(1))
         .map(|rows| rows.flatten().collect())
         .unwrap_or_default();
     if !existing.iter().any(|c| c == column) {
-        let _ = conn.execute(
-            &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
-            [],
-        );
+        let _ = conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"), []);
     }
 }
 
 fn now() -> String {
-    chrono::Local::now()
-        .format("%Y-%m-%d %H:%M:%S%.3f")
-        .to_string()
+    chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string()
 }
 
 impl Db {
@@ -156,6 +149,8 @@ impl Db {
         // review history recorded before evaluation existed stays usable.
         add_column(&conn, "decisions", "unit_json", "TEXT");
         add_column(&conn, "decisions", "blinded", "INTEGER NOT NULL DEFAULT 0");
+        // What the model says it read to reach the verdict, as a JSON array.
+        add_column(&conn, "suggestions", "evidence", "TEXT");
         Ok(Db { conn })
     }
 
@@ -168,11 +163,7 @@ impl Db {
 
     pub fn get_setting(&self, key: &str) -> Option<String> {
         self.conn
-            .query_row(
-                "SELECT value FROM settings WHERE key = ?1",
-                params![key],
-                |r| r.get(0),
-            )
+            .query_row("SELECT value FROM settings WHERE key = ?1", params![key], |r| r.get(0))
             .ok()
     }
 
@@ -205,24 +196,14 @@ impl Db {
         justification: Option<&str>,
         latency_ms: i64,
         error: Option<&str>,
+        evidence: Option<&str>,
     ) {
         let _ = self.conn.execute(
             "INSERT INTO suggestions(ts, session_id, file, line_start, line_end, model,
-                                     action, comment, justification, latency_ms, error)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![
-                now(),
-                session_id,
-                file,
-                line_start,
-                line_end,
-                model,
-                action,
-                comment,
-                justification,
-                latency_ms,
-                error
-            ],
+                                     action, comment, justification, latency_ms, error, evidence)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![now(), session_id, file, line_start, line_end, model, action, comment,
+                    justification, latency_ms, error, evidence],
         );
     }
 
@@ -236,21 +217,9 @@ impl Db {
                                    justification, unit_json, blinded)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
-                now(),
-                d.session_id,
-                d.file,
-                d.line_start,
-                d.line_end,
-                d.original,
-                d.action,
-                d.final_text,
-                d.source,
-                d.human_edited as i64,
-                d.committed as i64,
-                d.commit_sha,
-                d.justification,
-                d.unit_json,
-                d.blinded as i64
+                now(), d.session_id, d.file, d.line_start, d.line_end, d.original, d.action,
+                d.final_text, d.source, d.human_edited as i64, d.committed as i64, d.commit_sha,
+                d.justification, d.unit_json, d.blinded as i64
             ],
         );
         self.conn.last_insert_rowid()

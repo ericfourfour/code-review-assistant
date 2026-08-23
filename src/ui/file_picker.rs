@@ -31,7 +31,7 @@ impl CraApp {
             }
             if let Some(p) = &self.plan {
                 ui.label(theme::dim(&format!(
-                    "{} reviewable comments across {} files on {}",
+                    "{} reviewable units across {} files on {}",
                     p.total_units(),
                     p.files.len(),
                     p.ref_name
@@ -41,26 +41,29 @@ impl CraApp {
         ui.add_space(4.0);
 
         if let Some(plan) = &self.plan {
-            let rows: Vec<(String, usize, usize)> = plan
+            let rows: Vec<(String, usize, usize, usize)> = plan
                 .files
                 .iter()
-                .map(|f| (f.path.clone(), f.units.len(), f.decided))
+                .map(|f| {
+                    let code = f.units.iter().filter(|u| u.is_code()).count();
+                    (f.path.clone(), f.units.len() - code, code, f.decided)
+                })
                 .collect();
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    for (i, (path, units, decided)) in rows.iter().enumerate() {
-                        let text = format!("{path:<70} {units:>3} comments  ({decided} decided)");
-                        let resp = ui
-                            .selectable_label(i == self.file_sel, RichText::new(text).monospace());
-                        if resp.clicked() {
-                            self.file_sel = i;
-                        }
-                        if resp.double_clicked() {
-                            start_at = Some(i);
-                        }
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                for (i, (path, comments, code, decided)) in rows.iter().enumerate() {
+                    let text = format!(
+                        "{path:<70} {comments:>3} comments {code:>3} code  ({decided} decided)"
+                    );
+                    let resp =
+                        ui.selectable_label(i == self.file_sel, RichText::new(text).monospace());
+                    if resp.clicked() {
+                        self.file_sel = i;
                     }
-                });
+                    if resp.double_clicked() {
+                        start_at = Some(i);
+                    }
+                }
+            });
         } else {
             ui.label(theme::dim("no plan — pick a branch or PR first"));
         }

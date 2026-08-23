@@ -55,6 +55,14 @@ fn default_blind_review() -> bool {
     true
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn default_check_timeout() -> u64 {
+    120
+}
+
 /// Known effort settings for a command template, offered as a dropdown.
 /// Free-text like the model field: shortcuts, not a whitelist.
 pub fn effort_presets(command: &str) -> &'static [&'static str] {
@@ -127,6 +135,24 @@ pub struct Settings {
     /// a fixed left-to-right order biases it toward the first slot.
     #[serde(default = "default_blind_review")]
     pub blind_review: bool,
+    /// Review the comment runs the branch touched (the original flow).
+    #[serde(default = "default_true")]
+    pub review_comments: bool,
+    /// Review the code the branch changed — semantic units where the language
+    /// allows, hunk units everywhere else.
+    #[serde(default = "default_true")]
+    pub review_code: bool,
+    /// Validation command run in the repository after each applied edit
+    /// (e.g. `cargo check`, `tsc --noEmit`). Whitespace-tokenized, no shell.
+    /// Empty disables validation. An edit whose check fails is reverted.
+    #[serde(default)]
+    pub check_command: String,
+    #[serde(default = "default_check_timeout")]
+    pub check_timeout_secs: u64,
+    /// Also run the check after comment-only edits. Off by default: a comment
+    /// edit rarely breaks a build, and checks are slow.
+    #[serde(default)]
+    pub validate_comment_edits: bool,
     /// Bumped when a migration step must run exactly once. Absent (0) in rows
     /// written before this field existed.
     #[serde(default)]
@@ -197,6 +223,11 @@ impl Default for Settings {
             context_lines: 12,
             recent_repos: Vec::new(),
             blind_review: default_blind_review(),
+            review_comments: true,
+            review_code: true,
+            check_command: String::new(),
+            check_timeout_secs: default_check_timeout(),
+            validate_comment_edits: false,
             schema_version: SCHEMA_VERSION,
         }
     }

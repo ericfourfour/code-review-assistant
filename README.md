@@ -1,32 +1,23 @@
 # Code Review Assistant
 
 A local, dense, keyboard-first GUI (Rust + [egui](https://github.com/emilk/egui)) that helps a
-human review **AI-generated code comments** one at a time. Models like Claude Opus 5 tend to
-generate comments that restate the code or bury the point; this tool walks you through every
-comment a branch/PR introduced and asks three reviewer models whether each one should be
-**kept, rewritten, or deleted** — then leaves the final call (and the final wording) to you.
+human review **AI-generated changes** one unit at a time — the comments a branch introduced
+*and* the code around them. Models like Claude Opus 5 tend to generate comments that restate
+the code or bury the point, and code that is plausible without being right; this tool walks
+you through every reviewable unit a branch/PR introduced, asks three reviewer models for a
+verdict on each, and leaves the final call (and the final text) to you.
 
-## Installation
+Two kinds of unit share one walk:
 
-Install the latest binary release for your platform:
+- **Comment units** — runs of whole-line comments the diff touched. Verdicts:
+  **keep / rewrite / delete**.
+- **Code units** — clusters of changed code lines. Verdicts: **approve / revise / flag /
+  delete**, where *revise* comes with replacement lines and *flag* is a concern the unit's
+  own lines cannot fix (the justification is the payload; nothing is edited).
 
-### Linux x86_64
-
-```sh
-tmp="$(mktemp)" && curl -fsSL https://github.com/ericfourfour/code-review-assistant/releases/latest/download/code-review-assistant-linux-x86_64 -o "$tmp" && sudo mkdir -p /usr/local/bin && sudo install -m 0755 "$tmp" /usr/local/bin/code-review-assistant && rm -f "$tmp"
-```
-
-### macOS Apple Silicon
-
-```sh
-tmp="$(mktemp)" && curl -fsSL https://github.com/ericfourfour/code-review-assistant/releases/latest/download/code-review-assistant-macos-arm64 -o "$tmp" && sudo mkdir -p /usr/local/bin && sudo install -m 0755 "$tmp" /usr/local/bin/code-review-assistant && rm -f "$tmp"
-```
-
-### Windows x86_64 (PowerShell)
-
-```powershell
-$ErrorActionPreference = 'Stop'; $dir = Join-Path $env:LOCALAPPDATA 'Programs\code-review-assistant'; New-Item -ItemType Directory -Force $dir | Out-Null; Invoke-WebRequest 'https://github.com/ericfourfour/code-review-assistant/releases/latest/download/code-review-assistant-windows-x86_64.exe' -OutFile (Join-Path $dir 'code-review-assistant.exe'); $userPath = [Environment]::GetEnvironmentVariable('Path', 'User'); if (($userPath -split ';') -notcontains $dir) { [Environment]::SetEnvironmentVariable('Path', ("$userPath;$dir").Trim(';'), 'User') }; if (($env:Path -split ';') -notcontains $dir) { $env:Path = "$env:Path;$dir" }
-```
+Either kind can be switched off in Settings; both are on by default. A comment run sitting
+*between* changed code lines is judged with that code rather than separately — units in a
+file stay disjoint and ordered so sequential edits land exactly where they should.
 
 ## Flow
 
@@ -38,16 +29,55 @@ Pick Repository  →  Pick Branch / PR (or working tree)  →  Start or Pick Fil
 2. **Pick branch / PR** — local branches (via `git`) or open PRs (via your authenticated `gh`
    CLI). Selecting one checks it out and diffs it against its base (`base...HEAD`). You can
    also review uncommitted working-tree changes.
-3. **Start or pick file** — every file with reviewable comment hunks is listed with counts;
-   start from the top or jump to a file.
-4. **Review** — one comment at a time:
-   - the surrounding hunk is shown with the comment highlighted, so you know what it describes;
+3. **Start or pick file** — every file with reviewable units is listed with comment and code
+   counts; start from the top or jump to a file.
+4. **Review** — one unit at a time:
+   - the excerpt shows the unit in context: `>` marks the lines under review, `+` other lines
+     the branch added, `-` lines it removed, interleaved where they were removed;
    - three candidates (default: `claude`, `codex`, `agy`/Antigravity — fully customizable)
-     each return **keep / rewrite / delete** plus a one-sentence justification;
-   - pick a candidate (or keep/delete yourself), then edit the final text freely in the text box;
-   - **Save and Continue** (`Ctrl+S`) writes the working tree; **Commit and Continue**
-     (`Ctrl+Enter`) also commits that file with provenance metadata;
+     each return a verdict plus a one-sentence justification and the **evidence** they read;
+   - pick a candidate (or decide yourself), then edit the final text freely in the text box;
+   - **Save and Continue** (`Ctrl+S`) writes the working tree (and runs your validation
+     command, if configured); **Commit and Continue** (`Ctrl+Enter`) also commits that file
+     with provenance metadata;
    - progress bars track the current file and the whole branch.
+
+## Semantic units and hunk units
+
+A code unit's editable region is the tight cluster of changed lines, but its *context* is as
+wide as can be justified. When the language is parsable enough (brace matching for Rust,
+C/C++, JS/TS, JVM languages, Go, Swift, C#, PHP; indentation for Python), the excerpt is the
+**whole enclosing function or class** — a change judged against the definition it actually
+lives in, with the scope named in the unit badge (`code · fn main()`). Everywhere else — 
+unknown extensions, config files, code the heuristics cannot read, scopes over ~240 lines — 
+the excerpt falls back to the surrounding **hunk**, which needs nothing but the diff. Both
+kinds are reviewable; semantic is simply preferred when possible so the context is relevant
+rather than merely nearby.
+
+Scope detection is heuristic on purpose (strings and comments are blanked before brace
+counting; char literals and lifetimes are told apart by lookahead). Anything that defeats it
+degrades to a hunk unit — never to a wrong edit, because every write re-verifies the on-disk
+lines first.
+
+## Seeing what the models read
+
+The models are told to browse the repository before judging, and their JSON verdict includes
+an `evidence` list: the files and line ranges they actually read, with a note on why each
+mattered. Every candidate card shows its evidence as clickable chips — clicking one opens the
+**real file at that spot** (with margin around the named range), not the model's paraphrase of
+it. A model that misreports a path is caught by the same viewer: the failure to open it is
+shown, which is itself worth knowing when weighing the verdict. Evidence is stored alongside
+every suggestion in the database.
+
+## Per-edit validation
+
+Settings takes a **check command** (e.g. `cargo check`, `tsc --noEmit`, `go build ./...`) run
+in the repository after every applied edit, whitespace-tokenized with no shell. If the check
+fails, the edit is **reverted on the spot** and the command's own output is shown — a bad
+model rewrite can never walk the review onto a broken tree. Code edits are always validated
+when a command is set; comment-only edits opt in with their own toggle (they rarely break a
+build, and checks cost time). The check runs synchronously, so pick a fast one; the timeout
+is configurable.
 
 ## Model CLIs
 
@@ -119,11 +149,11 @@ around — it answers from files instead, exactly as claude does — where an un
 *prompt* ends the run with no verdict at all. The git-history question that used to kill the
 slot now comes back answered.
 
-The prompt itself stays short — the file, the surrounding code with the comment marked, a note
-that the repository is readable and the path is relative to its root, and a request for a JSON
-verdict. The models are assumed to already know what a good comment looks like; what they
-cannot know from the hunk is the code around it, so they are given the means to go and look.
-Browsing costs time: the model timeout defaults to 300s.
+The prompt itself stays short — the file, the excerpt with the unit marked, a note that the
+repository is readable and the path is relative to its root, and a request for a JSON verdict
+(with its evidence list). The models are assumed to already know what good comments and good
+code look like; what they cannot know from the excerpt is the code around it, so they are
+given the means to go and look. Browsing costs time: the model timeout defaults to 300s.
 
 ## Commit provenance
 
@@ -131,14 +161,19 @@ Commits made by **Commit and Continue** carry metadata about the app and where t
 text came from:
 
 ```
-review(comments): rewrite comment in src/lib.rs:42
+review(comments): rewrite comment in src/lib.rs:42     (or: review(code): revise code in …)
 
 <model justification, when a candidate was picked>
 
 Reviewed-with: code-review-assistant
-Comment-provenance: claude | claude+human-edited | human-authored
+Comment-provenance: claude | claude+human-edited | human-authored   (code: Change-provenance)
 Co-authored-by: Claude <noreply@anthropic.com>     (when a co-author identity is configured)
 ```
+
+A batch that mixes comment and code decisions commits as `review: N decisions in <file>`,
+with each decision's own verb and justification listed in the body. Flags never commit —
+nothing changed — but they are recorded in the database like any other decision, attributed
+to the model that raised them.
 
 If you edit a picked suggestion, provenance becomes `<model>+human-edited` (co-author kept);
 if you write the comment yourself, it's `human-authored` with no co-author trailer.
@@ -158,7 +193,7 @@ Every action has one; the bottom bar always shows what's live. Highlights:
 | Everywhere | `Ctrl+,` settings · `Ctrl+Q` quit · `Esc` back |
 | Pickers | `↑/↓` select · `Enter` open · `Tab` branches⇄PRs · `W` working tree · `R` refresh |
 | Files | `Enter` start at file · `S` start full review |
-| Review | `1/2/3` pick candidate · `K` keep · `D` delete · `E` edit · `R` re-run models · `P` prev · `N` skip |
+| Review | `1/2/3` pick candidate · `K` keep/approve · `D` delete · `E` edit · `R` re-run models · `P` prev · `N` skip |
 | Continue | `Ctrl+S` save + continue · `Ctrl+Enter` commit + continue |
 
 ## Build & run
@@ -168,22 +203,20 @@ cargo run --release
 ```
 
 Requires `git` on PATH; `gh` (authenticated) for the PR picker; and whichever model CLIs you
-configure. `cargo test` runs the unit tests (diff parsing, comment extraction, provenance,
-edit application, model-output parsing).
+configure. `cargo test` runs the unit tests (diff parsing, comment and code-unit extraction,
+scope detection, provenance, edit application and revert, validation, model-output parsing).
 
-Run the same checks used in pull requests with:
+## Scope notes
 
-```console
-cargo fmt --all --check
-cargo clippy --locked --all-targets --all-features -- -D warnings
-cargo test --locked --all-targets --all-features
-```
-
-## Scope notes (v1)
-
-- Reviewable units are runs of **whole-line** comments (line or block style) that the diff
-  added or touched; trailing comments sharing a line with code are not yet extracted.
-- Language coverage is extension-based (Rust, C/C++, JS/TS, Python, Go, Java/Kotlin, shell,
+- Comment units are runs of **whole-line** comments (line or block style) that the diff added
+  or touched; trailing comments sharing a line with code are not yet extracted. Comment
+  language coverage is extension-based (Rust, C/C++, JS/TS, Python, Go, Java/Kotlin, shell,
   SQL, HTML/XML, and more — see `src/comments.rs`).
+- Code units cover every changed cluster of code, including pure removals (anchored to the
+  line the removal followed, with the removed lines shown in context). Files with unknown
+  extensions still get hunk units — a `.conf` change is still a change.
+- A cross-cutting concern that spans units is what **flag** is for: the concern is recorded
+  and attributed even though no line in the unit moves.
 - Edits apply to the working tree of the checked-out branch; the app verifies the on-disk
-  lines still match the diff before touching a file.
+  lines still match the diff before touching a file, and reverts any edit the configured
+  check command rejects.

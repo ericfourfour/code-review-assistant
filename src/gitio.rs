@@ -470,7 +470,8 @@ mod repo_tests {
             decided: 0,
         };
         let replacement = unit.format_replacement("Counting retries, not requests.");
-        let delta = apply_edit(&repo.path(), &file, unit, &replacement).unwrap();
+        let wrapped = crate::units::ReviewUnit::Comment(unit.clone());
+        let delta = apply_edit(&repo.path(), &file, &wrapped, &replacement).unwrap();
 
         assert_eq!(delta, 0, "one line replaced by one line");
         let after = repo.read("src/lib.rs");
@@ -515,7 +516,8 @@ mod repo_tests {
 
         // Someone edits the file behind our back.
         repo.write("src/lib.rs", "fn main() {\n    counter += 1;\n}\n");
-        let err = apply_edit(&repo.path(), &file, &units[0], &[]).unwrap_err();
+        let wrapped = crate::units::ReviewUnit::Comment(units[0].clone());
+        let err = apply_edit(&repo.path(), &file, &wrapped, &[]).unwrap_err();
         assert!(
             err.contains("mismatch") || err.contains("out of bounds"),
             "should refuse the stale edit, said: {err}"
