@@ -33,76 +33,27 @@ const BUCKETS: &[Bucket] = &[
     Bucket {
         label: "security-sensitive terms",
         points: 15,
-        needles: &[
-            "passw",
-            "secret",
-            "credential",
-            "api_key",
-            "apikey",
-            "private_key",
-            "authent",
-            "authoriz",
-            "permission",
-            "crypt",
-            "certif",
-        ],
+        needles: &["passw", "secret", "credential", "api_key", "apikey", "private_key",
+                   "authent", "authoriz", "permission", "crypt", "certif"],
     },
     Bucket {
         label: "concurrency",
         points: 12,
-        needles: &[
-            "mutex",
-            "rwlock",
-            ".lock(",
-            "atomic",
-            "thread",
-            "spawn",
-            "channel",
-            "semaphore",
-            "concurren",
-            "race ",
-        ],
+        needles: &["mutex", "rwlock", ".lock(", "atomic", "thread", "spawn", "channel",
+                   "semaphore", "concurren", "race "],
     },
     Bucket {
         label: "panics or unsafe code",
         points: 12,
-        needles: &[
-            "unsafe",
-            ".unwrap(",
-            ".expect(",
-            "panic!",
-            "unimplemented!",
-            "todo!",
-            "unreachable!",
-            "assert!",
-            "raise ",
-            "throw ",
-        ],
+        needles: &["unsafe", ".unwrap(", ".expect(", "panic!", "unimplemented!", "todo!",
+                   "unreachable!", "assert!", "raise ", "throw "],
     },
     Bucket {
         label: "external effects",
         points: 10,
-        needles: &[
-            "subprocess",
-            "command",
-            "exec(",
-            "system(",
-            "eval(",
-            "shell",
-            "sql",
-            "query(",
-            "http",
-            "request(",
-            "socket",
-            "std::fs",
-            "os.remove",
-            "unlink",
-            "rmdir",
-            "delete",
-            "truncate",
-            "drop table",
-            "migrat",
-        ],
+        needles: &["subprocess", "command", "exec(", "system(", "eval(", "shell",
+                   "sql", "query(", "http", "request(", "socket", "std::fs", "os.remove",
+                   "unlink", "rmdir", "delete", "truncate", "drop table", "migrat"],
     },
     Bucket {
         label: "unfinished-work markers",
@@ -130,9 +81,7 @@ fn is_test_path(path: &str) -> bool {
 /// the code it describes.
 fn is_doc_path(path: &str) -> bool {
     let p = path.to_ascii_lowercase();
-    [".md", ".markdown", ".rst", ".txt", ".adoc"]
-        .iter()
-        .any(|ext| p.ends_with(ext))
+    [".md", ".markdown", ".rst", ".txt", ".adoc"].iter().any(|ext| p.ends_with(ext))
 }
 
 pub fn assess(unit: &ReviewUnit) -> Risk {
@@ -148,12 +97,7 @@ pub fn assess(unit: &ReviewUnit) -> Risk {
         ReviewUnit::Code(u) => {
             add(&mut score, &mut reasons, 25, "code change".into());
             if u.scope.is_none() {
-                add(
-                    &mut score,
-                    &mut reasons,
-                    8,
-                    "no enclosing scope found".into(),
-                );
+                add(&mut score, &mut reasons, 8, "no enclosing scope found".into());
             }
         }
     }
@@ -164,40 +108,21 @@ pub fn assess(unit: &ReviewUnit) -> Risk {
     };
     let size_pts = (2 * changed as u32).min(20);
     if size_pts > 0 {
-        add(
-            &mut score,
-            &mut reasons,
-            size_pts,
-            format!("{changed} changed line(s)"),
-        );
+        add(&mut score, &mut reasons, size_pts, format!("{changed} changed line(s)"));
     }
 
     // Removed lines appear in the context as `-` rows; deleting code is a
     // classic place for a regression to hide.
-    let removed = unit
-        .context()
-        .lines()
-        .filter(|l| l.starts_with('-'))
-        .count();
+    let removed = unit.context().lines().filter(|l| l.starts_with('-')).count();
     if removed > 0 {
         let pts = (3 * removed as u32).min(12);
-        add(
-            &mut score,
-            &mut reasons,
-            pts,
-            format!("removes {removed} line(s)"),
-        );
+        add(&mut score, &mut reasons, pts, format!("removes {removed} line(s)"));
     }
 
     let haystack = unit.raw_lines().join("\n").to_ascii_lowercase();
     for bucket in BUCKETS {
         if bucket.needles.iter().any(|n| haystack.contains(n)) {
-            add(
-                &mut score,
-                &mut reasons,
-                bucket.points,
-                bucket.label.to_string(),
-            );
+            add(&mut score, &mut reasons, bucket.points, bucket.label.to_string());
         }
     }
 
@@ -209,10 +134,7 @@ pub fn assess(unit: &ReviewUnit) -> Risk {
         reasons.push("halved: test code".into());
     }
 
-    Risk {
-        score: score.min(100),
-        reasons,
-    }
+    Risk { score: score.min(100), reasons }
 }
 
 /// Order units riskiest-first (stable: ties keep their line order), and files
@@ -231,7 +153,7 @@ pub fn order_riskiest_first(files: &mut Vec<(String, Vec<ReviewUnit>)>) {
         .map(|f| (f.1.first().map(|u| assess(u).score).unwrap_or(0), f))
         .collect();
     // Stable, so equally risky files keep their diff order.
-    scored.sort_by_key(|a| std::cmp::Reverse(a.0));
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
     files.extend(scored.into_iter().map(|(_, f)| f));
 }
 
@@ -249,22 +171,14 @@ mod tests {
             end_line: line,
             raw_lines: vec![text.to_string()],
             indent: String::new(),
-            style: CommentStyle::Line {
-                prefix: "//".into(),
-            },
+            style: CommentStyle::Line { prefix: "//".into() },
             context: String::new(),
             hunk_header: String::new(),
             has_added: true,
         })
     }
 
-    fn code(
-        file: &str,
-        line: u32,
-        lines: &[&str],
-        scope: Option<&str>,
-        context: &str,
-    ) -> ReviewUnit {
+    fn code(file: &str, line: u32, lines: &[&str], scope: Option<&str>, context: &str) -> ReviewUnit {
         ReviewUnit::Code(CodeUnit {
             file: file.into(),
             lang: "Rust".into(),
@@ -292,11 +206,7 @@ mod tests {
         ));
         assert!(plain_code.score > plain_comment.score);
         assert!(scary_code.score > plain_code.score);
-        assert!(
-            scary_code.reasons.iter().any(|r| r.contains("unsafe")),
-            "{:?}",
-            scary_code.reasons
-        );
+        assert!(scary_code.reasons.iter().any(|r| r.contains("unsafe")), "{:?}", scary_code.reasons);
         assert!(scary_code.reasons.iter().any(|r| r.contains("concurrency")));
     }
 
@@ -309,22 +219,10 @@ mod tests {
             None,
             ">    5| keep();\n-     | gone();\n",
         ));
-        let without = assess(&code(
-            "src/a.rs",
-            5,
-            &["    keep();"],
-            Some("fn f"),
-            ">    5| keep();\n",
-        ));
+        let without = assess(&code("src/a.rs", 5, &["    keep();"], Some("fn f"), ">    5| keep();\n"));
         assert!(with_removal.score > without.score);
-        assert!(with_removal
-            .reasons
-            .iter()
-            .any(|r| r.contains("removes 1 line")));
-        assert!(with_removal
-            .reasons
-            .iter()
-            .any(|r| r.contains("no enclosing scope")));
+        assert!(with_removal.reasons.iter().any(|r| r.contains("removes 1 line")));
+        assert!(with_removal.reasons.iter().any(|r| r.contains("no enclosing scope")));
     }
 
     #[test]
@@ -334,50 +232,26 @@ mod tests {
         let prose = &["This guards secrets with a mutex; unsafe code panics on TODO."];
         let doc = assess(&code("README.md", 1, prose, None, ""));
         let src = assess(&code("src/vault.rs", 1, prose, None, ""));
-        assert!(
-            doc.score < src.score / 2,
-            "doc {} vs code {}",
-            doc.score,
-            src.score
-        );
-        assert!(
-            doc.reasons.iter().any(|r| r.contains("documentation")),
-            "{:?}",
-            doc.reasons
-        );
+        assert!(doc.score < src.score / 2, "doc {} vs code {}", doc.score, src.score);
+        assert!(doc.reasons.iter().any(|r| r.contains("documentation")), "{:?}", doc.reasons);
     }
 
     #[test]
     fn test_files_are_halved_and_the_score_is_bounded() {
-        let prod = assess(&code(
-            "src/auth.rs",
-            1,
-            &["    check_password(secret);"],
-            Some("fn f"),
-            "",
-        ));
-        let test = assess(&code(
-            "tests/auth.rs",
-            1,
-            &["    check_password(secret);"],
-            Some("fn f"),
-            "",
-        ));
-        assert!(test.score < prod.score);
+        let prod = assess(&code("src/auth.rs", 1, &["    check_password(secret);"], Some("fn f"), ""));
+        let test = assess(&code("tests/auth.rs", 1, &["    check_password(secret);"], Some("fn f"), ""));
+        assert_eq!(test.score, prod.score / 2);
         assert!(test.reasons.iter().any(|r| r.contains("test code")));
 
         let everything = assess(&code(
             "src/kitchen.rs",
             1,
-            &["unsafe passw mutex subprocess todo fixme; "
-                .repeat(30)
-                .as_str()],
+            &["unsafe passw mutex subprocess todo fixme; ".repeat(30).as_str()],
             None,
             &"-     | gone\n".repeat(10),
         ));
         assert!(everything.score <= 100, "{}", everything.score);
     }
-
     #[test]
     fn scores_are_deterministic() {
         let u = code("src/a.rs", 1, &["    spawn(worker);"], Some("fn f"), "");
@@ -389,34 +263,19 @@ mod tests {
         let mut files = vec![
             (
                 "src/mild.rs".to_string(),
-                vec![
-                    comment("src/mild.rs", 2, "// a"),
-                    comment("src/mild.rs", 9, "// b"),
-                ],
+                vec![comment("src/mild.rs", 2, "// a"), comment("src/mild.rs", 9, "// b")],
             ),
             (
                 "src/hot.rs".to_string(),
                 vec![
                     comment("src/hot.rs", 3, "// note"),
-                    code(
-                        "src/hot.rs",
-                        40,
-                        &["    unsafe { go(); }"],
-                        Some("fn f"),
-                        "",
-                    ),
+                    code("src/hot.rs", 40, &["    unsafe { go(); }"], Some("fn f"), ""),
                 ],
             ),
         ];
         order_riskiest_first(&mut files);
-        assert_eq!(
-            files[0].0, "src/hot.rs",
-            "the file with the riskiest unit leads"
-        );
-        assert!(
-            files[0].1[0].is_code(),
-            "within a file, the risky code unit leads"
-        );
+        assert_eq!(files[0].0, "src/hot.rs", "the file with the riskiest unit leads");
+        assert!(files[0].1[0].is_code(), "within a file, the risky code unit leads");
         assert_eq!(files[0].1[1].start_line(), 3);
         // Equal-score units stay in line order, so the tie-break is stable.
         assert_eq!(files[1].1[0].start_line(), 2);
