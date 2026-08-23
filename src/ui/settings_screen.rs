@@ -229,11 +229,52 @@ than the other way round.",
             ui.label(theme::dim("blind review"));
             ui.checkbox(&mut self.settings.blind_review, "hide model names until you choose");
             ui.end_row();
+            ui.label(theme::dim("review"));
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.settings.review_comments, "comments");
+                ui.checkbox(&mut self.settings.review_code, "code");
+            });
+            ui.end_row();
         });
         ui.label(theme::dim(
             "Blind review also shuffles the candidates per comment. Every review is also a \
 labelled example, and knowing which model wrote which suggestion while you choose biases that \
 label — turn it off only if you are not measuring the models against each other.",
+        ));
+        ui.add_space(4.0);
+        ui.label(theme::dim(
+            "Code review walks every changed cluster of code — as the whole enclosing \
+function or class where the language allows, as the surrounding hunk where it does not. \
+Comment runs sitting between changed code lines are judged with that code rather than \
+separately. Turning a kind off here narrows every future session to the other.",
+        ));
+
+        ui.add_space(8.0);
+        theme::section_title(ui, "VALIDATION");
+        egui::Grid::new("check_grid").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
+            ui.label(theme::dim("check command"));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.settings.check_command)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("cargo check   (empty = no validation)")
+                    .font(egui::TextStyle::Monospace),
+            );
+            ui.end_row();
+            ui.label(theme::dim("check timeout (s)"));
+            ui.add(egui::DragValue::new(&mut self.settings.check_timeout_secs).range(5..=1800));
+            ui.end_row();
+            ui.label(theme::dim("comment edits too"));
+            ui.checkbox(
+                &mut self.settings.validate_comment_edits,
+                "also run the check after comment-only edits",
+            );
+            ui.end_row();
+        });
+        ui.label(theme::dim(
+            "Run in the repository after each applied edit, whitespace-tokenized, no shell — \
+the repo's own fast check (cargo check, tsc --noEmit, go build, pytest -x …). An edit whose \
+check fails is reverted on the spot and the failure shown, so a bad model rewrite can never \
+walk the review onto a broken tree. The check runs synchronously: pick a fast one.",
         ));
 
         ui.add_space(10.0);

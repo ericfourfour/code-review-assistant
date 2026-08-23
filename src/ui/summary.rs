@@ -29,7 +29,7 @@ impl CraApp {
                 ui.label(theme::dim("base"));
                 ui.label(RichText::new(&p.base_ref).monospace());
                 ui.end_row();
-                ui.label(theme::dim("comments reviewed"));
+                ui.label(theme::dim("units reviewed"));
                 ui.label(RichText::new(format!("{decided} / {}", p.total_units())).monospace());
                 ui.end_row();
                 ui.label(theme::dim("commits made"));

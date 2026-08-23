@@ -27,7 +27,7 @@ pub fn top_bar(app: &mut CraApp, ctx: &egui::Context) {
                 None => crumb(ui, "branch/PR?", false),
             }
             ui.label(theme::dim("▸"));
-            match app.plan.as_ref().and_then(|p| p.current().map(|(f, u)| (f.path.clone(), u.start_line))) {
+            match app.plan.as_ref().and_then(|p| p.current().map(|(f, u)| (f.path.clone(), u.start_line()))) {
                 Some((f, l)) => crumb(ui, &format!("{f}:{l}"), app.screen == Screen::Review),
                 None => crumb(ui, "file?", false),
             }
@@ -45,7 +45,7 @@ pub fn top_bar(app: &mut CraApp, ctx: &egui::Context) {
                 if let Some(p) = &app.plan {
                     ui.separator();
                     ui.label(theme::dim(&format!(
-                        "{}/{} comments decided",
+                        "{}/{} units decided",
                         p.decided_total,
                         p.total_units()
                     )));

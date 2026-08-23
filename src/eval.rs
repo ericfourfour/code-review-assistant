@@ -15,15 +15,16 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::comments::CommentUnit;
 use crate::db::Db;
 use crate::models::{self, Action};
 use crate::settings::Settings;
+use crate::units::ReviewUnit;
 
-/// One labelled example: a comment, and what the reviewer decided about it.
+/// One labelled example: a unit (comment or code), and what the reviewer
+/// decided about it.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct CorpusEntry {
-    pub unit: CommentUnit,
+    pub unit: ReviewUnit,
     /// keep / rewrite / delete, as the human left it.
     pub action: String,
     /// The text the human settled on (empty for a deletion).
@@ -58,7 +59,7 @@ impl Corpus {
             .corpus(limit)
             .into_iter()
             .filter_map(|row| {
-                let unit: CommentUnit = serde_json::from_str(&row.unit_json).ok()?;
+                let unit: ReviewUnit = serde_json::from_str(&row.unit_json).ok()?;
                 Some(CorpusEntry {
                     unit,
                     action: row.action,
@@ -118,7 +119,7 @@ pub fn replay(
     let mut done = 0;
 
     for (idx, entry) in corpus.entries.iter().enumerate() {
-        let prompt = crate::comments::build_prompt(&entry.unit);
+        let prompt = entry.unit.build_prompt();
         // A corpus outlives the checkout it came from: the repository may have
         // been moved or deleted since, and running the models in a directory
         // that is no longer there would fail every entry. Falling back to no
@@ -366,10 +367,10 @@ impl Report {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::comments::CommentStyle;
+    use crate::comments::{CommentStyle, CommentUnit};
 
-    fn unit(file: &str, line: u32) -> CommentUnit {
-        CommentUnit {
+    fn unit(file: &str, line: u32) -> ReviewUnit {
+        ReviewUnit::Comment(CommentUnit {
             file: file.into(),
             lang: "Rust".into(),
             start_line: line,
@@ -380,7 +381,7 @@ mod tests {
             context: String::new(),
             hunk_header: String::new(),
             has_added: true,
-        }
+        })
     }
 
     fn entry(action: &str, final_text: &str, blinded: bool) -> CorpusEntry {
@@ -438,12 +439,12 @@ mod tests {
         let loaded = Corpus::load(&path).unwrap();
         assert_eq!(loaded.entries.len(), 2);
         assert_eq!(loaded.entries[0].action, "rewrite");
-        assert_eq!(loaded.entries[0].unit.indent, "    ");
+        assert!(!loaded.entries[0].unit.is_code(), "the kind must survive the round trip");
         assert!(loaded.entries[0].blinded);
         assert!(!loaded.entries[1].blinded);
         // The unit has to survive intact, or a replay is not asking the same
         // question the human answered.
-        assert_eq!(loaded.entries[0].unit.raw_lines, vec!["    // a".to_string()]);
+        assert_eq!(loaded.entries[0].unit.raw_lines(), vec!["    // a".to_string()]);
     }
 
     #[test]

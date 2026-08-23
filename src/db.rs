@@ -149,6 +149,8 @@ impl Db {
         // review history recorded before evaluation existed stays usable.
         add_column(&conn, "decisions", "unit_json", "TEXT");
         add_column(&conn, "decisions", "blinded", "INTEGER NOT NULL DEFAULT 0");
+        // What the model says it read to reach the verdict, as a JSON array.
+        add_column(&conn, "suggestions", "evidence", "TEXT");
         Ok(Db { conn })
     }
 
@@ -194,13 +196,14 @@ impl Db {
         justification: Option<&str>,
         latency_ms: i64,
         error: Option<&str>,
+        evidence: Option<&str>,
     ) {
         let _ = self.conn.execute(
             "INSERT INTO suggestions(ts, session_id, file, line_start, line_end, model,
-                                     action, comment, justification, latency_ms, error)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                                     action, comment, justification, latency_ms, error, evidence)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![now(), session_id, file, line_start, line_end, model, action, comment,
-                    justification, latency_ms, error],
+                    justification, latency_ms, error, evidence],
         );
     }
 

@@ -1,7 +1,7 @@
 //! Invoke reviewer model CLIs (claude / codex / agy / anything configured)
 //! on background threads and parse their JSON verdicts.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -13,6 +13,9 @@ pub enum Action {
     Keep,
     Rewrite,
     Delete,
+    /// Code only: something is wrong that a rewrite of the unit's own lines
+    /// cannot fix. The justification is the payload; nothing is edited.
+    Flag,
 }
 
 impl Action {
@@ -21,6 +24,7 @@ impl Action {
             Action::Keep => "KEEP",
             Action::Rewrite => "REWRITE",
             Action::Delete => "DELETE",
+            Action::Flag => "FLAG",
         }
     }
     pub fn as_str(self) -> &'static str {
@@ -28,8 +32,23 @@ impl Action {
             Action::Keep => "keep",
             Action::Rewrite => "rewrite",
             Action::Delete => "delete",
+            Action::Flag => "flag",
         }
     }
+}
+
+/// One place a model says it read on its way to a verdict, so the human can
+/// look at the same code. Self-reported — it is the only cross-CLI channel
+/// there is — which is exactly why the viewer shows the real file at that
+/// spot rather than anything the model wrote.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Evidence {
+    #[serde(default)]
+    pub file: String,
+    #[serde(default)]
+    pub lines: String,
+    #[serde(default)]
+    pub note: String,
 }
 
 #[derive(Clone, Debug)]
@@ -37,6 +56,7 @@ pub struct Suggestion {
     pub action: Action,
     pub comment: String,
     pub justification: String,
+    pub evidence: Vec<Evidence>,
     pub latency_ms: i64,
 }
 
@@ -71,23 +91,47 @@ pub fn transcript_excerpt(raw: &str) -> String {
     format!("{head}\n\n… {} characters elided …\n\n{tail}", total - kept)
 }
 
+/// The answer format both prompts (and every follow-up) ask for. Shared so a
+/// follow-up can never drift from the schema the opening turn promised.
+/// The evidence list is what lets the human see the larger context the model
+/// judged from — which files it went and read, and why they mattered.
+pub fn answer_schema(code: bool) -> &'static str {
+    if code {
+        "Answer with JSON only:\n\
+{\"action\":\"approve|revise|flag|delete\",\
+\"replacement\":\"full replacement for the lines under review if revise, else empty\",\
+\"justification\":\"one or two short sentences — for flag, say exactly what is wrong and where\",\
+\"evidence\":[{\"file\":\"path\",\"lines\":\"12-40\",\"note\":\"what you checked there\"}]}\n\
+In \"evidence\", list the places you actually read to reach this verdict — the reviewer is \
+shown them. Use [] if you judged from the excerpt alone."
+    } else {
+        "Answer with JSON only:\n\
+{\"action\":\"keep|rewrite|delete\",\
+\"comment\":\"replacement text if rewrite, else empty\",\
+\"justification\":\"one short sentence\",\
+\"evidence\":[{\"file\":\"path\",\"lines\":\"12-40\",\"note\":\"what you checked there\"}]}\n\
+In \"evidence\", list the places you actually read to reach this verdict — the reviewer is \
+shown them. Use [] if you judged from the excerpt alone."
+    }
+}
+
 /// The prompt for a follow-up turn. The conversation itself lives in the
 /// CLI's own session, so only the new message and the answer format go over.
-pub fn followup_prompt(message: &str) -> String {
-    format!(
-        "{}\n\nAnswer with JSON only:\n\
-{{\"action\":\"keep|rewrite|delete\",\"comment\":\"replacement text if rewrite, else empty\",\"justification\":\"one short sentence\"}}",
-        message.trim()
-    )
+pub fn followup_prompt(message: &str, code: bool) -> String {
+    format!("{}\n\n{}", message.trim(), answer_schema(code))
 }
 
 #[derive(Deserialize)]
 struct RawSuggestion {
     action: String,
-    #[serde(default)]
+    /// The proposed replacement. Comment prompts call it "comment", code
+    /// prompts "replacement"; either key lands here.
+    #[serde(default, alias = "replacement")]
     comment: String,
     #[serde(default)]
     justification: String,
+    #[serde(default)]
+    evidence: Vec<Evidence>,
 }
 
 /// Message sent back to the UI thread when a model finishes.
@@ -373,16 +417,18 @@ fn run_inner(
     let raw = extract_verdict(&stdout)
         .or_else(|| extract_verdict(&stderr))
         .ok_or_else(|| cli_error(&slot.name, &stdout, &stderr))?;
-    let action = match raw.action.to_ascii_lowercase().as_str() {
-        "keep" => Action::Keep,
-        "rewrite" => Action::Rewrite,
+    let action = match raw.action.trim().to_ascii_lowercase().as_str() {
+        "keep" | "approve" => Action::Keep,
+        "rewrite" | "revise" => Action::Rewrite,
         "delete" | "remove" => Action::Delete,
+        "flag" | "concern" => Action::Flag,
         other => return Err(format!("unknown action {other:?}")),
     };
     Ok(Suggestion {
         action,
         comment: raw.comment,
         justification: raw.justification,
+        evidence: raw.evidence,
         latency_ms,
     })
 }
@@ -431,6 +477,40 @@ mod tests {
         let raw = extract_json(noisy).unwrap();
         assert_eq!(raw.action, "rewrite");
         assert_eq!(raw.comment, "Bump the counter.");
+    }
+
+    #[test]
+    fn a_code_verdict_parses_with_replacement_alias_and_evidence() {
+        let out = "{\"action\":\"revise\",\"replacement\":\"    retry(n - 1);\",\
+\"justification\":\"off by one\",\
+\"evidence\":[{\"file\":\"src/retry.rs\",\"lines\":\"10-30\",\"note\":\"caller counts from 1\"}]}";
+        let raw = extract_json(out).unwrap();
+        assert_eq!(raw.action, "revise");
+        assert_eq!(raw.comment, "    retry(n - 1);", "\"replacement\" must land in comment");
+        assert_eq!(raw.evidence.len(), 1);
+        assert_eq!(raw.evidence[0].file, "src/retry.rs");
+        assert_eq!(raw.evidence[0].lines, "10-30");
+    }
+
+    #[test]
+    fn evidence_objects_inside_the_verdict_do_not_confuse_the_scanner() {
+        // The balanced-object scan must return the verdict, not the first
+        // nested {...} it happens to close.
+        let out = "prose {\"action\":\"flag\",\"justification\":\"races\",\
+\"evidence\":[{\"file\":\"a.rs\"},{\"file\":\"b.rs\"}]} more prose";
+        let raw = extract_json(out).unwrap();
+        assert_eq!(raw.action, "flag");
+        assert_eq!(raw.evidence.len(), 2);
+    }
+
+    #[test]
+    fn the_schemas_stay_paired_with_the_prompts() {
+        assert!(answer_schema(false).contains("keep|rewrite|delete"));
+        assert!(answer_schema(false).contains("\"evidence\""));
+        assert!(answer_schema(true).contains("approve|revise|flag|delete"));
+        assert!(answer_schema(true).contains("\"replacement\""));
+        assert!(followup_prompt("why?", true).contains("approve|revise|flag|delete"));
+        assert!(followup_prompt("why?", false).contains("keep|rewrite|delete"));
     }
 
     #[test]
@@ -615,10 +695,10 @@ deny rule.\"}";
 
     #[test]
     fn followup_prompt_carries_the_message_and_the_format() {
-        let p = followup_prompt("  too wordy — one line?  ");
+        let p = followup_prompt("  too wordy — one line?  ", false);
         assert!(p.starts_with("too wordy — one line?"));
         assert!(p.contains("\"action\""));
-        assert!(p.trim_end().ends_with("}"));
+        assert!(p.contains("keep|rewrite|delete"));
     }
 }
 
@@ -743,7 +823,7 @@ mod spawn_tests {
         slot.resume_command = format!("{} resume {{session}}", second.command());
         let resume = slot.resume_command.replace("{session}", &session);
         let (res2, _) =
-            run_model(&slot, &resume, &followup_prompt("why?"), "", "", Duration::from_secs(30));
+            run_model(&slot, &resume, &followup_prompt("why?", false), "", "", Duration::from_secs(30));
         assert!(res2.is_ok());
         assert!(second.argv_seen().contains("resume sess-42"), "{}", second.argv_seen());
         assert!(second.stdin_seen().contains("why?"), "{}", second.stdin_seen());
@@ -891,6 +971,7 @@ Answer with JSON only:\n\
             let second = followup_prompt(
                 "What was the value of RETRY_LIMIT you found? \
                  Put just that number in \"justification\".",
+                false,
             );
             let (res2, raw2) = run_model(&slot, &resume, &second, &repo_path, &cli_home, timeout);
             match res2 {

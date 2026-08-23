@@ -301,10 +301,13 @@ You are running in the root of the repository this comment lives in, and the \
 path above is relative to it. Read whatever you need before deciding: the rest \
 of the file, what it calls, who calls it, the tests. Judge the comment against \
 the code as it actually is — delete one that only restates the line below it, \
-keep one that carries something the code cannot say for itself.\n\n\
-Answer with JSON only:\n\
-{{\"action\":\"keep|rewrite|delete\",\"comment\":\"replacement text if rewrite, else empty\",\"justification\":\"one short sentence\"}}",
-        unit.file, unit.lang, unit.context, unit.start_line, unit.end_line
+keep one that carries something the code cannot say for itself.\n\n{}",
+        unit.file,
+        unit.lang,
+        unit.context,
+        unit.start_line,
+        unit.end_line,
+        crate::models::answer_schema(false)
     )
 }
 

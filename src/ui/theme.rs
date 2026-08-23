@@ -30,6 +30,7 @@ pub fn action_color(a: Action) -> Color32 {
         Action::Keep => GOOD,
         Action::Rewrite => WARN,
         Action::Delete => BAD,
+        Action::Flag => ACCENT,
     }
 }
 

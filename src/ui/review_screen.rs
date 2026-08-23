@@ -64,19 +64,25 @@ impl CraApp {
         }
 
         // ---- header ----
+        let is_code = unit.is_code();
         ui.horizontal(|ui| {
             ui.label(
-                RichText::new(format!("{}:{}-{}", unit.file, unit.start_line, unit.end_line))
+                RichText::new(format!("{}:{}-{}", unit.file(), unit.start_line(), unit.end_line()))
                     .monospace()
                     .strong(),
             );
-            theme::badge(ui, &unit.lang, theme::ACCENT);
+            theme::badge(ui, unit.lang(), theme::ACCENT);
+            theme::badge(
+                ui,
+                &unit.kind_label(),
+                if is_code { theme::WARN } else { theme::ACCENT },
+            );
             if let Some(p) = &self.plan {
                 let (fi, ft) = p.file_progress();
-                ui.label(theme::dim(&format!("comment {}/{} in file", fi + 1, ft)));
+                ui.label(theme::dim(&format!("unit {}/{} in file", fi + 1, ft)));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(theme::dim(&crate::app::truncate(&unit.hunk_header, 70)));
+                ui.label(theme::dim(&crate::app::truncate(unit.hunk_header(), 70)));
             });
         });
         if let Some(err) = self.review_error.clone() {
@@ -98,16 +104,26 @@ impl CraApp {
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 0.0;
-                        for line in unit.context.lines() {
-                            let marked = line.starts_with('>');
+                        for line in unit.context().lines() {
                             let rt = RichText::new(line).monospace();
-                            if marked {
-                                ui.label(
-                                    rt.background_color(theme::MARK_BG)
-                                        .color(egui::Color32::from_rgb(230, 237, 243)),
-                                );
-                            } else {
-                                ui.label(rt.color(theme::TEXT_DIM));
+                            match line.chars().next() {
+                                Some('>') => {
+                                    ui.label(
+                                        rt.background_color(theme::MARK_BG)
+                                            .color(egui::Color32::from_rgb(230, 237, 243)),
+                                    );
+                                }
+                                // Removed by this change — shown where it was.
+                                Some('-') => {
+                                    ui.label(rt.color(egui::Color32::from_rgb(190, 100, 95)));
+                                }
+                                // Added by this branch, outside this unit.
+                                Some('+') => {
+                                    ui.label(rt.color(egui::Color32::from_rgb(150, 190, 150)));
+                                }
+                                _ => {
+                                    ui.label(rt.color(theme::TEXT_DIM));
+                                }
                             }
                         }
                     });
@@ -120,6 +136,7 @@ impl CraApp {
         let mut pick: Option<usize> = None;
         let mut ask_one: Option<usize> = None;
         let mut show_prompt: Option<usize> = None;
+        let mut evidence_click: Option<crate::models::Evidence> = None;
         let can_ask_slot: Vec<bool> = (0..n_slots).map(|i| self.can_ask(i)).collect();
         let order = self.candidate_order();
         let hidden = self.names_hidden();
@@ -191,13 +208,43 @@ impl CraApp {
                                 .max_height(96.0)
                                 .auto_shrink([false, true])
                                 .show(ui, |ui| {
-                                    let preview = match s.action {
-                                        Action::Keep => "(keep original text)".to_string(),
-                                        Action::Delete => "(delete this comment)".to_string(),
-                                        Action::Rewrite => s.comment.clone(),
+                                    let preview = match (s.action, is_code) {
+                                        (Action::Keep, false) => "(keep original text)".to_string(),
+                                        (Action::Keep, true) => "(approve — sound as written)".to_string(),
+                                        (Action::Delete, false) => "(delete this comment)".to_string(),
+                                        (Action::Delete, true) => "(delete these lines)".to_string(),
+                                        (Action::Flag, _) => "(flagged — no replacement proposed; \
+                                                              the concern above is the verdict)"
+                                            .to_string(),
+                                        (Action::Rewrite, _) => s.comment.clone(),
                                     };
                                     ui.label(RichText::new(preview).monospace());
                                 });
+                            // What the model says it read on the way to this
+                            // verdict — click to see that spot in the real file.
+                            if !s.evidence.is_empty() {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(theme::dim("read:"));
+                                    for ev in &s.evidence {
+                                        let label = if ev.lines.trim().is_empty() {
+                                            ev.file.clone()
+                                        } else {
+                                            format!("{}:{}", ev.file, ev.lines)
+                                        };
+                                        let resp = ui.small_button(
+                                            RichText::new(label).monospace().small(),
+                                        );
+                                        let resp = if ev.note.trim().is_empty() {
+                                            resp
+                                        } else {
+                                            resp.on_hover_text(&ev.note)
+                                        };
+                                        if resp.clicked() {
+                                            evidence_click = Some(ev.clone());
+                                        }
+                                    }
+                                });
+                            }
                             ui.horizontal(|ui| {
                                 if ui
                                     .add(egui::Button::new(
@@ -241,6 +288,9 @@ impl CraApp {
         if let Some(i) = show_prompt {
             self.show_prompt = Some(i);
         }
+        if let Some(ev) = evidence_click {
+            self.show_evidence = Some(ev);
+        }
 
         // ---- follow-up ----
         let mut ask_all = false;
@@ -275,14 +325,15 @@ impl CraApp {
 
         // ---- original vs final ----
         let editor_id = egui::Id::new("final_editor");
-        let action = review::final_action(&self.editor, &self.original_display);
+        let action = self.current_action();
         let mut keep_clicked = false;
         ui.columns(2, |cols| {
             {
                 let ui = &mut cols[0];
                 ui.horizontal(|ui| {
                     theme::section_title(ui, "ORIGINAL");
-                    if ui.small_button("keep [K]").clicked() {
+                    let keep_label = if is_code { "approve as-is [K]" } else { "keep [K]" };
+                    if ui.small_button(keep_label).clicked() {
                         keep_clicked = true;
                     }
                 });
@@ -380,10 +431,10 @@ impl CraApp {
                 return;
             }
             ui.separator();
-            if ui.button("Keep original [K]").clicked() {
+            if ui.button(if is_code { "Approve as-is [K]" } else { "Keep original [K]" }).clicked() {
                 self.choose_keep();
             }
-            if ui.button("Delete [D]").clicked() {
+            if ui.button(if is_code { "Delete lines [D]" } else { "Delete [D]" }).clicked() {
                 self.choose_delete();
             }
             if ui.button("Re-run models [R]").clicked() {
@@ -400,6 +451,75 @@ impl CraApp {
         });
 
         self.prompt_window(ctx);
+        self.evidence_window(ctx);
+    }
+
+    /// Floating viewer for one evidence entry: the real file at the spot a
+    /// model says it read, so the human can weigh the verdict against the
+    /// same context — not the model's paraphrase of it.
+    fn evidence_window(&mut self, ctx: &egui::Context) {
+        let Some(ev) = self.show_evidence.clone() else { return };
+        let mut open = true;
+        egui::Window::new(format!("evidence · {}", ev.file))
+            .id(egui::Id::new("evidence_window"))
+            .open(&mut open)
+            .default_size([760.0, 460.0])
+            .collapsible(false)
+            .show(ctx, |ui| {
+                if !ev.note.trim().is_empty() {
+                    ui.label(RichText::new(format!("“{}”", ev.note.trim())).italics());
+                    ui.separator();
+                }
+                let Some(repo) = self.repo.as_ref().map(|r| r.path.clone()) else {
+                    ui.label(theme::dim("no repository open"));
+                    return;
+                };
+                let path = std::path::Path::new(&repo).join(&ev.file);
+                let content = match std::fs::read_to_string(&path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        // Self-reported paths can be wrong — that is itself
+                        // worth knowing when weighing the verdict.
+                        ui.colored_label(
+                            theme::BAD,
+                            format!("could not read {} — the model may have misreported it ({e})", ev.file),
+                        );
+                        return;
+                    }
+                };
+                let lines: Vec<&str> = content.lines().collect();
+                if lines.is_empty() {
+                    ui.label(theme::dim("(empty file)"));
+                    return;
+                }
+                let (lo, hi) = evidence_range(&ev.lines, lines.len());
+                ui.label(theme::dim(&format!(
+                    "{} — lines {}-{} of {}",
+                    ev.file,
+                    lo + 1,
+                    hi + 1,
+                    lines.len()
+                )));
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    // A margin around the named range keeps it honest: the
+                    // reader sees what surrounds the excerpt the model chose.
+                    let view_lo = lo.saturating_sub(8);
+                    let view_hi = (hi + 8).min(lines.len().saturating_sub(1));
+                    for (i, line) in lines.iter().enumerate().take(view_hi + 1).skip(view_lo) {
+                        let in_range = i >= lo && i <= hi;
+                        let rt = RichText::new(format!("{:>5}| {line}", i + 1)).monospace();
+                        if in_range {
+                            ui.label(rt.background_color(theme::MARK_BG));
+                        } else {
+                            ui.label(rt.color(theme::TEXT_DIM));
+                        }
+                    }
+                });
+            });
+        if !open {
+            self.show_evidence = None;
+        }
     }
 
     /// Floating inspector for exactly what was piped to a model CLI and what
@@ -466,5 +586,39 @@ impl CraApp {
         if !open {
             self.show_prompt = None;
         }
+    }
+}
+
+/// Parse a model-reported line range ("12-40", "12", "L12-L40") into 0-based
+/// inclusive bounds, clamped to the file. Unparsable ranges show the top of
+/// the file rather than nothing — a wrong spot the human can see beats an
+/// error they have to interpret.
+fn evidence_range(spec: &str, len: usize) -> (usize, usize) {
+    let last = len.saturating_sub(1);
+    let parse = |s: &str| s.trim().trim_start_matches(['L', 'l']).parse::<usize>().ok();
+    let spec = spec.trim();
+    let (a, b) = match spec.split_once(['-', ':']) {
+        Some((a, b)) => (parse(a), parse(b)),
+        None => (parse(spec), parse(spec)),
+    };
+    match (a, b) {
+        (Some(a), Some(b)) if a >= 1 => ((a - 1).min(last), (b.max(a) - 1).min(last)),
+        _ => (0, last.min(39)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::evidence_range;
+
+    #[test]
+    fn evidence_ranges_parse_and_clamp() {
+        assert_eq!(evidence_range("12-40", 100), (11, 39));
+        assert_eq!(evidence_range("12", 100), (11, 11));
+        assert_eq!(evidence_range("L12-L40", 100), (11, 39));
+        assert_eq!(evidence_range("40-12", 100), (39, 39), "a backwards range never inverts");
+        assert_eq!(evidence_range("90-200", 100), (89, 99), "clamped to the file");
+        assert_eq!(evidence_range("", 100), (0, 39), "no range shows the top");
+        assert_eq!(evidence_range("garbage", 10), (0, 9));
     }
 }
