@@ -26,7 +26,7 @@ impl CraApp {
 
         theme::section_title(ui, "REVIEWER MODELS");
         ui.label(theme::dim(
-            "A template with no {prompt} token gets the prompt piped on stdin — preferred, since it has no length limit. Use {prompt} only for CLIs that cannot read stdin: as an argument the prompt is capped at ~32k characters, and .cmd shims (npm-installed CLIs) reject multi-line values outright. CLIs must be installed and authenticated.",
+            "A template with no {prompt} token gets the prompt piped on stdin — preferred, since it has no length limit. Use {prompt} only for CLIs that cannot read stdin: as an argument the prompt is capped at ~32k characters, and .cmd shims (npm-installed CLIs) reject multi-line values outright. The resume template continues a conversation and must contain {session}; the session key names the JSON field the CLI reports its session id in, and is left empty for CLIs that accept an id we generate instead. CLIs must be installed and authenticated.",
         ));
         ui.add_space(4.0);
 
@@ -130,6 +130,32 @@ impl CraApp {
                                 .font(egui::TextStyle::Monospace),
                         );
                     });
+                    field(ui, "resume", |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut m.resume_command)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("mycli --resume {session}  (empty = no follow-ups)")
+                                .font(egui::TextStyle::Monospace),
+                        );
+                    });
+                    field(ui, "session key", |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut m.session_key)
+                                .desired_width(200.0)
+                                .hint_text("(we generate the id)")
+                                .font(egui::TextStyle::Monospace),
+                        );
+                        let explain = if m.session_key.trim().is_empty() {
+                            if m.command.contains("{session}") {
+                                "we mint a UUID and pass it in the command"
+                            } else {
+                                "no session — add {session} to the command, or name the CLI's id field"
+                            }
+                        } else {
+                            "JSON field the CLI reports its session id in"
+                        };
+                        ui.label(theme::dim(explain));
+                    });
                     field(ui, "co-author", |ui| {
                         ui.add(
                             egui::TextEdit::singleline(&mut m.coauthor)
@@ -154,6 +180,8 @@ impl CraApp {
                 model_flag: "--model".into(),
                 effort: String::new(),
                 effort_flag: "--effort".into(),
+                resume_command: String::new(),
+                session_key: String::new(),
             });
         }
 
