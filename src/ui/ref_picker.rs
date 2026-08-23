@@ -8,6 +8,7 @@ enum RefAction {
     Branch(String),
     Pr(PrInfo),
     WorkingTree,
+    Recheck,
 }
 
 impl CraApp {
@@ -47,6 +48,9 @@ impl CraApp {
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::W)) {
                 action = Some(RefAction::WorkingTree);
             }
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::C)) {
+                action = Some(RefAction::Recheck);
+            }
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::R)) {
                 self.load_refs();
             }
@@ -71,6 +75,17 @@ impl CraApp {
             ui.separator();
             if ui.button("Review working tree [W]").clicked() {
                 action = Some(RefAction::WorkingTree);
+            }
+            if ui
+                .button("Re-check past decisions [C]")
+                .on_hover_text(
+                    "Re-judge comments you have already decided. Comparing your verdicts to \
+your earlier ones measures how consistent you are, which is the ceiling any model can be \
+scored against. Nothing is written to disk.",
+                )
+                .clicked()
+            {
+                action = Some(RefAction::Recheck);
             }
             if ui.button("Refresh [R]").clicked() {
                 self.load_refs();
@@ -146,6 +161,7 @@ impl CraApp {
             Some(RefAction::Branch(name)) => self.select_branch(&name),
             Some(RefAction::Pr(pr)) => self.select_pr(&pr),
             Some(RefAction::WorkingTree) => self.select_working_tree(),
+            Some(RefAction::Recheck) => self.start_recheck(ctx, 25),
             None => {}
         }
     }
