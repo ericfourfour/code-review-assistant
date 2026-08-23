@@ -702,7 +702,10 @@ impl CraApp {
             .get(slot_idx)
             .map(|m| m.name.clone())
             .unwrap_or_else(|| format!("model {slot_idx}"));
-        self.note("choice", &format!("picked {} ({})", name, s.action.label()));
+        self.note(
+            "choice",
+            &format!("picked {} ({})", name, units::action_label(s.action, unit.kind())),
+        );
     }
 
     pub fn choose_keep(&mut self) {
@@ -1227,9 +1230,18 @@ impl CraApp {
                 if self.settings.blind_review {
                     self.note("model", &format!("{} replied ({} ms)", c.model, s.latency_ms));
                 } else {
+                    let kind = self
+                        .current_unit()
+                        .map(|u| u.kind())
+                        .unwrap_or(units::UnitKind::Comment);
                     self.note(
                         "model",
-                        &format!("{} → {} ({} ms)", c.model, s.action.label(), s.latency_ms),
+                        &format!(
+                            "{} → {} ({} ms)",
+                            c.model,
+                            units::action_label(s.action, kind),
+                            s.latency_ms
+                        ),
                     );
                 }
                 if let Some(slot) = self.candidates.get_mut(c.slot_idx) {

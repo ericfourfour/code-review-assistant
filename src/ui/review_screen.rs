@@ -194,7 +194,11 @@ impl CraApp {
                         }
                         match self.candidates.get(i) {
                             Some(CandidateState::Ready(s)) => {
-                                theme::badge(ui, s.action.label(), theme::action_color(s.action));
+                                theme::badge(
+                                    ui,
+                                    crate::units::action_label(s.action, unit.kind()),
+                                    theme::action_color(s.action),
+                                );
                                 ui.label(theme::dim(&format!("{} ms", s.latency_ms)));
                             }
                             Some(CandidateState::Pending) => {
@@ -365,7 +369,11 @@ impl CraApp {
                 let ui = &mut cols[1];
                 ui.horizontal(|ui| {
                     theme::section_title(ui, "FINAL (editable)");
-                    theme::badge(ui, action.label(), theme::action_color(action));
+                    theme::badge(
+                        ui,
+                        crate::units::action_label(action, unit.kind()),
+                        theme::action_color(action),
+                    );
                 });
                 let mut editor = std::mem::take(&mut self.editor);
                 let resp = ui.add(

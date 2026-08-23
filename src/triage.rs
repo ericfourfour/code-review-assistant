@@ -74,6 +74,16 @@ fn is_test_path(path: &str) -> bool {
         || p.contains(".spec.")
 }
 
+/// Documentation. Prose *about* locks and secrets fires the vocabulary
+/// buckets exactly as hard as code that touches them — dogfooding this tool
+/// on its own branch put the README at risk 100 for that reason — so doc
+/// files are cut to a third rather than letting their subject matter outrank
+/// the code it describes.
+fn is_doc_path(path: &str) -> bool {
+    let p = path.to_ascii_lowercase();
+    [".md", ".markdown", ".rst", ".txt", ".adoc"].iter().any(|ext| p.ends_with(ext))
+}
+
 pub fn assess(unit: &ReviewUnit) -> Risk {
     let mut score: u32 = 0;
     let mut reasons: Vec<String> = Vec::new();
@@ -116,7 +126,10 @@ pub fn assess(unit: &ReviewUnit) -> Risk {
         }
     }
 
-    if is_test_path(unit.file()) {
+    if is_doc_path(unit.file()) {
+        score /= 3;
+        reasons.push("cut to a third: documentation".into());
+    } else if is_test_path(unit.file()) {
         score /= 2;
         reasons.push("halved: test code".into());
     }
@@ -209,6 +222,17 @@ mod tests {
         assert!(with_removal.score > without.score);
         assert!(with_removal.reasons.iter().any(|r| r.contains("removes 1 line")));
         assert!(with_removal.reasons.iter().any(|r| r.contains("no enclosing scope")));
+    }
+
+    #[test]
+    fn prose_about_risky_things_does_not_outrank_the_code() {
+        // Found by running the tool on its own branch: the README hit risk
+        // 100 because it *describes* the vocabulary buckets.
+        let prose = &["This guards secrets with a mutex; unsafe code panics on TODO."];
+        let doc = assess(&code("README.md", 1, prose, None, ""));
+        let src = assess(&code("src/vault.rs", 1, prose, None, ""));
+        assert!(doc.score < src.score / 2, "doc {} vs code {}", doc.score, src.score);
+        assert!(doc.reasons.iter().any(|r| r.contains("documentation")), "{:?}", doc.reasons);
     }
 
     #[test]
