@@ -240,11 +240,18 @@ mod tests {
     }
 
     #[test]
-    fn ordering_walks_riskiest_first_but_keeps_line_order_on_ties() {
+    fn ordering_walks_riskiest_first_but_keeps_diff_order_on_ties() {
+        // Surfacing highest-risk changes first makes effective use of human reviewer
+        // time and attention. For equal risk, preserving diff order lets reviewers
+        // lean on their built-up mental model.
         let mut files = vec![
             (
-                "src/mild.rs".to_string(),
-                vec![comment("src/mild.rs", 2, "// a"), comment("src/mild.rs", 9, "// b")],
+                "src/a_mild.rs".to_string(),
+                vec![comment("src/a_mild.rs", 2, "// a"), comment("src/a_mild.rs", 9, "// b")],
+            ),
+            (
+                "src/z_mild.rs".to_string(),
+                vec![comment("src/z_mild.rs", 5, "// z")],
             ),
             (
                 "src/hot.rs".to_string(),
@@ -258,7 +265,10 @@ mod tests {
         assert_eq!(files[0].0, "src/hot.rs", "the file with the riskiest unit leads");
         assert!(files[0].1[0].is_code(), "within a file, the risky code unit leads");
         assert_eq!(files[0].1[1].start_line(), 3);
-        // Equal-score units stay in line order, so the tie-break is stable.
+        // Equal-score files stay in original diff order.
+        assert_eq!(files[1].0, "src/a_mild.rs");
+        assert_eq!(files[2].0, "src/z_mild.rs");
+        // Equal-score units within a file stay in line order.
         assert_eq!(files[1].1[0].start_line(), 2);
         assert_eq!(files[1].1[1].start_line(), 9);
     }
