@@ -246,8 +246,11 @@ scope detection, provenance, edit application and revert, validation, model-outp
 - Code units cover every changed cluster of code, including pure removals (anchored to the
   line the removal followed, with the removed lines shown in context). Files with unknown
   extensions still get hunk units — a `.conf` change is still a change. A cluster longer
-  than ~120 lines (a brand-new large file, typically) is split into consecutive windows at
-  blank lines, so no single unit is an unreviewable wall.
+  than ~120 lines (a brand-new large file, typically) is split into consecutive windows, and
+  the cuts are semantic first: at the tops of the functions and classes the region spans,
+  descending into oversized containers so an `impl` splits at its methods and a class at its
+  defs. Blank lines are only the fallback — inside a definition that is itself too long, and
+  in files the scope heuristics cannot read.
 - A cross-cutting concern that spans units is what **flag** is for: the concern is recorded
   and attributed even though no line in the unit moves.
 - Edits apply to the working tree of the checked-out branch; the app verifies the on-disk
