@@ -293,6 +293,37 @@ mod tests {
     }
 
     #[test]
+    fn blind_order_is_a_permutation_and_stable_per_comment() {
+        for n in 1..=6 {
+            let order = blind_order(unit_seed("src/lib.rs", 12), n);
+            let mut sorted = order.clone();
+            sorted.sort_unstable();
+            // Every slot appears exactly once, or a candidate would be shown
+            // twice or not at all.
+            assert_eq!(sorted, (0..n).collect::<Vec<_>>(), "n={n}");
+            // Stable, so the cards do not reshuffle on every repaint.
+            assert_eq!(order, blind_order(unit_seed("src/lib.rs", 12), n));
+        }
+    }
+
+    #[test]
+    fn blind_order_varies_between_comments() {
+        // Three slots have six orderings; over many comments a fixed order
+        // would put the same model first every time and reintroduce the bias
+        // blinding exists to remove.
+        let first_slots: std::collections::HashSet<usize> = (0..60)
+            .map(|line| blind_order(unit_seed("src/lib.rs", line), 3)[0])
+            .collect();
+        assert_eq!(first_slots.len(), 3, "every slot should lead sometimes: {first_slots:?}");
+    }
+
+    #[test]
+    fn blind_order_handles_a_single_candidate() {
+        assert_eq!(blind_order(unit_seed("a.rs", 1), 1), vec![0]);
+        assert!(blind_order(unit_seed("a.rs", 1), 0).is_empty());
+    }
+
+    #[test]
     fn final_action_cases() {
         assert_eq!(final_action("same", "same"), Action::Keep);
         assert_eq!(final_action("  ", "same"), Action::Delete);

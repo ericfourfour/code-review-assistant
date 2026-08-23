@@ -871,3 +871,480 @@ impl CraApp {
         }
     }
 }
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+    use crate::testkit::{FakeCli, FakeCliSpec, TempDir, TempRepo};
+
+    const VERDICT: &str =
+        "{\"action\":\"rewrite\",\"comment\":\"Counts retries.\",\"justification\":\"says why\"}";
+
+    /// Two consecutive redundant comments, so tests can watch a second edit
+    /// land after the first has already shifted the line numbers.
+    const LIB_RS: &str = concat!(
+        "fn main() {\n",
+        "    // Increment the counter by one\n",
+        "    counter += 1;\n",
+        "    // Reset the counter to zero\n",
+        "    counter = 0;\n",
+        "}\n",
+    );
+
+    struct Harness {
+        app: CraApp,
+        repo: TempRepo,
+        _dir: TempDir,
+    }
+
+    impl Harness {
+        /// An app with its own database and a real repository whose feature
+        /// branch adds two reviewable comments.
+        fn new(tag: &str) -> Harness {
+            let dir = TempDir::new(tag);
+            let db = Db::open_at(&dir.path().join("cra.db")).expect("open test db");
+            let mut app = CraApp::with_db(db);
+            app.settings.models.clear();
+
+            let repo = TempRepo::new(tag);
+            repo.write("src/lib.rs", "fn main() {}\n");
+            repo.commit("base");
+            repo.git(&["checkout", "-b", "feature"]);
+            repo.write("src/lib.rs", LIB_RS);
+            repo.commit("add counter");
+
+            app.repo = Some(RepoCtx {
+                path: repo.path(),
+                name: "test-repo".into(),
+                default_branch: "main".into(),
+            });
+            app.plan = Some(Self::plan(&repo));
+            Harness { app, repo, _dir: dir }
+        }
+
+        fn plan(repo: &TempRepo) -> ReviewPlan {
+            let diff = gitio::review_diff(&repo.path(), "main", 12).expect("diff");
+            let files = crate::diffparse::parse(&diff);
+            let extracted = comments::extract_units(&files, 12);
+            assert_eq!(extracted.len(), 1, "expected one reviewable file");
+            let files = extracted
+                .into_iter()
+                .map(|(path, units)| ReviewFile { path, units, line_offset: 0, decided: 0 })
+                .collect();
+            ReviewPlan {
+                session_id: 1,
+                ref_kind: RefKind::Branch,
+                ref_name: "feature".into(),
+                base_ref: "main".into(),
+                files,
+                file_idx: 0,
+                unit_idx: 0,
+                decided_total: 0,
+            }
+        }
+
+        /// Point every slot at a fake CLI and start the review, through the
+        /// same entry point the file picker uses.
+        fn enter_with(&mut self, slots: Vec<crate::settings::ModelSlot>) {
+            self.app.settings.models = slots;
+            self.app.start_review(&egui::Context::default(), 0);
+        }
+
+        /// Drain replies until every slot has settled, or give up.
+        fn settle(&mut self) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                self.app.pump_messages();
+                let pending = self
+                    .app
+                    .candidates
+                    .iter()
+                    .any(|c| matches!(c, CandidateState::Pending));
+                if !pending {
+                    return;
+                }
+                assert!(std::time::Instant::now() < deadline, "models never came back");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+
+    #[test]
+    fn entering_a_unit_loads_the_comment_dedented() {
+        let mut h = Harness::new("enter");
+        h.enter_with(vec![]);
+        assert_eq!(h.app.original_text, "    // Increment the counter by one");
+        // The editor works flush left; the indent goes back on at save time.
+        assert_eq!(h.app.original_display, "// Increment the counter by one");
+        assert_eq!(h.app.editor, h.app.original_display);
+        assert_eq!(h.app.screen as u8, Screen::Review as u8);
+    }
+
+    #[test]
+    fn a_model_reply_becomes_a_pickable_candidate() {
+        let dir = TempDir::new("reply");
+        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let mut h = Harness::new("reply");
+        h.enter_with(vec![cli.slot("")]);
+        h.settle();
+
+        match &h.app.candidates[0] {
+            CandidateState::Ready(s) => assert_eq!(s.action, Action::Rewrite),
+            other => panic!("expected a ready candidate, got {}", state_name(other)),
+        }
+        // Picking it must reformat the prose as a comment in the unit's style.
+        h.app.choose_candidate(0);
+        assert_eq!(h.app.editor, "// Counts retries.");
+        assert_eq!(h.app.chosen, Some(Choice::Candidate(0)));
+    }
+
+    fn state_name(s: &CandidateState) -> &'static str {
+        match s {
+            CandidateState::Disabled => "disabled",
+            CandidateState::Pending => "pending",
+            CandidateState::Ready(_) => "ready",
+            CandidateState::Failed(_) => "failed",
+        }
+    }
+
+    #[test]
+    fn a_session_id_is_captured_and_replayed_on_the_follow_up() {
+        let dir = TempDir::new("session");
+        let first = FakeCli::new(
+            &dir,
+            "first",
+            FakeCliSpec {
+                reply: "{\"conversation_id\":\"sess-7\",\"response\":\"\
+{\\\"action\\\":\\\"keep\\\",\\\"justification\\\":\\\"fine\\\"}\"}",
+                ..Default::default()
+            },
+        );
+        let second =
+            FakeCli::new(&dir, "second", FakeCliSpec { reply: VERDICT, ..Default::default() });
+
+        let mut h = Harness::new("session");
+        let mut slot = first.slot("");
+        slot.session_key = "conversation_id".into();
+        slot.resume_command = format!("{} --conversation {{session}}", second.command());
+        h.enter_with(vec![slot]);
+        h.settle();
+
+        assert_eq!(h.app.sessions[0].as_deref(), Some("sess-7"));
+        assert!(h.app.can_ask(0), "a settled, resumable slot should accept a follow-up");
+
+        h.app.follow_up = "too vague".into();
+        h.app.ask_followup(&egui::Context::default(), None);
+        h.settle();
+
+        // The id must reach the resumed process, and only the new message with
+        // it — the conversation itself lives in the CLI's session.
+        let argv = second.argv_seen();
+        assert!(argv.contains("--conversation sess-7"), "{argv}");
+        let sent = second.stdin_seen();
+        assert!(sent.contains("too vague"), "{sent}");
+        assert!(!sent.contains("Increment the counter"), "the diff was re-sent: {sent}");
+        assert!(h.app.follow_up.is_empty(), "the box should clear once sent");
+        assert_eq!(h.app.convos[0].len(), 2, "both turns belong in the inspector");
+    }
+
+    #[test]
+    fn a_slot_without_a_session_cannot_be_asked_again() {
+        let dir = TempDir::new("nosession");
+        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let mut h = Harness::new("nosession");
+        // No session key and no {session} in the command: nothing to resume.
+        h.enter_with(vec![cli.slot("")]);
+        h.settle();
+
+        assert!(!h.app.can_ask(0));
+        h.app.follow_up = "why?".into();
+        h.app.ask_followup(&egui::Context::default(), None);
+        assert!(h.app.review_error.is_some(), "the user needs to be told why nothing happened");
+        assert_eq!(h.app.follow_up, "why?", "an unsent message must not be cleared");
+    }
+
+    #[test]
+    fn a_pending_slot_is_not_asked_again_mid_flight() {
+        let dir = TempDir::new("pending");
+        let cli = FakeCli::new(
+            &dir,
+            "fake",
+            FakeCliSpec { reply: VERDICT, delay_secs: 30, ..Default::default() },
+        );
+        let mut h = Harness::new("pending");
+        let mut slot = cli.slot("");
+        slot.session_key = "conversation_id".into();
+        slot.resume_command = format!("{} {{session}}", cli.command());
+        h.enter_with(vec![slot]);
+
+        // Still in flight: one reply per request keeps answers attributable.
+        assert!(matches!(h.app.candidates[0], CandidateState::Pending));
+        assert!(!h.app.can_ask(0));
+    }
+
+    #[test]
+    fn saving_writes_the_indent_back_and_records_provenance() {
+        let dir = TempDir::new("save");
+        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let mut h = Harness::new("save");
+        h.enter_with(vec![cli.slot("")]);
+        h.settle();
+        h.app.choose_candidate(0);
+
+        h.app.save_and_continue(&egui::Context::default(), false);
+        assert!(h.app.review_error.is_none(), "{:?}", h.app.review_error);
+
+        let after = h.repo.read("src/lib.rs");
+        assert!(after.contains("    // Counts retries."), "indent not restored: {after}");
+        assert!(!after.contains("Increment the counter"), "{after}");
+        // And it moved on to the next comment in the same file.
+        assert_eq!(h.app.original_display, "// Reset the counter to zero");
+    }
+
+    #[test]
+    fn a_second_edit_in_the_same_file_accounts_for_the_first() {
+        let dir = TempDir::new("offset");
+        let two_liner = "{\"action\":\"rewrite\",\"comment\":\"First line.\\nSecond line.\",\
+\"justification\":\"needs two\"}";
+        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: two_liner, ..Default::default() });
+        let mut h = Harness::new("offset");
+
+        // First comment becomes two lines, pushing everything below it down.
+        h.enter_with(vec![cli.slot("")]);
+        h.settle();
+        h.app.choose_candidate(0);
+        h.app.save_and_continue(&egui::Context::default(), false);
+        assert!(h.app.review_error.is_none(), "{:?}", h.app.review_error);
+        assert_eq!(h.app.plan.as_ref().unwrap().files[0].line_offset, 1);
+
+        // The second edit has to land on the shifted lines, not the original.
+        h.settle();
+        h.app.choose_candidate(0);
+        h.app.save_and_continue(&egui::Context::default(), false);
+        assert!(h.app.review_error.is_none(), "{:?}", h.app.review_error);
+
+        let after = h.repo.read("src/lib.rs");
+        assert_eq!(after.matches("// First line.").count(), 2, "both comments rewritten: {after}");
+        assert!(after.contains("counter += 1;"), "{after}");
+        assert!(after.contains("counter = 0;"), "{after}");
+        assert!(!after.contains("Increment"), "{after}");
+        assert!(!after.contains("Reset"), "{after}");
+        assert_eq!(h.app.screen as u8, Screen::Summary as u8, "plan should be exhausted");
+    }
+
+    #[test]
+    fn committing_records_the_model_as_co_author() {
+        let dir = TempDir::new("commit");
+        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let mut h = Harness::new("commit");
+        h.enter_with(vec![cli.slot("")]);
+        h.settle();
+        h.app.choose_candidate(0);
+
+        h.app.save_and_continue(&egui::Context::default(), true);
+        assert!(h.app.review_error.is_none(), "{:?}", h.app.review_error);
+
+        let message = h.repo.git(&["log", "-1", "--format=%B"]);
+        assert!(message.contains("review(comments): rewrite"), "{message}");
+        assert!(message.contains("Comment-provenance: fake"), "{message}");
+        assert!(message.contains("Co-authored-by: Fake <fake@example.com>"), "{message}");
+        assert!(message.contains("says why"), "the model's reasoning belongs in the body: {message}");
+    }
+
+    #[test]
+    fn keeping_the_original_touches_neither_the_file_nor_git() {
+        let dir = TempDir::new("keep");
+        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let mut h = Harness::new("keep");
+        let before = h.repo.read("src/lib.rs");
+        let head = gitio::head_sha(&h.repo.path()).unwrap();
+
+        h.enter_with(vec![cli.slot("")]);
+        h.settle();
+        h.app.choose_keep();
+        h.app.save_and_continue(&egui::Context::default(), true);
+
+        assert!(h.app.review_error.is_none(), "{:?}", h.app.review_error);
+        assert_eq!(h.repo.read("src/lib.rs"), before, "a keep must not rewrite the file");
+        assert_eq!(gitio::head_sha(&h.repo.path()).unwrap(), head, "a keep must not commit");
+    }
+
+    #[test]
+    fn a_failing_model_leaves_the_others_usable() {
+        let dir = TempDir::new("mixed");
+        let good = FakeCli::new(&dir, "good", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let bad = FakeCli::new(
+            &dir,
+            "bad",
+            FakeCliSpec { reply: "boom", exit_code: 1, ..Default::default() },
+        );
+        let mut h = Harness::new("mixed");
+        h.enter_with(vec![good.slot(""), bad.slot("")]);
+        h.settle();
+
+        assert!(matches!(h.app.candidates[0], CandidateState::Ready(_)));
+        assert!(matches!(h.app.candidates[1], CandidateState::Failed(_)));
+        h.app.choose_candidate(0);
+        assert_eq!(h.app.chosen, Some(Choice::Candidate(0)));
+    }
+
+    #[test]
+    fn blinding_hides_names_until_a_choice_is_made() {
+        let dir = TempDir::new("blind");
+        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let mut h = Harness::new("blind");
+        h.app.settings.blind_review = true;
+        let mut a = cli.slot("");
+        a.name = "alpha".into();
+        let mut b = cli.slot("");
+        b.name = "beta".into();
+        h.enter_with(vec![a, b]);
+        h.settle();
+
+        assert!(h.app.names_hidden());
+        let order = h.app.candidate_order();
+        // Labels follow screen position, not slot, so nothing identifies the
+        // model behind a card.
+        assert_eq!(h.app.slot_label(order[0], 0), "model A");
+        assert_eq!(h.app.slot_label(order[1], 1), "model B");
+
+        // Picking the first card must select whichever slot it stands for.
+        h.app.choose_candidate(order[0]);
+        assert_eq!(h.app.chosen, Some(Choice::Candidate(order[0])));
+        // And once chosen, the names come back so provenance is visible.
+        assert!(!h.app.names_hidden());
+        assert!(h.app.slot_label(order[0], 0) != "model A");
+    }
+
+    #[test]
+    fn blinding_off_leaves_the_order_and_the_names_alone() {
+        let dir = TempDir::new("unblind");
+        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let mut h = Harness::new("unblind");
+        h.app.settings.blind_review = false;
+        let mut a = cli.slot("");
+        a.name = "alpha".into();
+        h.enter_with(vec![a]);
+
+        assert!(!h.app.names_hidden());
+        assert_eq!(h.app.candidate_order(), vec![0]);
+        assert_eq!(h.app.slot_label(0, 0), "alpha");
+    }
+
+    #[test]
+    fn a_decision_records_whether_it_was_blinded() {
+        let dir = TempDir::new("blindrec");
+        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let mut h = Harness::new("blindrec");
+        h.app.settings.blind_review = true;
+        h.enter_with(vec![cli.slot("")]);
+        h.settle();
+        h.app.choose_candidate(0);
+        h.app.save_and_continue(&egui::Context::default(), false);
+
+        // An unblinded label is weaker evidence, so the report has to be able
+        // to tell them apart after the fact.
+        let rows = h.app.db.corpus(10);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].blinded);
+        assert!(!rows[0].unit_json.is_empty(), "the unit must be stored for replay");
+    }
+
+    #[test]
+    fn a_recheck_records_the_judgement_without_touching_the_file() {
+        let dir = TempDir::new("recheck");
+        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let mut h = Harness::new("recheck");
+
+        // Decide one comment normally, which writes the file and stores a label.
+        h.enter_with(vec![cli.slot("")]);
+        h.settle();
+        h.app.choose_candidate(0);
+        h.app.save_and_continue(&egui::Context::default(), false);
+        let after_first = h.repo.read("src/lib.rs");
+        let head = gitio::head_sha(&h.repo.path()).unwrap();
+        assert_eq!(h.app.db.corpus(10).len(), 1);
+
+        // Now re-judge it. The point is the verdict, not the edit.
+        h.app.settings.models.clear();
+        h.app.start_recheck(&egui::Context::default(), 10);
+        assert!(h.app.plan.as_ref().unwrap().is_recheck());
+        // The stored unit is the comment as it was *asked about*, not the
+        // rewrite it became — re-judging the outcome would be a different
+        // question and useless as a consistency measure.
+        assert_eq!(h.app.original_display, "// Increment the counter by one");
+
+        h.app.choose_keep();
+        h.app.save_and_continue(&egui::Context::default(), true);
+        assert!(h.app.review_error.is_none(), "{:?}", h.app.review_error);
+        assert_eq!(h.repo.read("src/lib.rs"), after_first, "a re-check must not edit the tree");
+        assert_eq!(gitio::head_sha(&h.repo.path()).unwrap(), head, "or commit");
+        assert_eq!(h.app.db.corpus(10).len(), 2, "but it must record the second judgement");
+    }
+
+    #[test]
+    fn a_recheck_with_no_history_explains_itself() {
+        let mut h = Harness::new("nohistory");
+        h.app.start_recheck(&egui::Context::default(), 10);
+        assert!(h.app.ref_error.as_deref().is_some_and(|e| e.contains("no past decisions")));
+    }
+
+    #[test]
+    fn repeated_judgements_give_the_report_a_noise_floor() {
+        let dir = TempDir::new("floor");
+        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let mut h = Harness::new("floor");
+        h.enter_with(vec![cli.slot("")]);
+        h.settle();
+        h.app.choose_candidate(0);
+        h.app.save_and_continue(&egui::Context::default(), false);
+
+        // Before any repeat there is no scale to read agreement against.
+        assert!(crate::eval::Report::from_db(&h.app.db).self_agreement_pct().is_none());
+
+        // Re-judge the same comment the same way.
+        h.app.settings.models.clear();
+        h.app.start_recheck(&egui::Context::default(), 10);
+        h.app.choose_keep();
+        h.app.save_and_continue(&egui::Context::default(), false);
+
+        // Re-judging the same comment gives the report its scale. Here the
+        // verdict changed (rewrite, then keep), so self-agreement is 0% — a
+        // reviewer who contradicts themselves caps what any model can score.
+        let report = crate::eval::Report::from_db(&h.app.db);
+        assert_eq!(report.repeat_total, 1);
+        assert_eq!(report.self_agreement_pct(), Some(0.0));
+        assert!(report.render().contains("self-agreement: 0%"), "{}", report.render());
+    }
+
+    #[test]
+    fn a_stale_reply_from_a_previous_comment_is_discarded() {
+        let dir = TempDir::new("stale");
+        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let mut h = Harness::new("stale");
+        h.enter_with(vec![cli.slot("")]);
+
+        // The user moves on before the model answers; the late reply carries
+        // the old sequence number and must not overwrite the new question.
+        let stale_seq = h.app.review_seq;
+        h.app.skip_unit(&egui::Context::default());
+        assert!(h.app.review_seq > stale_seq);
+
+        h.app.handle_candidate(CandidateMsg {
+            seq: stale_seq,
+            slot_idx: 0,
+            model: "fake".into(),
+            result: Ok(Suggestion {
+                action: Action::Delete,
+                comment: String::new(),
+                justification: "from the previous comment".into(),
+                latency_ms: 1,
+            }),
+            raw: String::new(),
+        });
+        assert!(
+            !matches!(h.app.candidates[0], CandidateState::Ready(_)),
+            "a stale reply was shown against the wrong comment"
+        );
+    }
+}

@@ -32,7 +32,7 @@ impl Action {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Suggestion {
     pub action: Action,
     pub comment: String,
@@ -350,6 +350,7 @@ mod tests {
         assert_eq!(raw.action, "keep");
         assert!(raw.justification.contains("{braces}"));
     }
+
     fn slot(model: &str, model_flag: &str, effort: &str, effort_flag: &str) -> ModelSlot {
         ModelSlot {
             name: "t".into(),
@@ -440,5 +441,231 @@ mod tests {
         assert!(p.starts_with("too wordy — one line?"));
         assert!(p.contains("\"action\""));
         assert!(p.trim_end().ends_with("}"));
+    }
+}
+
+#[cfg(test)]
+mod spawn_tests {
+    use super::*;
+    use crate::testkit::{FakeCli, FakeCliSpec, TempDir};
+
+    const VERDICT: &str =
+        "{\"action\":\"rewrite\",\"comment\":\"Bump it.\",\"justification\":\"clearer\"}";
+
+    fn run(slot: &ModelSlot, prompt: &str) -> (Result<Suggestion, String>, String) {
+        let command = slot.command.clone();
+        run_model(slot, &command, prompt, Duration::from_secs(30))
+    }
+
+    #[test]
+    fn prompt_reaches_the_cli_on_stdin() {
+        let dir = TempDir::new("stdin");
+        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let slot = cli.slot("");
+
+        let (res, _) = run(&slot, "line one\nline two");
+        let s = res.expect("verdict");
+        assert_eq!(s.action, Action::Rewrite);
+        assert_eq!(s.comment, "Bump it.");
+        // Multi-line prompts are exactly what argument passing rejects for a
+        // .cmd shim, so this is the case that has to go over the pipe.
+        let seen = cli.stdin_seen();
+        assert!(seen.contains("line one"), "stdin missing first line: {seen:?}");
+        assert!(seen.contains("line two"), "stdin missing second line: {seen:?}");
+    }
+
+    #[test]
+    fn prompt_reaches_the_cli_as_an_argument_when_templated() {
+        let dir = TempDir::new("argv");
+        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let slot = cli.slot("{prompt}");
+
+        let (res, _) = run(&slot, "single-line prompt");
+        assert!(res.is_ok());
+        assert!(cli.argv_seen().contains("single-line prompt"), "{}", cli.argv_seen());
+        assert!(cli.stdin_seen().trim().is_empty(), "stdin should be closed in argv mode");
+    }
+
+    #[test]
+    fn model_and_effort_reach_the_process_in_order() {
+        let dir = TempDir::new("flags");
+        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let mut slot = cli.slot("--print {prompt}");
+        slot.model = "tiny-model".into();
+        slot.effort = "low".into();
+
+        let (res, _) = run(&slot, "hello");
+        assert!(res.is_ok());
+        let argv = cli.argv_seen();
+        let prompt_at = argv.find("hello").expect("prompt in argv");
+        let model_at = argv.find("--model tiny-model").expect("model flag in argv");
+        let effort_at = argv.find("--effort low").expect("effort flag in argv");
+        // Both must trail the prompt, or `--print` would swallow the flag
+        // instead of the prompt — the bug agy's -p exposed.
+        assert!(prompt_at < model_at && model_at < effort_at, "wrong order: {argv:?}");
+    }
+
+    #[test]
+    fn a_failing_cli_surfaces_as_an_error_with_its_output_kept() {
+        let dir = TempDir::new("fail");
+        let cli = FakeCli::new(
+            &dir,
+            "fake",
+            FakeCliSpec { reply: "command not recognised", exit_code: 1, ..Default::default() },
+        );
+        let (res, raw) = run(&cli.slot(""), "hi");
+        let err = res.unwrap_err();
+        assert!(err.contains("no JSON verdict"), "{err}");
+        // The raw output is what the prompt inspector shows, so it must survive.
+        assert!(raw.contains("command not recognised"), "{raw:?}");
+    }
+
+    #[test]
+    fn a_hung_cli_is_killed_at_the_deadline() {
+        let dir = TempDir::new("hang");
+        let cli = FakeCli::new(
+            &dir,
+            "fake",
+            FakeCliSpec { reply: VERDICT, delay_secs: 30, ..Default::default() },
+        );
+        let slot = cli.slot("");
+        let started = Instant::now();
+        let (res, _) = run_model(&slot, &slot.command, "hi", Duration::from_secs(1));
+        let err = res.unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+        // A slot that never returns would wedge the review; the poll loop has
+        // to give up close to the deadline rather than wait out the child.
+        assert!(started.elapsed() < Duration::from_secs(15), "took {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn session_id_survives_a_round_trip_through_a_resume_command() {
+        let dir = TempDir::new("session");
+        // Turn 1 answers in an envelope carrying the id, the way codex does.
+        let first = FakeCli::new(
+            &dir,
+            "first",
+            FakeCliSpec {
+                reply: "{\"type\":\"thread.started\",\"thread_id\":\"sess-42\"}\n\
+{\"type\":\"item.completed\",\"item\":{\"text\":\"{\\\"action\\\":\\\"keep\\\",\\\"justification\\\":\\\"ok\\\"}\"}}",
+                ..Default::default()
+            },
+        );
+        let mut slot = first.slot("");
+        slot.session_key = "thread_id".into();
+
+        let (res, raw) = run(&slot, "first turn");
+        assert_eq!(res.unwrap().action, Action::Keep, "verdict must survive the envelope");
+        let session = extract_session_id(&raw, &slot.session_key).expect("session id");
+        assert_eq!(session, "sess-42");
+
+        // Turn 2 resumes: the id has to land on the child's command line.
+        let second =
+            FakeCli::new(&dir, "second", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        slot.resume_command = format!("{} resume {{session}}", second.command());
+        let resume = slot.resume_command.replace("{session}", &session);
+        let (res2, _) = run_model(&slot, &resume, &followup_prompt("why?"), Duration::from_secs(30));
+        assert!(res2.is_ok());
+        assert!(second.argv_seen().contains("resume sess-42"), "{}", second.argv_seen());
+        assert!(second.stdin_seen().contains("why?"), "{}", second.stdin_seen());
+    }
+
+    #[test]
+    fn a_missing_program_is_reported_rather_than_panicking() {
+        let dir = TempDir::new("missing");
+        let mut slot = FakeCli::new(&dir, "fake", FakeCliSpec::default()).slot("");
+        slot.command = "cra-no-such-program-anywhere".into();
+        let (res, _) = run(&slot, "hi");
+        assert!(res.unwrap_err().contains("spawn"), "should name the spawn failure");
+    }
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+    use crate::settings::Settings;
+
+    fn verdict_prompt(extra: &str) -> String {
+        format!(
+            "File: src/lib.rs (Rust)\n\n\
+>    2|     // Increment the counter by one\n \
+    3|     counter += 1;\n\n\
+Review the comment marked with '>' (lines 2-2). \
+Should it be kept, rewritten, or deleted?{extra}\n\
+Answer with JSON only:\n\
+{{\"action\":\"keep|rewrite|delete\",\"comment\":\"replacement text if rewrite, else empty\",\"justification\":\"one short sentence\"}}"
+        )
+    }
+
+    /// Two real turns per configured CLI, resuming by session id between them.
+    /// Exercises argv building, PATHEXT resolution, stdin piping, verdict
+    /// extraction from each CLI's JSON envelope, session-id capture, and the
+    /// resume command. The second turn asks for a number that only exists in
+    /// the first turn, so a broken session shows up as a wrong answer rather
+    /// than a passing test.
+    ///
+    /// Ignored by default; costs six model calls:
+    ///     cargo test -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn configured_clis_hold_a_session_across_two_turns() {
+        let timeout = Duration::from_secs(180);
+        let mut failures: Vec<String> = Vec::new();
+
+        for (_, slot) in Settings::default().enabled_models() {
+            // Turn 1 — either we name the session or the CLI reports one.
+            let (command, mut session) = if slot.session_key.trim().is_empty() {
+                let id = uuid::Uuid::new_v4().to_string();
+                (slot.command.replace("{session}", &id), Some(id))
+            } else {
+                (slot.command.clone(), None)
+            };
+            let first = verdict_prompt(" Also remember the number 4291 for later.");
+            let (res, raw) = run_model(&slot, &command, &first, timeout);
+            match &res {
+                Ok(v) => println!("{:>6} turn 1: {} — {}", slot.name, v.action.label(), v.justification),
+                Err(e) => {
+                    println!("{:>6} turn 1: FAILED {e}", slot.name);
+                    failures.push(format!("{} turn 1: {e}", slot.name));
+                    continue;
+                }
+            }
+            if !slot.session_key.trim().is_empty() {
+                session = extract_session_id(&raw, &slot.session_key);
+            }
+            let Some(session) = session else {
+                println!("{:>6}: no session id in output", slot.name);
+                failures.push(format!("{}: no session id reported", slot.name));
+                continue;
+            };
+            println!("{:>6} session: {session}", slot.name);
+
+            // Turn 2 — resume, and ask for something only turn 1 established.
+            let resume = slot.resume_command.replace("{session}", &session);
+            let second = followup_prompt(
+                "What number did I ask you to remember? Put just that number in \"justification\".",
+            );
+            let (res2, raw2) = run_model(&slot, &resume, &second, timeout);
+            match res2 {
+                Ok(v) => {
+                    println!("{:>6} turn 2: justification = {}", slot.name, v.justification);
+                    if !v.justification.contains("4291") {
+                        failures.push(format!(
+                            "{}: session lost — turn 2 said {:?}",
+                            slot.name, v.justification
+                        ));
+                    }
+                }
+                Err(e) => {
+                    println!(
+                        "{:>6} turn 2: FAILED {e}\n  raw: {}",
+                        slot.name,
+                        raw2.chars().take(300).collect::<String>()
+                    );
+                    failures.push(format!("{} turn 2: {e}", slot.name));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "session round-trip failed:\n  {}", failures.join("\n  "));
     }
 }

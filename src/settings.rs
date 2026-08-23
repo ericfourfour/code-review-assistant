@@ -328,3 +328,120 @@ impl Settings {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migrate_repairs_shipped_defaults_only() {
+        let mut s = Settings {
+            models: vec![
+                ModelSlot {
+                    name: "codex".into(),
+                    command: "codex exec {prompt}".into(),
+                    coauthor: String::new(),
+                    enabled: true,
+                    model: String::new(),
+                    model_flag: String::new(),
+                    effort: String::new(),
+                    effort_flag: String::new(),
+                    resume_command: String::new(),
+                    session_key: String::new(),
+                },
+                ModelSlot {
+                    name: "mine".into(),
+                    command: "mycli --weird {prompt}".into(),
+                    coauthor: String::new(),
+                    enabled: true,
+                    model: String::new(),
+                    model_flag: "-m".into(),
+                    effort: String::new(),
+                    effort_flag: "-e".into(),
+                    resume_command: String::new(),
+                    session_key: String::new(),
+                },
+            ],
+            // a row written before the model/effort/session fields existed
+            schema_version: 0,
+            ..Settings::default()
+        };
+        assert!(s.migrate());
+        assert_eq!(s.models[0].command, CODEX_CMD);
+        assert_eq!(s.models[0].model_flag, "--model");
+        // the repaired command also picks up its session wiring
+        assert_eq!(s.models[0].session_key, "thread_id");
+        assert!(s.models[0].resume_command.contains("resume {session}"));
+        // and its starting tier
+        assert_eq!(s.models[0].model, CODEX_MODEL);
+        assert_eq!(s.models[0].effort, CODEX_EFFORT);
+        assert_eq!(s.models[0].effort_flag, "-c");
+        // a hand-edited template is left exactly as the user wrote it
+        assert_eq!(s.models[1].command, "mycli --weird {prompt}");
+        assert_eq!(s.models[1].model_flag, "-m");
+        assert!(s.models[1].resume_command.is_empty());
+        assert!(s.models[1].model.is_empty());
+        assert_eq!(s.models[1].effort_flag, "-e");
+        // running it again is a no-op
+        assert!(!s.migrate());
+    }
+
+    #[test]
+    fn shipped_defaults_are_not_themselves_broken() {
+        let mut s = Settings::default();
+        assert!(!s.migrate(), "a default template matches a known-broken one");
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+
+    #[test]
+    fn tier_fill_runs_once_and_then_respects_the_users_choice() {
+        let mut s = Settings { schema_version: 0, ..Settings::default() };
+        s.models[0].model.clear();
+        s.models[0].effort.clear();
+        assert!(s.migrate(), "the upgrade pass should fill the starting tier");
+        assert_eq!(s.models[0].model, CLAUDE_MODEL);
+        assert_eq!(s.schema_version, SCHEMA_VERSION);
+
+        // Now the user picks "(CLI default)" — a later load must not undo it.
+        s.models[0].model.clear();
+        s.models[0].effort.clear();
+        assert!(!s.migrate());
+        assert!(s.models[0].model.is_empty(), "migrate clobbered a deliberate choice");
+        assert!(s.models[0].effort.is_empty());
+    }
+
+    #[test]
+    fn every_shipped_slot_has_model_presets() {
+        // A preset list that does not match its command is a silent dead end
+        // in the settings dropdown, so tie them together.
+        for m in Settings::default().models {
+            let argv0 = m.command.split_whitespace().next().unwrap_or("");
+            assert!(
+                !model_presets(argv0).is_empty(),
+                "{} ({argv0}) offers no model presets",
+                m.name
+            );
+        }
+    }
+
+    #[test]
+    fn every_shipped_slot_can_resume() {
+        for m in Settings::default().models {
+            assert!(!m.resume_command.is_empty(), "{} has no resume command", m.name);
+            assert!(
+                m.resume_command.contains("{session}"),
+                "{} resume command must carry the session id",
+                m.name
+            );
+            // Either the CLI reports the id, or we hand it one.
+            assert!(
+                !m.session_key.is_empty() || m.command.contains("{session}"),
+                "{} can neither report nor accept a session id",
+                m.name
+            );
+        }
+    }
+}
