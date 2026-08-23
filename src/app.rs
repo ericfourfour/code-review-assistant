@@ -460,6 +460,38 @@ impl CraApp {
         self.note("follow-up", &format!("asked {}: {}", sent.join(", "), truncate(&message, 80)));
     }
 
+    /// Display position -> slot index for the current comment. Identity when
+    /// blinding is off; a stable shuffle when it is on.
+    pub fn candidate_order(&self) -> Vec<usize> {
+        let n = self.candidates.len();
+        if !self.settings.blind_review {
+            return (0..n).collect();
+        }
+        match self.current_unit() {
+            Some(u) => review::blind_order(review::unit_seed(&u.file, u.start_line), n),
+            None => (0..n).collect(),
+        }
+    }
+
+    /// Whether model identities are currently hidden. Blinding lifts once a
+    /// choice is made, so the provenance being recorded is still visible.
+    pub fn names_hidden(&self) -> bool {
+        self.settings.blind_review && self.chosen.is_none()
+    }
+
+    /// What to call slot `idx` at display position `pos` right now.
+    pub fn slot_label(&self, idx: usize, pos: usize) -> String {
+        if self.names_hidden() {
+            format!("model {}", (b'A' + pos as u8) as char)
+        } else {
+            self.settings
+                .models
+                .get(idx)
+                .map(|m| m.name.clone())
+                .unwrap_or_else(|| format!("model {idx}"))
+        }
+    }
+
     pub fn current_unit(&self) -> Option<CommentUnit> {
         self.plan.as_ref().and_then(|p| p.current().map(|(_, u)| u.clone()))
     }
@@ -683,7 +715,14 @@ impl CraApp {
                     s.latency_ms,
                     None,
                 );
-                self.note("model", &format!("{} → {} ({} ms)", c.model, s.action.label(), s.latency_ms));
+                if self.settings.blind_review {
+                    self.note("model", &format!("{} replied ({} ms)", c.model, s.latency_ms));
+                } else {
+                    self.note(
+                        "model",
+                        &format!("{} → {} ({} ms)", c.model, s.action.label(), s.latency_ms),
+                    );
+                }
                 if let Some(slot) = self.candidates.get_mut(c.slot_idx) {
                     *slot = CandidateState::Ready(s);
                 }

@@ -211,7 +211,15 @@ impl CraApp {
             ui.label(theme::dim("context lines"));
             ui.add(egui::DragValue::new(&mut self.settings.context_lines).range(2..=60));
             ui.end_row();
+            ui.label(theme::dim("blind review"));
+            ui.checkbox(&mut self.settings.blind_review, "hide model names until you choose");
+            ui.end_row();
         });
+        ui.label(theme::dim(
+            "Blind review also shuffles the candidates per comment. Every review is also a \
+labelled example, and knowing which model wrote which suggestion while you choose biases that \
+label — turn it off only if you are not measuring the models against each other.",
+        ));
 
         ui.add_space(10.0);
         if ui.button(RichText::new("Save and close  [Ctrl+S / Esc]").strong()).clicked() {

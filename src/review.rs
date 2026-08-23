@@ -99,8 +99,35 @@ impl ReviewPlan {
     }
 }
 
+/// The order to show candidates in, as display position -> slot index.
+///
+/// Deterministic in `seed` so the cards do not reshuffle on every repaint, and
+/// so re-reviewing the same comment presents it the same way. A plain
+/// Fisher-Yates over a small LCG: this only has to be unbiased across
+/// comments, not cryptographic.
+pub fn blind_order(seed: u64, n: usize) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..n).collect();
+    let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    for i in (1..n).rev() {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let j = (state >> 33) as usize % (i + 1);
+        order.swap(i, j);
+    }
+    order
+}
+
+/// Stable identity for a comment, used to seed its candidate order.
+pub fn unit_seed(file: &str, start_line: u32) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in file.as_bytes().iter().chain(&start_line.to_le_bytes()) {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
 /// What the human picked (before free-form edits are considered).
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 pub enum Choice {
     /// Candidate from model slot i (index into the session's model list).
     Candidate(usize),
