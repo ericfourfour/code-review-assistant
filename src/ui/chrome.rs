@@ -88,6 +88,7 @@ pub fn hotkey_bar(app: &mut CraApp, ctx: &egui::Context) {
                     k(ui, "K", "keep");
                     k(ui, "D", "delete");
                     k(ui, "E", "edit");
+                    k(ui, "F", "follow-up");
                     k(ui, "R", "re-run");
                     k(ui, "P", "prev");
                     k(ui, "N", "skip");

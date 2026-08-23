@@ -6,7 +6,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use crate::comments::{self, CommentUnit};
 use crate::db::Db;
 use crate::gitio::{self, BranchInfo, PrInfo};
-use crate::models::{self, Action, CandidateMsg, Suggestion};
+use crate::models::{self, Action, CandidateMsg, Suggestion, Turn};
 use crate::review::{self, Choice, RefKind, ReviewFile, ReviewPlan};
 use crate::settings::Settings;
 
@@ -86,6 +86,14 @@ pub struct CraApp {
     pub review_error: Option<String>,
     pub focus_editor: bool,
 
+    /// Per-slot conversation ID; `None` means the slot has no usable session yet.
+    pub sessions: Vec<Option<String>>,
+    /// Per-slot record of sent and received turns.
+    pub convos: Vec<Vec<Turn>>,
+    pub follow_up: String,
+    pub show_prompt: Option<usize>,
+    pub focus_follow_up: bool,
+
     pub tx: Sender<Msg>,
     pub rx: Receiver<Msg>,
 }
@@ -133,6 +141,11 @@ impl CraApp {
             original_display: String::new(),
             review_error: None,
             focus_editor: false,
+            sessions: Vec::new(),
+            convos: Vec::new(),
+            follow_up: String::new(),
+            show_prompt: None,
+            focus_follow_up: false,
             tx,
             rx,
         }
@@ -349,12 +362,29 @@ impl CraApp {
             .iter()
             .map(|m| if m.enabled { CandidateState::Pending } else { CandidateState::Disabled })
             .collect();
+        self.convos = vec![Vec::new(); self.settings.models.len()];
+        self.sessions = vec![None; self.settings.models.len()];
+        self.follow_up.clear();
+        self.show_prompt = None;
         for (idx, slot) in self.settings.enabled_models() {
+            // A slot that names no session key takes an id of our choosing;
+            // the rest report theirs in the reply and we pick it up there.
+            let command = if slot.session_key.trim().is_empty() && slot.command.contains("{session}")
+            {
+                let id = uuid::Uuid::new_v4().to_string();
+                let command = slot.command.replace("{session}", &id);
+                self.sessions[idx] = Some(id);
+                command
+            } else {
+                slot.command.clone()
+            };
+            self.convos[idx].push(Turn { prompt: prompt.clone(), reply: String::new() });
             let tx = self.tx.clone();
             models::spawn_model(
                 self.review_seq,
                 idx,
                 slot,
+                command,
                 prompt.clone(),
                 timeout,
                 move |m| {
@@ -364,6 +394,70 @@ impl CraApp {
             );
         }
         self.note("review", &format!("{file}:{line} — querying models"));
+    }
+
+    /// A slot can take a follow-up once its previous request has come back and
+    /// it has a session to resume. Waiting for the reply keeps one answer per
+    /// request, so a late one can never be misfiled against the wrong turn.
+    pub fn can_ask(&self, slot_idx: usize) -> bool {
+        let settled = matches!(
+            self.candidates.get(slot_idx),
+            Some(CandidateState::Ready(_)) | Some(CandidateState::Failed(_))
+        );
+        let resumable = self
+            .settings
+            .models
+            .get(slot_idx)
+            .is_some_and(|m| !m.resume_command.trim().is_empty());
+        settled && resumable && self.sessions.get(slot_idx).is_some_and(|s| s.is_some())
+    }
+
+    /// Send the pending follow-up to one slot, or to every slot that can take
+    /// it. Each goes out on the CLI's own resumed session, so only the new
+    /// message travels — the model still has the rest of the conversation.
+    pub fn ask_followup(&mut self, ctx: &egui::Context, slot: Option<usize>) {
+        let message = self.follow_up.trim().to_string();
+        if message.is_empty() {
+            return;
+        }
+        let targets: Vec<usize> = match slot {
+            Some(i) => vec![i],
+            None => (0..self.candidates.len()).collect(),
+        };
+        let timeout = self.settings.model_timeout_secs;
+        let mut sent = Vec::new();
+        for idx in targets {
+            if !self.can_ask(idx) {
+                continue;
+            }
+            let Some(slot_cfg) = self.settings.models.get(idx).cloned() else { continue };
+            let Some(session) = self.sessions[idx].clone() else { continue };
+            let command = slot_cfg.resume_command.replace("{session}", &session);
+            let prompt = models::followup_prompt(&message);
+            self.convos[idx].push(Turn { prompt: prompt.clone(), reply: String::new() });
+            self.candidates[idx] = CandidateState::Pending;
+            let tx = self.tx.clone();
+            models::spawn_model(
+                self.review_seq,
+                idx,
+                slot_cfg.clone(),
+                command,
+                prompt,
+                timeout,
+                move |m| {
+                    let _ = tx.send(Msg::Cand(m));
+                },
+                ctx.clone(),
+            );
+            sent.push(slot_cfg.name);
+        }
+        if sent.is_empty() {
+            self.review_error =
+                Some("no model has a resumable session ready for a follow-up yet".into());
+            return;
+        }
+        self.follow_up.clear();
+        self.note("follow-up", &format!("asked {}: {}", sent.join(", "), truncate(&message, 80)));
     }
 
     pub fn current_unit(&self) -> Option<CommentUnit> {
@@ -555,6 +649,26 @@ impl CraApp {
             .map(|u| (u.file, u.start_line, u.end_line))
             .unwrap_or_default();
         let session_id = self.plan.as_ref().map(|p| p.session_id).unwrap_or(0);
+        // Track the CLI's own id so the next turn resumes this conversation.
+        // Take the newest one each time: a CLI is free to hand back a fresh id
+        // when it resumes, and following it keeps the chain unbroken.
+        if let Some(key) = self.settings.models.get(c.slot_idx).map(|m| m.session_key.clone()) {
+            if let Some(id) = models::extract_session_id(&c.raw, &key) {
+                if let Some(slot) = self.sessions.get_mut(c.slot_idx) {
+                    *slot = Some(id);
+                }
+            }
+        }
+        if let Some(turn) = self.convos.get_mut(c.slot_idx).and_then(|t| t.last_mut()) {
+            turn.reply = if c.raw.trim().is_empty() {
+                match &c.result {
+                    Ok(_) => "(no output)".to_string(),
+                    Err(e) => e.clone(),
+                }
+            } else {
+                c.raw.clone()
+            };
+        }
         match c.result {
             Ok(s) => {
                 self.db.log_suggestion(

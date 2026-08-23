@@ -40,6 +40,25 @@ pub struct Suggestion {
     pub latency_ms: i64,
 }
 
+/// One exchange with a model CLI: what we piped in, what it printed back.
+/// Recorded only so the inspector can show it — conversational continuity
+/// comes from the CLI's own session, not from anything we re-send.
+#[derive(Clone)]
+pub struct Turn {
+    pub prompt: String,
+    pub reply: String,
+}
+
+/// The prompt for a follow-up turn. The conversation itself lives in the
+/// CLI's own session, so only the new message and the answer format go over.
+pub fn followup_prompt(message: &str) -> String {
+    format!(
+        "{}\n\nAnswer with JSON only:\n\
+{{\"action\":\"keep|rewrite|delete\",\"comment\":\"replacement text if rewrite, else empty\",\"justification\":\"one short sentence\"}}",
+        message.trim()
+    )
+}
+
 #[derive(Deserialize)]
 struct RawSuggestion {
     action: String,
@@ -57,6 +76,8 @@ pub struct CandidateMsg {
     pub slot_idx: usize,
     pub model: String,
     pub result: Result<Suggestion, String>,
+    /// Everything the CLI printed, kept verbatim for the transcript.
+    pub raw: String,
 }
 
 /// Split the command template into argv, substituting `{prompt}` and
@@ -92,6 +113,65 @@ fn build_argv(template: &str, prompt: &str, slot: &ModelSlot) -> (Vec<String>, b
         argv.push(value.trim().to_string());
     }
     (argv, !used_placeholder)
+}
+
+/// Every JSON document in the output: the whole thing if it parses, else
+/// line by line for CLIs that emit a JSONL event stream (`codex --json`).
+fn json_documents(output: &str) -> Vec<serde_json::Value> {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(output.trim()) {
+        return vec![v];
+    }
+    output
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
+        .collect()
+}
+
+fn collect_strings(v: &serde_json::Value, out: &mut Vec<String>) {
+    match v {
+        serde_json::Value::String(s) => out.push(s.clone()),
+        serde_json::Value::Array(a) => a.iter().for_each(|x| collect_strings(x, out)),
+        serde_json::Value::Object(o) => o.values().for_each(|x| collect_strings(x, out)),
+        _ => {}
+    }
+}
+
+fn find_string_key(v: &serde_json::Value, key: &str) -> Option<String> {
+    match v {
+        serde_json::Value::Object(o) => {
+            if let Some(serde_json::Value::String(s)) = o.get(key) {
+                return Some(s.clone());
+            }
+            o.values().find_map(|x| find_string_key(x, key))
+        }
+        serde_json::Value::Array(a) => a.iter().find_map(|x| find_string_key(x, key)),
+        _ => None,
+    }
+}
+
+/// The session id the CLI reported, looked up by key anywhere in its output.
+/// Returns None when the slot names no key — those CLIs take an id we choose.
+pub fn extract_session_id(output: &str, key: &str) -> Option<String> {
+    let key = key.trim();
+    if key.is_empty() {
+        return None;
+    }
+    json_documents(output).iter().find_map(|v| find_string_key(v, key))
+}
+
+/// Pull the verdict out of whatever the CLI printed. Asking a CLI for
+/// machine-readable output (needed to recover the session id) wraps the
+/// model's answer in the CLI's own envelope, so the verdict arrives as an
+/// escaped string inside it rather than as bare text.
+fn extract_verdict(output: &str) -> Option<RawSuggestion> {
+    if let Some(raw) = extract_json(output) {
+        return Some(raw);
+    }
+    let mut strings = Vec::new();
+    for doc in json_documents(output) {
+        collect_strings(&doc, &mut strings);
+    }
+    strings.iter().rev().find_map(|s| extract_json(s))
 }
 
 fn extract_json(output: &str) -> Option<RawSuggestion> {
@@ -133,8 +213,29 @@ fn extract_json(output: &str) -> Option<RawSuggestion> {
     None
 }
 
-fn run_model(slot: &ModelSlot, prompt: &str, timeout: Duration) -> Result<Suggestion, String> {
-    let (argv, via_stdin) = build_argv(&slot.command, prompt, slot);
+/// Run one model CLI. Returns the parsed verdict and everything the process
+/// printed (kept for the transcript and the prompt inspector).
+/// `command` is the already-resolved template — the slot's opening command
+/// or its resume command with the session id substituted in.
+fn run_model(
+    slot: &ModelSlot,
+    command: &str,
+    prompt: &str,
+    timeout: Duration,
+) -> (Result<Suggestion, String>, String) {
+    let mut raw_output = String::new();
+    let result = run_inner(slot, command, prompt, timeout, &mut raw_output);
+    (result, raw_output)
+}
+
+fn run_inner(
+    slot: &ModelSlot,
+    command: &str,
+    prompt: &str,
+    timeout: Duration,
+    raw_output: &mut String,
+) -> Result<Suggestion, String> {
+    let (argv, via_stdin) = build_argv(command, prompt, slot);
     if argv.is_empty() {
         return Err("empty command template".into());
     }
@@ -171,9 +272,17 @@ fn run_model(slot: &ModelSlot, prompt: &str, timeout: Duration) -> Result<Sugges
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     let latency_ms = started.elapsed().as_millis() as i64;
+    raw_output.push_str(stdout.trim());
+    if !stderr.trim().is_empty() {
+        if !raw_output.is_empty() {
+            raw_output.push('\n');
+        }
+        raw_output.push_str("[stderr] ");
+        raw_output.push_str(stderr.trim());
+    }
 
-    let raw = extract_json(&stdout)
-        .or_else(|| extract_json(&stderr))
+    let raw = extract_verdict(&stdout)
+        .or_else(|| extract_verdict(&stderr))
         .ok_or_else(|| {
             let snippet: String = stdout.chars().take(400).collect();
             format!("no JSON verdict in output: {}", snippet.trim())
@@ -192,18 +301,21 @@ fn run_model(slot: &ModelSlot, prompt: &str, timeout: Duration) -> Result<Sugges
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_model(
     seq: u64,
     slot_idx: usize,
     slot: ModelSlot,
+    command: String,
     prompt: String,
     timeout_secs: u64,
     send: impl FnOnce(CandidateMsg) + Send + 'static,
     ctx: egui::Context,
 ) {
     std::thread::spawn(move || {
-        let result = run_model(&slot, &prompt, Duration::from_secs(timeout_secs.max(5)));
-        send(CandidateMsg { seq, slot_idx, model: slot.name.clone(), result });
+        let (result, raw) =
+            run_model(&slot, &command, &prompt, Duration::from_secs(timeout_secs.max(5)));
+        send(CandidateMsg { seq, slot_idx, model: slot.name.clone(), result, raw });
         ctx.request_repaint();
     });
 }
@@ -237,6 +349,8 @@ mod tests {
             model_flag: model_flag.into(),
             effort: effort.into(),
             effort_flag: effort_flag.into(),
+            resume_command: String::new(),
+            session_key: String::new(),
         }
     }
 
@@ -273,5 +387,47 @@ mod tests {
         // empty values leave argv untouched
         let (argv, _) = build_argv("claude -p", "hi", &slot("  ", "--model", " ", "--effort"));
         assert_eq!(argv, vec!["claude", "-p"]);
+    }
+
+    #[test]
+    fn session_id_is_found_in_jsonl_and_in_a_single_object() {
+        // codex --json emits an event stream
+        let codex = "{\"type\":\"thread.started\",\"thread_id\":\"abc-123\"}\n\
+{\"type\":\"turn.started\"}";
+        assert_eq!(extract_session_id(codex, "thread_id"), Some("abc-123".into()));
+        // agy emits one object
+        let agy = "{\"conversation_id\":\"xyz-789\",\"response\":\"hi\"}";
+        assert_eq!(extract_session_id(agy, "conversation_id"), Some("xyz-789".into()));
+        // a slot that names no key never reports one — the id is ours to pick
+        assert_eq!(extract_session_id(agy, ""), None);
+        assert_eq!(extract_session_id("plain text", "thread_id"), None);
+    }
+
+    #[test]
+    fn verdict_is_found_inside_a_cli_json_envelope() {
+        // bare text, as claude prints it
+        let bare = "Sure: {\"action\":\"keep\",\"justification\":\"fine\"}";
+        assert_eq!(extract_verdict(bare).unwrap().action, "keep");
+        // escaped inside agy's envelope
+        let wrapped = "{\"conversation_id\":\"x\",\"response\":\"\
+{\\\"action\\\":\\\"delete\\\",\\\"justification\\\":\\\"restates the code\\\"}\"}";
+        let v = extract_verdict(wrapped).unwrap();
+        assert_eq!(v.action, "delete");
+        assert_eq!(v.justification, "restates the code");
+        // escaped inside a codex JSONL event
+        let jsonl = "{\"type\":\"thread.started\",\"thread_id\":\"t\"}\n\
+{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"\
+{\\\"action\\\":\\\"rewrite\\\",\\\"comment\\\":\\\"Bump it.\\\",\\\"justification\\\":\\\"clearer\\\"}\"}}";
+        let v = extract_verdict(jsonl).unwrap();
+        assert_eq!(v.action, "rewrite");
+        assert_eq!(v.comment, "Bump it.");
+    }
+
+    #[test]
+    fn followup_prompt_carries_the_message_and_the_format() {
+        let p = followup_prompt("  too wordy — one line?  ");
+        assert!(p.starts_with("too wordy — one line?"));
+        assert!(p.contains("\"action\""));
+        assert!(p.trim_end().ends_with("}"));
     }
 }

@@ -30,6 +30,16 @@ pub struct ModelSlot {
     pub effort: String,
     #[serde(default = "default_effort_flag")]
     pub effort_flag: String,
+    /// Command used to continue an existing conversation. `{session}` is
+    /// replaced with the session id. Empty means the CLI has no resume mode,
+    /// so follow-ups are unavailable for the slot.
+    #[serde(default)]
+    pub resume_command: String,
+    /// JSON key in the CLI output that carries the session id. Empty means
+    /// the id is ours to generate — `command` must then contain `{session}`
+    /// (that is claude's `--session-id <uuid>`).
+    #[serde(default)]
+    pub session_key: String,
 }
 
 fn default_model_flag() -> String {
@@ -128,6 +138,8 @@ impl Default for Settings {
                     model_flag: "--model".into(),
                     effort: CLAUDE_EFFORT.into(),
                     effort_flag: "--effort".into(),
+                    resume_command: CLAUDE_RESUME.into(),
+                    session_key: String::new(),
                 },
                 ModelSlot {
                     name: "codex".into(),
@@ -138,6 +150,8 @@ impl Default for Settings {
                     model_flag: "--model".into(),
                     effort: CODEX_EFFORT.into(),
                     effort_flag: "-c".into(),
+                    resume_command: CODEX_RESUME.into(),
+                    session_key: "thread_id".into(),
                 },
                 // agy has no stdin mode, but it is a native .exe, so the
                 // prompt goes as an argument (32k limit, not cmd.exe's 8k).
@@ -152,6 +166,8 @@ impl Default for Settings {
                     // separate flag would be redundant here.
                     effort: String::new(),
                     effort_flag: "--effort".into(),
+                    resume_command: AGY_RESUME.into(),
+                    session_key: "conversation_id".into(),
                 },
             ],
             default_base: "main".into(),
@@ -166,13 +182,15 @@ impl Default for Settings {
 
 const KEY: &str = "settings";
 
-// The shipped command for each CLI. Piping on stdin is the default:
-// a template with no {prompt} token gets the prompt on the pipe, which
-// sidesteps both the command-line length limit and Windows' refusal to
-// pass multi-line arguments to a `.cmd` shim.
-const CLAUDE_CMD: &str = "claude -p";
-const CODEX_CMD: &str = "codex exec --skip-git-repo-check";
-const AGY_CMD: &str = "agy -p {prompt}";
+// The shipped command for each CLI, and the command that continues its
+// conversation. Each first call asks for machine-readable output so the
+// session id can be recovered — except claude, which lets us name the id.
+const CLAUDE_CMD: &str = "claude -p --session-id {session}";
+const CLAUDE_RESUME: &str = "claude -p --resume {session}";
+const CODEX_CMD: &str = "codex exec --skip-git-repo-check --json";
+const CODEX_RESUME: &str = "codex exec --skip-git-repo-check --json resume {session} -";
+const AGY_CMD: &str = "agy -p {prompt} --output-format json";
+const AGY_RESUME: &str = "agy -p {prompt} --output-format json --conversation {session}";
 
 // Start small and cheap: a first-pass comment reviewer runs on every hunk, and
 // the cheapest tier of each family handles "does this comment restate the
@@ -191,14 +209,24 @@ const STARTING_TIER: &[(&str, &str, &str, &str)] = &[
     (AGY_CMD, AGY_MODEL, "", "--effort"),
 ];
 
+/// Session wiring keyed by the command it belongs to: (command, resume, key).
+const SESSION_WIRING: &[(&str, &str, &str)] = &[
+    (CLAUDE_CMD, CLAUDE_RESUME, ""),
+    (CODEX_CMD, CODEX_RESUME, "thread_id"),
+    (AGY_CMD, AGY_RESUME, "conversation_id"),
+];
+
 /// Command templates that shipped in earlier versions, mapped to the current
-/// one. Applied on load so an existing install picks up the fix without the
-/// user having to notice and edit settings by hand.
+/// one. Applied on load so an existing install picks up fixes — and session
+/// support — without the user having to notice and edit settings by hand.
 const COMMAND_FIXUPS: &[(&str, &str)] = &[
     // Multi-line arguments are rejected outright for `.cmd` shims on Windows
     // ("batch file arguments are invalid"), so codex has to take stdin.
     ("codex exec {prompt}", CODEX_CMD),
+    ("codex exec --skip-git-repo-check", CODEX_CMD),
     ("claude -p {prompt}", CLAUDE_CMD),
+    ("claude -p", CLAUDE_CMD),
+    ("agy -p {prompt}", AGY_CMD),
     ("agy --print -", AGY_CMD),
 ];
 
@@ -246,6 +274,16 @@ impl Settings {
                         m.effort = (*effort).to_string();
                         m.effort_flag = (*effort_flag).to_string();
                     }
+                    changed = true;
+                }
+            }
+            // Fill in session wiring for a recognised command that predates it.
+            if m.resume_command.trim().is_empty() {
+                if let Some((_, resume, key)) =
+                    SESSION_WIRING.iter().find(|(cmd, _, _)| m.command.trim() == *cmd)
+                {
+                    m.resume_command = (*resume).to_string();
+                    m.session_key = (*key).to_string();
                     changed = true;
                 }
             }
