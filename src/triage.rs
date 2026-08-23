@@ -74,16 +74,10 @@ fn is_test_path(path: &str) -> bool {
         || p.contains(".spec.")
 }
 
-/// Documentation. Prose *about* locks and secrets fires the vocabulary
-/// buckets exactly as hard as code that touches them — dogfooding this tool
-/// on its own branch put the README at risk 100 for that reason — so doc
-/// files are cut to a third rather than letting their subject matter outrank
-/// the code it describes.
 fn is_doc_path(path: &str) -> bool {
     let p = path.to_ascii_lowercase();
     [".md", ".markdown", ".rst", ".txt", ".adoc"].iter().any(|ext| p.ends_with(ext))
 }
-
 pub fn assess(unit: &ReviewUnit) -> Risk {
     let mut score: u32 = 0;
     let mut reasons: Vec<String> = Vec::new();
