@@ -27,6 +27,21 @@ impl CraApp {
             "A template with no {prompt} token gets the prompt piped on stdin — preferred, since it has no length limit. Use {prompt} only for CLIs that cannot read stdin: as an argument the prompt is capped at ~32k characters, and .cmd shims (npm-installed CLIs) reject multi-line values outright. The resume template continues a conversation and must contain {session}; the session key names the JSON field the CLI reports its session id in, and is left empty for CLIs that accept an id we generate instead. CLIs must be installed and authenticated.",
         ));
         ui.add_space(4.0);
+        ui.label(theme::dim(
+            "Every CLI is started in the repository being reviewed, and the shipped templates \
+carry the flags that let it read that repository — a comment often cannot be judged without \
+looking past its own hunk. The flags differ per CLI: claude takes a tool allowlist, codex a \
+read-only sandbox, and agy the {repo} token, which names the repository as its workspace \
+(--add-dir) because it will not read a directory it was merely started in. agy also takes \
+{cli_home}: its permissions live in a settings file rather than in flags, so it is given a \
+home this app owns, granting it this repository and nothing else — your own ~/.gemini is left \
+alone. It has no shell there, only file reads and its own search, so a comment whose \
+justification would need git history is one it answers without. A hand-written \
+template that drops them leaves that model reviewing on the diff alone. Reading the \
+repository takes longer than answering from the hunk: raise the model timeout below rather \
+than the other way round.",
+        ));
+        ui.add_space(4.0);
 
         let mut remove: Option<usize> = None;
         let n_models = self.settings.models.len();
@@ -61,7 +76,7 @@ impl CraApp {
                         ui.add(
                             egui::TextEdit::singleline(&mut m.command)
                                 .desired_width(f32::INFINITY)
-                                .hint_text("mycli --print -")
+                                .hint_text("mycli --print - --dir {repo}")
                                 .font(egui::TextStyle::Monospace),
                         );
                     });

@@ -38,6 +38,12 @@ pub struct CorpusEntry {
     /// a "close, but not right" signal when scoring.
     #[serde(default)]
     pub human_edited: bool,
+    /// The repository the comment was judged in. A replay runs the models
+    /// there, so they can read the same code the reviewer could see; entries
+    /// exported before this field existed carry none, and replay in that case
+    /// falls back to the hunk alone.
+    #[serde(default)]
+    pub repo: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -60,6 +66,7 @@ impl Corpus {
                     source: row.source,
                     blinded: row.blinded,
                     human_edited: row.human_edited,
+                    repo: row.repo,
                 })
             })
             .collect();
@@ -112,11 +119,29 @@ pub fn replay(
 
     for (idx, entry) in corpus.entries.iter().enumerate() {
         let prompt = crate::comments::build_prompt(&entry.unit);
+        // A corpus outlives the checkout it came from: the repository may have
+        // been moved or deleted since, and running the models in a directory
+        // that is no longer there would fail every entry. Falling back to no
+        // working directory costs them the ability to browse, which the prompt
+        // has already promised — so say which entries lost it.
+        let repo = match entry.repo.trim() {
+            "" => String::new(),
+            path if std::path::Path::new(path).is_dir() => path.to_string(),
+            path => {
+                progress(done, total, &format!("(repo gone: {path})"));
+                String::new()
+            }
+        };
+        // A CLI whose permissions come from a config file gets the home this
+        // app manages, pointed at the repository this entry was judged in.
+        let cli_home = crate::agycli::configure(&repo).map(|h| h.to_string_lossy().to_string());
+        let cli_home = cli_home.unwrap_or_default();
         for (_, slot) in &slots {
             // A replay is one-shot per entry, so no session id is threaded
             // through; `{session}` would be meaningless without a follow-up.
             let command = slot.command.replace("{session}", &uuid::Uuid::new_v4().to_string());
-            let (result, _raw) = models::run_for_eval(slot, &command, &prompt, timeout);
+            let (result, _raw) =
+                models::run_for_eval(slot, &command, &prompt, &repo, &cli_home, timeout);
             let answer = match result {
                 Ok(s) => ReplayAnswer {
                     model: slot.name.clone(),
@@ -366,7 +391,39 @@ mod tests {
             source: "human-authored".into(),
             blinded,
             human_edited: false,
+            repo: String::new(),
         }
+    }
+
+    #[test]
+    fn a_corpus_entry_remembers_the_repository_it_was_judged_in() {
+        let dir = crate::testkit::TempDir::new("corpus_repo");
+        let db = Db::open_at(&dir.path().join("cra.db")).expect("open test db");
+        let session = db.new_session("C:/work/widgets", "branch", "feature", "main");
+        let unit = unit("src/lib.rs", 2);
+        db.log_decision(&crate::db::DecisionRecord {
+            session_id: session,
+            file: "src/lib.rs",
+            line_start: 2,
+            line_end: 2,
+            original: "    // a",
+            action: "keep",
+            final_text: "    // a",
+            source: "original",
+            human_edited: false,
+            committed: false,
+            commit_sha: None,
+            justification: None,
+            unit_json: Some(&serde_json::to_string(&unit).unwrap()),
+            blinded: true,
+        });
+
+        // Without the repository a replay cannot put the models back where the
+        // reviewer was standing, and it would measure them on strictly less
+        // than the human had.
+        let corpus = Corpus::from_db(&db, 10);
+        assert_eq!(corpus.entries.len(), 1);
+        assert_eq!(corpus.entries[0].repo, "C:/work/widgets");
     }
 
     #[test]

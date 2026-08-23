@@ -149,6 +149,7 @@ pub enum Choice {
 }
 
 /// Provenance of the final text, derived at save time.
+#[derive(Clone)]
 pub enum Provenance {
     Unchanged,
     Model { name: String, coauthor: String, edited: bool },
@@ -243,31 +244,116 @@ pub fn apply_edit(
     Ok(new_lines.len() as i64 - old_len as i64)
 }
 
-/// Commit message with app + provenance metadata trailers.
-pub fn commit_message(
-    unit: &CommentUnit,
-    action: Action,
-    provenance: &Provenance,
-    justification: Option<&str>,
-) -> String {
-    let verb = match action {
+/// One decision that has changed the working tree but is not committed yet.
+/// Accumulated across `Save and Continue` calls on the same file, so that a
+/// later `Commit and Continue` can document every one of them instead of just
+/// the last, even though `git commit` only ever sees the file's final state.
+#[derive(Clone)]
+pub struct PendingDecision {
+    pub file: String,
+    pub line: u32,
+    pub action: Action,
+    pub provenance: Provenance,
+    pub justification: Option<String>,
+    /// `(model variant, effort)` from the chosen candidate's slot, when the
+    /// decision came from a model. Either half may be empty — the CLI default.
+    pub model_info: Option<(String, String)>,
+}
+
+fn action_verb(action: Action) -> &'static str {
+    match action {
         Action::Keep => "keep",
         Action::Rewrite => "rewrite",
         Action::Delete => "delete",
-    };
-    let mut msg = format!(
-        "review(comments): {verb} comment in {}:{}\n\n",
-        unit.file, unit.start_line
-    );
-    if let Some(j) = justification {
-        if !j.trim().is_empty() {
-            msg.push_str(&format!("{}\n\n", j.trim()));
-        }
     }
-    msg.push_str("Reviewed-with: code-review-assistant\n");
-    msg.push_str(&format!("Comment-provenance: {}\n", provenance.source_str()));
+}
+
+fn push_model_trailers(msg: &mut String, provenance: &Provenance, model_info: Option<(&str, &str)>) {
     if let Provenance::Model { coauthor, .. } = provenance {
         msg.push_str(&format!("Co-authored-by: {coauthor}\n"));
+    }
+    if let Some((model, effort)) = model_info {
+        if !model.trim().is_empty() {
+            msg.push_str(&format!("Model: {}\n", model.trim()));
+        }
+        if !effort.trim().is_empty() {
+            msg.push_str(&format!("Effort: {}\n", effort.trim()));
+        }
+    }
+}
+
+/// Commit message covering every pending decision on the file being
+/// committed — the fix for a batch of `Save and Continue`s losing all but the
+/// last decision's message once `Commit and Continue` finally runs `git
+/// commit`. `entries` must be non-empty and share the same `file`.
+pub fn commit_message_batch(entries: &[PendingDecision]) -> String {
+    assert!(!entries.is_empty(), "commit_message_batch needs at least one decision");
+    if entries.len() == 1 {
+        let e = &entries[0];
+        let mut msg = format!(
+            "review(comments): {} comment in {}:{}\n\n",
+            action_verb(e.action),
+            e.file,
+            e.line
+        );
+        if let Some(j) = &e.justification {
+            if !j.trim().is_empty() {
+                msg.push_str(&format!("{}\n\n", j.trim()));
+            }
+        }
+        msg.push_str("Reviewed-with: code-review-assistant\n");
+        msg.push_str(&format!("Comment-provenance: {}\n", e.provenance.source_str()));
+        push_model_trailers(&mut msg, &e.provenance, e.model_info.as_ref().map(|(m, ef)| (m.as_str(), ef.as_str())));
+        return msg;
+    }
+
+    let file = &entries[0].file;
+    let mut msg = format!("review(comments): {} comment decisions in {file}\n\n", entries.len());
+    for e in entries {
+        msg.push_str(&format!("- {} {file}:{}", action_verb(e.action), e.line));
+        let mut detail: Vec<String> = vec![e.provenance.source_str()];
+        if let Some((model, _)) = &e.model_info {
+            if !model.trim().is_empty() {
+                detail.push(model.trim().to_string());
+            }
+        }
+        msg.push_str(&format!(" ({})", detail.join(", ")));
+        if let Some(j) = &e.justification {
+            if !j.trim().is_empty() {
+                msg.push_str(&format!(" — {}", j.trim()));
+            }
+        }
+        msg.push('\n');
+    }
+    msg.push('\n');
+    msg.push_str("Reviewed-with: code-review-assistant\n");
+
+    // Trailers are deduplicated across the batch: several decisions may share
+    // the same model, and repeating its Co-authored-by would just be noise
+    // (and some git hosts collapse it anyway).
+    let mut coauthors: Vec<&str> = Vec::new();
+    let mut model_infos: Vec<(&str, &str)> = Vec::new();
+    for e in entries {
+        if let Provenance::Model { coauthor, .. } = &e.provenance {
+            if !coauthors.contains(&coauthor.as_str()) {
+                coauthors.push(coauthor);
+            }
+        }
+        if let Some((model, effort)) = &e.model_info {
+            let pair = (model.as_str(), effort.as_str());
+            if !model.trim().is_empty() && !model_infos.contains(&pair) {
+                model_infos.push(pair);
+            }
+        }
+    }
+    for coauthor in &coauthors {
+        msg.push_str(&format!("Co-authored-by: {coauthor}\n"));
+    }
+    for (model, effort) in &model_infos {
+        msg.push_str(&format!("Model: {model}\n"));
+        if !effort.trim().is_empty() {
+            msg.push_str(&format!("Effort: {}\n", effort.trim()));
+        }
     }
     msg
 }
@@ -344,18 +430,76 @@ mod tests {
         assert_eq!(p.source_str(), "original");
     }
 
+    fn pending(file: &str, line: u32, action: Action, justification: &str) -> PendingDecision {
+        PendingDecision {
+            file: file.into(),
+            line,
+            action,
+            provenance: Provenance::Model {
+                name: "claude".into(),
+                coauthor: "Claude <noreply@anthropic.com>".into(),
+                edited: false,
+            },
+            justification: Some(justification.into()),
+            model_info: Some(("claude-sonnet-5".into(), "low".into())),
+        }
+    }
+
     #[test]
-    fn commit_message_has_trailers() {
-        let prov = Provenance::Model {
+    fn a_single_pending_decision_reads_like_the_old_single_commit_message() {
+        let mut e = pending("src/lib.rs", 2, Action::Rewrite, "clearer");
+        e.provenance = Provenance::Model {
             name: "claude".into(),
             coauthor: "Claude <noreply@anthropic.com>".into(),
             edited: true,
         };
-        let msg = commit_message(&unit(), Action::Rewrite, &prov, Some("clearer"));
+        e.model_info = None;
+        let msg = commit_message_batch(&[e]);
         assert!(msg.starts_with("review(comments): rewrite comment in src/lib.rs:2"));
+        assert!(msg.contains("clearer"));
         assert!(msg.contains("Reviewed-with: code-review-assistant"));
         assert!(msg.contains("Comment-provenance: claude+human-edited"));
         assert!(msg.contains("Co-authored-by: Claude <noreply@anthropic.com>"));
+    }
+
+    #[test]
+    fn commit_message_records_model_and_effort() {
+        let entries = vec![pending("src/lib.rs", 2, Action::Rewrite, "clearer")];
+        let msg = commit_message_batch(&entries);
+        assert!(msg.contains("Model: claude-sonnet-5"));
+        assert!(msg.contains("Effort: low"));
+    }
+
+    #[test]
+    fn commit_message_omits_empty_model_and_effort() {
+        let entries = vec![PendingDecision {
+            file: "src/lib.rs".into(),
+            line: 2,
+            action: Action::Delete,
+            provenance: Provenance::Human,
+            justification: None,
+            model_info: Some(("".into(), "".into())),
+        }];
+        let msg = commit_message_batch(&entries);
+        assert!(!msg.contains("Model:"));
+        assert!(!msg.contains("Effort:"));
+    }
+
+    #[test]
+    fn batch_documents_every_pending_decision() {
+        let entries = vec![
+            pending("src/lib.rs", 2, Action::Delete, "restates the code"),
+            pending("src/lib.rs", 9, Action::Rewrite, "clarifies the retry limit"),
+        ];
+        let msg = commit_message_batch(&entries);
+        assert!(msg.starts_with("review(comments): 2 comment decisions in src/lib.rs"));
+        assert!(msg.contains("delete src/lib.rs:2"), "{msg}");
+        assert!(msg.contains("restates the code"), "{msg}");
+        assert!(msg.contains("rewrite src/lib.rs:9"), "{msg}");
+        assert!(msg.contains("clarifies the retry limit"), "{msg}");
+        // Trailers are deduplicated, not repeated once per decision.
+        assert_eq!(msg.matches("Co-authored-by:").count(), 1, "{msg}");
+        assert_eq!(msg.matches("Model:").count(), 1, "{msg}");
     }
 
     #[test]

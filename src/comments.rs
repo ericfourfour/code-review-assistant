@@ -283,12 +283,25 @@ fn make_unit(
     }
 }
 
-/// The minimalist prompt sent to each model CLI. We assume the models already
-/// know what a good comment looks like; we only supply the code and the ask.
+/// The prompt sent to each model CLI. We assume the models already know what a
+/// good comment looks like; we supply the code, the ask, and the fact that the
+/// rest of the repository is theirs to read.
+///
+/// The hunk on its own is often too little to judge by. A comment that seems to
+/// restate its line is doing real work if the thing it names is defined three
+/// files away; one that reads like noise is load-bearing if it records why the
+/// obvious implementation was rejected. Either call needs the surrounding code,
+/// so the CLI is started in the repository root with read-only tools, and the
+/// path below is relative to that root.
 pub fn build_prompt(unit: &CommentUnit) -> String {
     format!(
         "File: {} ({})\n\n{}\nReview the comment marked with '>' (lines {}-{}). \
-Should it be kept, rewritten, or deleted?\n\
+Should it be kept, rewritten, or deleted?\n\n\
+You are running in the root of the repository this comment lives in, and the \
+path above is relative to it. Read whatever you need before deciding: the rest \
+of the file, what it calls, who calls it, the tests. Judge the comment against \
+the code as it actually is — delete one that only restates the line below it, \
+keep one that carries something the code cannot say for itself.\n\n\
 Answer with JSON only:\n\
 {{\"action\":\"keep|rewrite|delete\",\"comment\":\"replacement text if rewrite, else empty\",\"justification\":\"one short sentence\"}}",
         unit.file, unit.lang, unit.context, unit.start_line, unit.end_line
@@ -391,12 +404,16 @@ diff --git a/a.c b/a.c
     }
 
     #[test]
-    fn prompt_is_minimal_but_contextual() {
+    fn prompt_is_contextual_and_opens_the_repo() {
         let out = units_for(RS_DIFF);
         let p = build_prompt(&out[0].1[0]);
         assert!(p.contains("src/lib.rs"));
         assert!(p.contains("lines 2-3"));
         assert!(p.contains("\"action\""));
-        assert!(p.len() < 2000);
+        // A path is only useful to the model once it knows what it is relative
+        // to, and it will not go looking unless it is told it may.
+        assert!(p.contains("root of the repository"), "{p}");
+        assert!(p.contains("relative to it"), "{p}");
+        assert!(p.len() < 2500);
     }
 }

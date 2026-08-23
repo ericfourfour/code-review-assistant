@@ -49,6 +49,28 @@ pub struct Turn {
     pub reply: String,
 }
 
+/// How much of a CLI's output the inspector keeps. A model that reads its way
+/// around the repository prints whole files into its transcript, and the whole
+/// thing is laid out again on every repaint of the prompt window. The ends are
+/// where anything useful is — the CLI's envelope at the top, the verdict at the
+/// bottom — so the middle is what goes.
+const TRANSCRIPT_HEAD: usize = 2_000;
+const TRANSCRIPT_TAIL: usize = 4_000;
+
+/// The output as the transcript should keep it. Parsing has already happened
+/// against the full text by the time this is called; this is only what the
+/// human is shown.
+pub fn transcript_excerpt(raw: &str) -> String {
+    let total = raw.chars().count();
+    let kept = TRANSCRIPT_HEAD + TRANSCRIPT_TAIL;
+    if total <= kept {
+        return raw.to_string();
+    }
+    let head: String = raw.chars().take(TRANSCRIPT_HEAD).collect();
+    let tail: String = raw.chars().skip(total - TRANSCRIPT_TAIL).collect();
+    format!("{head}\n\n… {} characters elided …\n\n{tail}", total - kept)
+}
+
 /// The prompt for a follow-up turn. The conversation itself lives in the
 /// CLI's own session, so only the new message and the answer format go over.
 pub fn followup_prompt(message: &str) -> String {
@@ -80,21 +102,38 @@ pub struct CandidateMsg {
     pub raw: String,
 }
 
-/// Split the command template into argv, substituting `{prompt}` and
-/// appending the model selection. Returns (argv, prompt_via_stdin).
+/// Split the command template into argv, substituting `{prompt}` and `{repo}`
+/// and appending the model selection. Returns (argv, prompt_via_stdin).
 ///
 /// Piping is the default: a template without `{prompt}` gets the prompt on
 /// stdin, which sidesteps both the command-line length limit and Windows'
 /// refusal to pass multi-line arguments to a `.cmd` shim.
-fn build_argv(template: &str, prompt: &str, slot: &ModelSlot) -> (Vec<String>, bool) {
+///
+/// `{repo}` is for CLIs that need the repository named rather than merely
+/// being started in it — agy will not read a directory that is not in its
+/// workspace, however it was launched. `{cli_home}` is for one whose
+/// permissions live in a config file rather than in flags: it points the CLI
+/// at a home this app owns, so the rules it runs under are the reviewer's and
+/// not the user's own. Both are substituted inside their token, so a path with
+/// spaces in it stays one argument.
+fn build_argv(
+    template: &str,
+    prompt: &str,
+    repo: &str,
+    cli_home: &str,
+    slot: &ModelSlot,
+) -> (Vec<String>, bool) {
     let mut argv: Vec<String> = Vec::new();
     let mut used_placeholder = false;
+    // No repository (a replay whose checkout has gone) leaves the CLI pointed
+    // at wherever it was started, which is what it would default to anyway.
+    let repo = if repo.trim().is_empty() { "." } else { repo.trim() };
     for tok in template.split_whitespace() {
         if tok == "{prompt}" {
             argv.push(prompt.to_string());
             used_placeholder = true;
         } else {
-            argv.push(tok.to_string());
+            argv.push(tok.replace("{repo}", repo).replace("{cli_home}", cli_home));
         }
     }
     // Append rather than splice: inserting ahead of the prompt would land
@@ -213,29 +252,76 @@ fn extract_json(output: &str) -> Option<RawSuggestion> {
     None
 }
 
+/// The most useful error available when the output carried no verdict.
+///
+/// A CLI that refuses one of its own tools reports it in its envelope and
+/// still exits 0, so without this the slot shows a wall of JSON with the one
+/// line that explains it buried inside.
+fn cli_error(name: &str, stdout: &str, stderr: &str) -> String {
+    for out in [stdout, stderr] {
+        let reported = json_documents(out).iter().find_map(|v| find_string_key(v, "error"));
+        if let Some(msg) = reported.filter(|m| !m.trim().is_empty()) {
+            return refused_tool(name, &msg).unwrap_or(msg);
+        }
+    }
+    let snippet: String = stdout.chars().take(400).collect();
+    format!("no JSON verdict in output: {}", snippet.trim())
+}
+
+/// Rewrite a permission refusal into something actionable. This is not a
+/// broken CLI and retrying will not help — its own rules said no — so the
+/// message has to name the command it wanted and where that gets decided.
+fn refused_tool(name: &str, msg: &str) -> Option<String> {
+    if !msg.to_ascii_lowercase().contains("permission") {
+        return None;
+    }
+    // The command is quoted in the refusal; fall back to the whole message
+    // rather than guessing if this CLI words it differently.
+    let wanted = msg.split('"').nth(1).map(str::trim).filter(|c| !c.is_empty());
+    Some(match wanted {
+        Some(cmd) => format!(
+            "{name} refused a tool it wanted: `{cmd}`. Nothing ran, and retrying will not \
+             help until that command is allowed in the CLI's own permission settings. \
+             Reviewing needs only file reads, so a slot that keeps hitting this is reaching \
+             for shell commands it does not need."
+        ),
+        None => format!("{name} refused a tool it wanted: {}", msg.trim()),
+    })
+}
+
 /// Run one model CLI. Returns the parsed verdict and everything the process
 /// printed (kept for the transcript and the prompt inspector).
 /// `command` is the already-resolved template — the slot's opening command
 /// or its resume command with the session id substituted in.
+///
+/// `repo` is the directory the CLI runs in, which is what makes the rest of
+/// the codebase reachable: the prompt names files by their path relative to
+/// the repository root, so the model can only open them if that is where it
+/// started. Empty means "inherit ours", which is what the unit tests use.
 fn run_model(
     slot: &ModelSlot,
     command: &str,
     prompt: &str,
+    repo: &str,
+    cli_home: &str,
     timeout: Duration,
 ) -> (Result<Suggestion, String>, String) {
     let mut raw_output = String::new();
-    let result = run_inner(slot, command, prompt, timeout, &mut raw_output);
+    let result = run_inner(slot, command, prompt, repo, cli_home, timeout, &mut raw_output);
     (result, raw_output)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_inner(
     slot: &ModelSlot,
     command: &str,
     prompt: &str,
+    repo: &str,
+    cli_home: &str,
     timeout: Duration,
     raw_output: &mut String,
 ) -> Result<Suggestion, String> {
-    let (argv, via_stdin) = build_argv(command, prompt, slot);
+    let (argv, via_stdin) = build_argv(command, prompt, repo, cli_home, slot);
     if argv.is_empty() {
         return Err("empty command template".into());
     }
@@ -245,6 +331,9 @@ fn run_inner(
         .stdin(if via_stdin { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if !repo.trim().is_empty() {
+        cmd.current_dir(repo);
+    }
     let mut child = cmd.spawn().map_err(|e| format!("spawn `{}`: {e}", argv[0]))?;
     if via_stdin {
         if let Some(mut stdin) = child.stdin.take() {
@@ -283,10 +372,7 @@ fn run_inner(
 
     let raw = extract_verdict(&stdout)
         .or_else(|| extract_verdict(&stderr))
-        .ok_or_else(|| {
-            let snippet: String = stdout.chars().take(400).collect();
-            format!("no JSON verdict in output: {}", snippet.trim())
-        })?;
+        .ok_or_else(|| cli_error(&slot.name, &stdout, &stderr))?;
     let action = match raw.action.to_ascii_lowercase().as_str() {
         "keep" => Action::Keep,
         "rewrite" => Action::Rewrite,
@@ -307,9 +393,11 @@ pub fn run_for_eval(
     slot: &ModelSlot,
     command: &str,
     prompt: &str,
+    repo: &str,
+    cli_home: &str,
     timeout: Duration,
 ) -> (Result<Suggestion, String>, String) {
-    run_model(slot, command, prompt, timeout)
+    run_model(slot, command, prompt, repo, cli_home, timeout)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -319,13 +407,15 @@ pub fn spawn_model(
     slot: ModelSlot,
     command: String,
     prompt: String,
+    repo: String,
+    cli_home: String,
     timeout_secs: u64,
     send: impl FnOnce(CandidateMsg) + Send + 'static,
     ctx: egui::Context,
 ) {
     std::thread::spawn(move || {
         let (result, raw) =
-            run_model(&slot, &command, &prompt, Duration::from_secs(timeout_secs.max(5)));
+            run_model(&slot, &command, &prompt, &repo, &cli_home, Duration::from_secs(timeout_secs.max(5)));
         send(CandidateMsg { seq, slot_idx, model: slot.name.clone(), result, raw });
         ctx.request_repaint();
     });
@@ -369,27 +459,30 @@ mod tests {
     #[test]
     fn argv_placeholder_vs_stdin() {
         let bare = slot("", "--model", "", "--effort");
-        let (argv, stdin) = build_argv("claude -p {prompt}", "hello", &bare);
+        let (argv, stdin) = build_argv("claude -p {prompt}", "hello", "", "", &bare);
         assert_eq!(argv, vec!["claude", "-p", "hello"]);
         assert!(!stdin);
-        let (argv, stdin) = build_argv("codex exec", "hello", &bare);
+        let (argv, stdin) = build_argv("codex exec", "hello", "", "", &bare);
         assert_eq!(argv, vec!["codex", "exec"]);
         assert!(stdin);
     }
 
     #[test]
     fn model_and_effort_trail_so_they_never_split_a_flag_from_its_value() {
-        let (argv, _) = build_argv("claude -p", "hi", &slot("haiku", "--model", "low", "--effort"));
+        let (argv, _) =
+            build_argv("claude -p", "hi", "", "", &slot("haiku", "--model", "low", "--effort"));
         assert_eq!(argv, vec!["claude", "-p", "--model", "haiku", "--effort", "low"]);
         // `agy -p {prompt}` passes the prompt as -p's value, so the flags must
         // land after it — inserting ahead would make -p consume "--model".
         let (argv, _) =
-            build_argv("agy -p {prompt}", "hi", &slot("gemini-3.7-flash-low", "--model", "", ""));
+            build_argv("agy -p {prompt}", "hi", "", "", &slot("gemini-3.7-flash-low", "--model", "", ""));
         assert_eq!(argv, vec!["agy", "-p", "hi", "--model", "gemini-3.7-flash-low"]);
         // codex routes effort through a config override rather than a flag
         let (argv, _) = build_argv(
             "codex exec",
             "hi",
+            "",
+            "",
             &slot("gpt-5.6-luna", "--model", "model_reasoning_effort=low", "-c"),
         );
         assert_eq!(
@@ -397,8 +490,41 @@ mod tests {
             vec!["codex", "exec", "--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=low"]
         );
         // empty values leave argv untouched
-        let (argv, _) = build_argv("claude -p", "hi", &slot("  ", "--model", " ", "--effort"));
+        let (argv, _) = build_argv("claude -p", "hi", "", "", &slot("  ", "--model", " ", "--effort"));
         assert_eq!(argv, vec!["claude", "-p"]);
+    }
+
+    #[test]
+    fn the_cli_home_token_points_a_cli_at_the_config_this_app_owns() {
+        let bare = slot("", "--model", "", "--effort");
+        let (argv, _) = build_argv(
+            "agy --gemini_dir={cli_home} -p {prompt} --add-dir {repo}",
+            "hi",
+            "C:/code/app",
+            "C:/data/agy home",
+            &bare,
+        );
+        // The flag takes its value with an `=`, so the substitution has to
+        // happen inside the token — and a space in the path must not split it.
+        assert_eq!(
+            argv,
+            vec!["agy", "--gemini_dir=C:/data/agy home", "-p", "hi", "--add-dir", "C:/code/app"]
+        );
+    }
+
+    #[test]
+    fn the_repo_token_names_the_directory_and_survives_spaces_in_it() {
+        let bare = slot("", "--model", "", "--effort");
+        let (argv, _) = build_argv("agy -p {prompt} --add-dir {repo}", "hi", "C:/code/app", "", &bare);
+        assert_eq!(argv, vec!["agy", "-p", "hi", "--add-dir", "C:/code/app"]);
+        // The template is tokenized on whitespace, so a path with a space in
+        // it has to come back out as one argument rather than two.
+        let (argv, _) =
+            build_argv("agy --add-dir {repo}", "hi", "C:/my code/app", "", &bare);
+        assert_eq!(argv, vec!["agy", "--add-dir", "C:/my code/app"]);
+        // A replay whose checkout is gone still has to produce a valid argv.
+        let (argv, _) = build_argv("agy --add-dir {repo}", "hi", "", "", &bare);
+        assert_eq!(argv, vec!["agy", "--add-dir", "."]);
     }
 
     #[test]
@@ -436,6 +562,58 @@ mod tests {
     }
 
     #[test]
+    fn a_verdict_survives_an_envelope_that_also_reports_a_refusal() {
+        // What agy returns once it has a rule to bounce off rather than an
+        // unanswerable confirmation: it routes around the refused command,
+        // answers from files, and reports both. The verdict is the part that
+        // matters, so a slot must show a candidate and not an error.
+        let mixed = "{\"conversation_id\":\"x\",\"status\":\"ERROR\",\"response\":\"\
+{\\\"action\\\":\\\"keep\\\",\\\"comment\\\":\\\"\\\",\\\"justification\\\":\\\"reads fine\\\"}\",\
+\"error\":\"permission check failed for command \\\"git log -1\\\": Matches user-configured \
+deny rule.\"}";
+        let v = extract_verdict(mixed).expect("verdict alongside the refusal");
+        assert_eq!(v.action, "keep");
+        assert_eq!(v.justification, "reads fine");
+    }
+
+    #[test]
+    fn a_refused_tool_is_reported_as_itself_rather_than_as_unparseable_output() {
+        // agy exits 0 and puts the refusal in its envelope, so the slot would
+        // otherwise show a JSON blob whose first 400 characters say nothing.
+        let refusal = "{\"conversation_id\":\"x\",\"status\":\"ERROR\",\"response\":\"\",\
+\"error\":\"permission check failed for command \\\"git log -1\\\": user denied permission\"}";
+        let err = cli_error("agy", refusal, "");
+        assert!(err.contains("git log -1"), "the command it wanted must survive: {err}");
+        assert!(err.contains("agy"), "the slot must be named: {err}");
+        assert!(!err.contains("no JSON verdict"), "{err}");
+
+        // An envelope error that is not about permissions is passed through.
+        let other = "{\"status\":\"ERROR\",\"error\":\"model capacity exhausted\"}";
+        assert_eq!(cli_error("agy", other, ""), "model capacity exhausted");
+
+        // Output with nothing to go on still says what it saw.
+        assert!(cli_error("codex", "garbage", "").contains("no JSON verdict"));
+    }
+
+    #[test]
+    fn a_long_transcript_keeps_the_envelope_and_the_verdict() {
+        let short = "{\"action\":\"keep\"}";
+        assert_eq!(transcript_excerpt(short), short, "a normal reply is untouched");
+
+        // What a CLI prints when the model reads a few files on its way to an
+        // answer: an opening event, a wall of file content, then the verdict.
+        let long = format!(
+            "{{\"type\":\"thread.started\",\"thread_id\":\"t-1\"}}\n{}\n{{\"action\":\"delete\"}}",
+            "x".repeat(200_000)
+        );
+        let kept = transcript_excerpt(&long);
+        assert!(kept.chars().count() < 7_000, "still {} chars", kept.chars().count());
+        assert!(kept.starts_with("{\"type\":\"thread.started\""), "lost the envelope");
+        assert!(kept.ends_with("{\"action\":\"delete\"}"), "lost the verdict");
+        assert!(kept.contains("characters elided"), "the cut should be visible: {kept:.200}");
+    }
+
+    #[test]
     fn followup_prompt_carries_the_message_and_the_format() {
         let p = followup_prompt("  too wordy — one line?  ");
         assert!(p.starts_with("too wordy — one line?"));
@@ -454,7 +632,7 @@ mod spawn_tests {
 
     fn run(slot: &ModelSlot, prompt: &str) -> (Result<Suggestion, String>, String) {
         let command = slot.command.clone();
-        run_model(slot, &command, prompt, Duration::from_secs(30))
+        run_model(slot, &command, prompt, "", "", Duration::from_secs(30))
     }
 
     #[test]
@@ -530,7 +708,7 @@ mod spawn_tests {
         );
         let slot = cli.slot("");
         let started = Instant::now();
-        let (res, _) = run_model(&slot, &slot.command, "hi", Duration::from_secs(1));
+        let (res, _) = run_model(&slot, &slot.command, "hi", "", "", Duration::from_secs(1));
         let err = res.unwrap_err();
         assert!(err.contains("timed out"), "{err}");
         // A slot that never returns would wedge the review; the poll loop has
@@ -564,10 +742,34 @@ mod spawn_tests {
             FakeCli::new(&dir, "second", FakeCliSpec { reply: VERDICT, ..Default::default() });
         slot.resume_command = format!("{} resume {{session}}", second.command());
         let resume = slot.resume_command.replace("{session}", &session);
-        let (res2, _) = run_model(&slot, &resume, &followup_prompt("why?"), Duration::from_secs(30));
+        let (res2, _) =
+            run_model(&slot, &resume, &followup_prompt("why?"), "", "", Duration::from_secs(30));
         assert!(res2.is_ok());
         assert!(second.argv_seen().contains("resume sess-42"), "{}", second.argv_seen());
         assert!(second.stdin_seen().contains("why?"), "{}", second.stdin_seen());
+    }
+
+    #[test]
+    fn the_cli_runs_in_the_repository_it_is_reviewing() {
+        let dir = TempDir::new("cwd");
+        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let repo = TempDir::new("cwd_repo");
+        let slot = cli.slot("");
+
+        let (res, _) = run_model(
+            &slot,
+            &slot.command,
+            "hi",
+            &repo.path().to_string_lossy(),
+            "",
+            Duration::from_secs(30),
+        );
+        assert!(res.is_ok());
+        // The prompt names files by their path relative to the repository
+        // root, so anywhere else the model has nothing it can open.
+        let seen = std::fs::canonicalize(cli.cwd_seen()).expect("child cwd");
+        let want = std::fs::canonicalize(repo.path()).expect("repo path");
+        assert_eq!(seen, want);
     }
 
     #[test]
@@ -584,13 +786,33 @@ mod spawn_tests {
 mod live_tests {
     use super::*;
     use crate::settings::Settings;
+    use crate::testkit::TempRepo;
+
+    /// A value the model can only report by opening a file the prompt never
+    /// quotes, so a CLI that answered from the prompt alone is distinguishable
+    /// from one that actually browsed the repository.
+    const RETRY_LIMIT: &str = "4291";
+
+    /// A repository whose comment cannot be judged from the diff alone: what
+    /// "the configured limit" means lives in a file next door.
+    fn browsable_repo() -> TempRepo {
+        let repo = TempRepo::new("live_browse");
+        repo.write("src/config.rs", &format!("pub const RETRY_LIMIT: u32 = {RETRY_LIMIT};\n"));
+        repo.write(
+            "src/net.rs",
+            "use crate::config::RETRY_LIMIT;\n\npub fn connect() {\n    \
+             // Retry up to the configured limit.\n    for _ in 0..RETRY_LIMIT {}\n}\n",
+        );
+        repo.commit("seed");
+        repo
+    }
 
     fn verdict_prompt(extra: &str) -> String {
         format!(
-            "File: src/lib.rs (Rust)\n\n\
->    2|     // Increment the counter by one\n \
-    3|     counter += 1;\n\n\
-Review the comment marked with '>' (lines 2-2). \
+            "File: src/net.rs (Rust)\n\n\
+>    4|     // Retry up to the configured limit.\n \
+    5|     for _ in 0..RETRY_LIMIT {{}}\n\n\
+Review the comment marked with '>' (lines 4-4). \
 Should it be kept, rewritten, or deleted?{extra}\n\
 Answer with JSON only:\n\
 {{\"action\":\"keep|rewrite|delete\",\"comment\":\"replacement text if rewrite, else empty\",\"justification\":\"one short sentence\"}}"
@@ -600,16 +822,29 @@ Answer with JSON only:\n\
     /// Two real turns per configured CLI, resuming by session id between them.
     /// Exercises argv building, PATHEXT resolution, stdin piping, verdict
     /// extraction from each CLI's JSON envelope, session-id capture, and the
-    /// resume command. The second turn asks for a number that only exists in
-    /// the first turn, so a broken session shows up as a wrong answer rather
-    /// than a passing test.
+    /// resume command.
+    ///
+    /// Both turns are answerable only from the repository. Turn 1 asks for a
+    /// constant defined in a file the prompt does not quote, so a slot whose
+    /// tools are switched off — or one started in the wrong directory — fails
+    /// here instead of quietly reviewing on the diff alone. Turn 2 asks for
+    /// the same number back, so a lost session shows up as a wrong answer.
     ///
     /// Ignored by default; costs six model calls:
     ///     cargo test -- --ignored --nocapture
     #[test]
     #[ignore]
-    fn configured_clis_hold_a_session_across_two_turns() {
-        let timeout = Duration::from_secs(180);
+    fn configured_clis_browse_the_repo_and_hold_a_session() {
+        let timeout = Duration::from_secs(300);
+        let repo = browsable_repo();
+        let repo_path = repo.path();
+        // A slot whose permissions come from a config file gets the home this
+        // app writes; the shipped agy template will not read the repo without
+        // it, so the test would be measuring the wrong thing.
+        let cli_home = crate::agycli::configure(&repo_path)
+            .expect("write CLI permissions")
+            .to_string_lossy()
+            .to_string();
         let mut failures: Vec<String> = Vec::new();
 
         for (_, slot) in Settings::default().enabled_models() {
@@ -620,10 +855,21 @@ Answer with JSON only:\n\
             } else {
                 (slot.command.clone(), None)
             };
-            let first = verdict_prompt(" Also remember the number 4291 for later.");
-            let (res, raw) = run_model(&slot, &command, &first, timeout);
+            let first = verdict_prompt(
+                " This repository defines RETRY_LIMIT somewhere; open the file that \
+                 defines it and start your justification with its value.",
+            );
+            let (res, raw) = run_model(&slot, &command, &first, &repo_path, &cli_home, timeout);
             match &res {
-                Ok(v) => println!("{:>6} turn 1: {} — {}", slot.name, v.action.label(), v.justification),
+                Ok(v) => {
+                    println!("{:>6} turn 1: {} — {}", slot.name, v.action.label(), v.justification);
+                    if !v.justification.contains(RETRY_LIMIT) {
+                        failures.push(format!(
+                            "{}: did not read the repo — turn 1 said {:?}",
+                            slot.name, v.justification
+                        ));
+                    }
+                }
                 Err(e) => {
                     println!("{:>6} turn 1: FAILED {e}", slot.name);
                     failures.push(format!("{} turn 1: {e}", slot.name));
@@ -643,13 +889,14 @@ Answer with JSON only:\n\
             // Turn 2 — resume, and ask for something only turn 1 established.
             let resume = slot.resume_command.replace("{session}", &session);
             let second = followup_prompt(
-                "What number did I ask you to remember? Put just that number in \"justification\".",
+                "What was the value of RETRY_LIMIT you found? \
+                 Put just that number in \"justification\".",
             );
-            let (res2, raw2) = run_model(&slot, &resume, &second, timeout);
+            let (res2, raw2) = run_model(&slot, &resume, &second, &repo_path, &cli_home, timeout);
             match res2 {
                 Ok(v) => {
                     println!("{:>6} turn 2: justification = {}", slot.name, v.justification);
-                    if !v.justification.contains("4291") {
+                    if !v.justification.contains(RETRY_LIMIT) {
                         failures.push(format!(
                             "{}: session lost — turn 2 said {:?}",
                             slot.name, v.justification
@@ -666,6 +913,6 @@ Answer with JSON only:\n\
                 }
             }
         }
-        assert!(failures.is_empty(), "session round-trip failed:\n  {}", failures.join("\n  "));
+        assert!(failures.is_empty(), "live round-trip failed:\n  {}", failures.join("\n  "));
     }
 }

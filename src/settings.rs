@@ -133,7 +133,13 @@ pub struct Settings {
 }
 
 /// Current settings schema. Bump when adding a one-shot migration step.
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
+
+/// A model that reads its way around the repository before answering takes far
+/// longer than one that only reads the hunk, so the ceiling that was generous
+/// for a single-shot verdict is not generous for a browsing one.
+const DEFAULT_TIMEOUT_SECS: u64 = 300;
+const PRE_BROWSE_TIMEOUT_SECS: u64 = 120;
 
 impl Default for Settings {
     fn default() -> Self {
@@ -182,7 +188,7 @@ impl Default for Settings {
             ],
             default_base: "main".into(),
             gh_path: "gh".into(),
-            model_timeout_secs: 120,
+            model_timeout_secs: DEFAULT_TIMEOUT_SECS,
             context_lines: 12,
             recent_repos: Vec::new(),
             blind_review: default_blind_review(),
@@ -196,12 +202,36 @@ const KEY: &str = "settings";
 // The shipped command for each CLI, and the command that continues its
 // conversation. Each first call asks for machine-readable output so the
 // session id can be recovered — except claude, which lets us name the id.
-const CLAUDE_CMD: &str = "claude -p --session-id {session}";
-const CLAUDE_RESUME: &str = "claude -p --resume {session}";
-const CODEX_CMD: &str = "codex exec --skip-git-repo-check --json";
-const CODEX_RESUME: &str = "codex exec --skip-git-repo-check --json resume {session} -";
-const AGY_CMD: &str = "agy -p {prompt} --output-format json";
-const AGY_RESUME: &str = "agy -p {prompt} --output-format json --conversation {session}";
+//
+// Every template also grants the CLI read-only run of the repository it is
+// started in, because a comment cannot be judged from its own hunk alone. The
+// three CLIs spell that differently: claude takes a tool allowlist and codex a
+// sandbox mode, both of which apply to wherever the process was started.
+//
+// agy scopes access to a workspace instead of a working directory, and reading
+// inside that workspace is allowed without a prompt — so it is handed the
+// repository with `--add-dir {repo}`, which is what makes its own read and
+// search tools usable rather than blocked. Plan mode keeps it off the working
+// tree, which matters here because a workspace is writable by default and the
+// edits are ours to apply.
+//
+// Its permissions live in a settings file rather than in flags, so it is also
+// given a home of its own with `--gemini_dir={cli_home}`; see [`crate::agycli`]
+// for what that home allows and why it is not the user's. Its `--sandbox` flag
+// is deliberately absent: measured on Windows, a command run under it wants an
+// admin escalation that print mode cannot prompt for, and the run dies with
+// "context canceled".
+const CLAUDE_CMD: &str = "claude -p --session-id {session} \
+                          --tools Read,Grep,Glob --allowed-tools Read,Grep,Glob";
+const CLAUDE_RESUME: &str = "claude -p --resume {session} \
+                             --tools Read,Grep,Glob --allowed-tools Read,Grep,Glob";
+const CODEX_CMD: &str = "codex exec --skip-git-repo-check --json --sandbox read-only";
+const CODEX_RESUME: &str =
+    "codex exec --skip-git-repo-check --json --sandbox read-only resume {session} -";
+const AGY_CMD: &str = "agy --gemini_dir={cli_home} -p {prompt} --output-format json \
+                       --mode plan --add-dir {repo}";
+const AGY_RESUME: &str = "agy --gemini_dir={cli_home} -p {prompt} --output-format json \
+                          --mode plan --add-dir {repo} --conversation {session}";
 
 // Start small and cheap: a first-pass comment reviewer runs on every hunk, and
 // the cheapest tier of each family handles "does this comment restate the
@@ -228,8 +258,9 @@ const SESSION_WIRING: &[(&str, &str, &str)] = &[
 ];
 
 /// Command templates that shipped in earlier versions, mapped to the current
-/// one. Applied on load so an existing install picks up fixes — and session
-/// support — without the user having to notice and edit settings by hand.
+/// one. Applied on load to both the opening and the resume template, so an
+/// existing install picks up fixes — and session support, and repo access —
+/// without the user having to notice and edit settings by hand.
 const COMMAND_FIXUPS: &[(&str, &str)] = &[
     // Multi-line arguments are rejected outright for `.cmd` shims on Windows
     // ("batch file arguments are invalid"), so codex has to take stdin.
@@ -239,6 +270,22 @@ const COMMAND_FIXUPS: &[(&str, &str)] = &[
     ("claude -p", CLAUDE_CMD),
     ("agy -p {prompt}", AGY_CMD),
     ("agy --print -", AGY_CMD),
+    // Shipped before the models were allowed to read the repository: same
+    // CLIs, same sessions, no way to look past the hunk.
+    ("claude -p --session-id {session}", CLAUDE_CMD),
+    ("claude -p --resume {session}", CLAUDE_RESUME),
+    ("codex exec --skip-git-repo-check --json", CODEX_CMD),
+    ("codex exec --skip-git-repo-check --json resume {session} -", CODEX_RESUME),
+    ("agy -p {prompt} --output-format json", AGY_CMD),
+    ("agy -p {prompt} --output-format json --conversation {session}", AGY_RESUME),
+    // Shipped briefly with repo access but no home of its own, which left it
+    // running under whatever rules the machine happened to have.
+    ("agy -p {prompt} --output-format json --mode plan --add-dir {repo}", AGY_CMD),
+    (
+        "agy -p {prompt} --output-format json --mode plan --add-dir {repo} \
+         --conversation {session}",
+        AGY_RESUME,
+    ),
 ];
 
 impl Settings {
@@ -255,13 +302,21 @@ impl Settings {
     /// shipped default are touched — a template the user has edited is theirs.
     fn migrate(&mut self) -> bool {
         let mut changed = false;
-        let fresh_fields = self.schema_version < SCHEMA_VERSION;
+        // Each step is gated on the version it was introduced at, so an install
+        // that has already taken one is not walked through it twice.
+        let fresh_fields = self.schema_version < 1;
+        let repo_access = self.schema_version < 2;
         for m in &mut self.models {
-            if let Some((_, fixed)) =
-                COMMAND_FIXUPS.iter().find(|(broken, _)| m.command.trim() == *broken)
-            {
-                m.command = (*fixed).to_string();
-                changed = true;
+            // Both templates, not just the opening one: a follow-up that
+            // resumed without repo access would answer from a different vantage
+            // point than the turn it is continuing.
+            for template in [&mut m.command, &mut m.resume_command] {
+                if let Some((_, fixed)) =
+                    COMMAND_FIXUPS.iter().find(|(broken, _)| template.trim() == *broken)
+                {
+                    *template = (*fixed).to_string();
+                    changed = true;
+                }
             }
             if m.model_flag.trim().is_empty() {
                 m.model_flag = default_model_flag();
@@ -299,7 +354,13 @@ impl Settings {
                 }
             }
         }
-        if fresh_fields {
+        // Only a timeout still sitting on the old default is raised; one the
+        // user has typed in is their answer to the same question.
+        if repo_access && self.model_timeout_secs == PRE_BROWSE_TIMEOUT_SECS {
+            self.model_timeout_secs = DEFAULT_TIMEOUT_SECS;
+            changed = true;
+        }
+        if self.schema_version < SCHEMA_VERSION {
             self.schema_version = SCHEMA_VERSION;
             changed = true;
         }
@@ -383,6 +444,61 @@ mod tests {
         assert_eq!(s.models[1].effort_flag, "-e");
         // running it again is a no-op
         assert!(!s.migrate());
+    }
+
+    #[test]
+    fn an_install_from_before_repo_access_picks_it_up_on_both_templates() {
+        let mut s = Settings {
+            models: vec![ModelSlot {
+                name: "claude".into(),
+                command: "claude -p --session-id {session}".into(),
+                coauthor: String::new(),
+                enabled: true,
+                model: "haiku".into(),
+                model_flag: "--model".into(),
+                effort: "low".into(),
+                effort_flag: "--effort".into(),
+                resume_command: "claude -p --resume {session}".into(),
+                session_key: String::new(),
+            }],
+            model_timeout_secs: PRE_BROWSE_TIMEOUT_SECS,
+            // already through the model/effort migration, so only the repo
+            // access step is outstanding
+            schema_version: 1,
+            ..Settings::default()
+        };
+        assert!(s.migrate());
+        assert_eq!(s.models[0].command, CLAUDE_CMD);
+        // The follow-up resumes through its own template, so it needs the same
+        // access as the turn it continues.
+        assert_eq!(s.models[0].resume_command, CLAUDE_RESUME);
+        assert_eq!(s.model_timeout_secs, DEFAULT_TIMEOUT_SECS);
+        // The step that was already taken must not run again.
+        assert_eq!(s.models[0].model, "haiku", "the tier fill re-ran");
+        assert!(!s.migrate());
+    }
+
+    #[test]
+    fn a_timeout_the_user_chose_survives_the_upgrade() {
+        let mut s = Settings { model_timeout_secs: 45, schema_version: 1, ..Settings::default() };
+        s.migrate();
+        assert_eq!(s.model_timeout_secs, 45);
+    }
+
+    #[test]
+    fn no_shipped_template_buys_access_by_switching_permissions_off() {
+        // Read access is granted per CLI by naming what may be read, not by
+        // approving whatever the model decides to run. A flag like this in a
+        // default would hand every reviewed repository to an unattended agent.
+        for m in Settings::default().models {
+            for template in [&m.command, &m.resume_command] {
+                assert!(
+                    !template.contains("dangerously") && !template.contains("bypass"),
+                    "{} ships a permission bypass: {template}",
+                    m.name
+                );
+            }
+        }
     }
 
     #[test]

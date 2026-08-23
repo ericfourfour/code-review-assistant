@@ -55,6 +55,7 @@ pub struct FakeCli {
     program: PathBuf,
     argv_log: PathBuf,
     stdin_log: PathBuf,
+    cwd_log: PathBuf,
 }
 
 #[derive(Default)]
@@ -75,10 +76,12 @@ impl FakeCli {
         let base = dir.path();
         let argv_log = base.join(format!("{name}.argv"));
         let stdin_log = base.join(format!("{name}.stdin"));
+        let cwd_log = base.join(format!("{name}.cwd"));
         let reply_file = base.join(format!("{name}.reply"));
         std::fs::write(&reply_file, spec.reply).expect("write reply");
 
-        let (program, script) = Self::script(name, base, &argv_log, &stdin_log, &reply_file, &spec);
+        let logs = Logs { argv: &argv_log, stdin: &stdin_log, cwd: &cwd_log, reply: &reply_file };
+        let (program, script) = Self::script(name, base, &logs, &spec);
         std::fs::write(&program, script).expect("write fake cli");
         #[cfg(unix)]
         {
@@ -86,18 +89,12 @@ impl FakeCli {
             std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
                 .expect("chmod fake cli");
         }
-        FakeCli { program, argv_log, stdin_log }
+        FakeCli { program, argv_log, stdin_log, cwd_log }
     }
 
     #[cfg(windows)]
-    fn script(
-        name: &str,
-        base: &Path,
-        argv_log: &Path,
-        stdin_log: &Path,
-        reply_file: &Path,
-        spec: &FakeCliSpec,
-    ) -> (PathBuf, String) {
+    fn script(name: &str, base: &Path, logs: &Logs, spec: &FakeCliSpec) -> (PathBuf, String) {
+        let (argv_log, stdin_log, cwd_log, reply_file) = (logs.argv, logs.stdin, logs.cwd, logs.reply);
         // `findstr "^"` matches every line, so it copies stdin through; with a
         // null stdin it simply produces an empty file.
         let delay = if spec.delay_secs > 0 {
@@ -108,11 +105,13 @@ impl FakeCli {
         let script = format!(
             "@echo off\r\n\
              > \"{argv}\" echo %*\r\n\
+             > \"{cwd}\" cd\r\n\
              findstr \"^\" > \"{stdin}\"\r\n\
              {delay}\
              type \"{reply}\"\r\n\
              exit /b {code}\r\n",
             argv = argv_log.display(),
+            cwd = cwd_log.display(),
             stdin = stdin_log.display(),
             reply = reply_file.display(),
             code = spec.exit_code,
@@ -121,14 +120,8 @@ impl FakeCli {
     }
 
     #[cfg(not(windows))]
-    fn script(
-        name: &str,
-        base: &Path,
-        argv_log: &Path,
-        stdin_log: &Path,
-        reply_file: &Path,
-        spec: &FakeCliSpec,
-    ) -> (PathBuf, String) {
+    fn script(name: &str, base: &Path, logs: &Logs, spec: &FakeCliSpec) -> (PathBuf, String) {
+        let (argv_log, stdin_log, cwd_log, reply_file) = (logs.argv, logs.stdin, logs.cwd, logs.reply);
         let delay = if spec.delay_secs > 0 {
             format!("sleep {}\n", spec.delay_secs)
         } else {
@@ -137,11 +130,13 @@ impl FakeCli {
         let script = format!(
             "#!/bin/sh\n\
              echo \"$@\" > '{argv}'\n\
+             pwd > '{cwd}'\n\
              cat > '{stdin}'\n\
              {delay}\
              cat '{reply}'\n\
              exit {code}\n",
             argv = argv_log.display(),
+            cwd = cwd_log.display(),
             stdin = stdin_log.display(),
             reply = reply_file.display(),
             code = spec.exit_code,
@@ -185,6 +180,20 @@ impl FakeCli {
     pub fn stdin_seen(&self) -> String {
         std::fs::read_to_string(&self.stdin_log).unwrap_or_default()
     }
+
+    /// The directory the process ran in — which is what decides whether the
+    /// repository the prompt talks about is reachable from inside it.
+    pub fn cwd_seen(&self) -> String {
+        std::fs::read_to_string(&self.cwd_log).unwrap_or_default().trim().to_string()
+    }
+}
+
+/// Where one fake CLI writes what it saw, and where it reads its reply from.
+struct Logs<'a> {
+    argv: &'a Path,
+    stdin: &'a Path,
+    cwd: &'a Path,
+    reply: &'a Path,
 }
 
 /// A real git repository in a temp directory, so the git plumbing can be
