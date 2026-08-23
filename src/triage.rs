@@ -1,15 +1,5 @@
 //! Risk triage: a fast, local, deterministic score per unit so the walk can
 //! visit the changes most worth human attention first.
-//!
-//! Deliberately *not* a model call. Triage runs at plan build, synchronously,
-//! for every unit on the branch — a model pass there would freeze the app for
-//! minutes and add a failure mode to the one step that must always work. The
-//! models still judge every unit when it is reached; this only decides the
-//! order, so cheap static signals are enough: what kind of change it is, how
-//! big, whether it deletes code, and whether it touches the vocabulary of
-//! things that go wrong (locks, secrets, unsafe blocks, subprocesses…).
-//! The score is shown with its reasons, so the ordering is inspectable
-//! rather than an oracle.
 
 use crate::units::ReviewUnit;
 
