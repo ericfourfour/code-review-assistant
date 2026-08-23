@@ -207,9 +207,8 @@ mod tests {
         assert!(plain_code.score > plain_comment.score);
         assert!(scary_code.score > plain_code.score);
         assert!(scary_code.reasons.iter().any(|r| r.contains("unsafe")), "{:?}", scary_code.reasons);
-        assert!(scary_code.reasons.iter().any(|r| r.contains("concurrency")));
+        assert!(scary_code.reasons.iter().any(|r| r.contains("concurrency")), "{:?}", scary_code.reasons);
     }
-
     #[test]
     fn removals_and_missing_scope_raise_the_score() {
         let with_removal = assess(&code(
