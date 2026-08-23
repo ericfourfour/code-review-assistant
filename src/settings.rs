@@ -51,6 +51,10 @@ fn default_effort_flag() -> String {
     "--effort".into()
 }
 
+fn default_blind_review() -> bool {
+    true
+}
+
 /// Known effort settings for a command template, offered as a dropdown.
 /// Free-text like the model field: shortcuts, not a whitelist.
 pub fn effort_presets(command: &str) -> &'static [&'static str] {
@@ -117,6 +121,12 @@ pub struct Settings {
     /// Context lines shown around a comment in the prompt and the UI.
     pub context_lines: usize,
     pub recent_repos: Vec<String>,
+    /// Hide which model produced each candidate, and shuffle their order, until
+    /// a choice is made. Reviewing is also labelling: seeing the name while
+    /// choosing biases the label toward whichever model you already trust, and
+    /// a fixed left-to-right order biases it toward the first slot.
+    #[serde(default = "default_blind_review")]
+    pub blind_review: bool,
     /// Bumped when a migration step must run exactly once. Absent (0) in rows
     /// written before this field existed.
     #[serde(default)]
@@ -180,6 +190,7 @@ impl Default for Settings {
             model_timeout_secs: 120,
             context_lines: 12,
             recent_repos: Vec::new(),
+            blind_review: default_blind_review(),
             schema_version: SCHEMA_VERSION,
         }
     }

@@ -12,9 +12,7 @@ impl CraApp {
         }
 
         ui.heading("Settings");
-        ui.label(theme::dim(
-            "stored in the local sqlite database; saved on close",
-        ));
+        ui.label(theme::dim("stored in the local sqlite database; saved on close"));
         ui.add_space(6.0);
         egui::ScrollArea::vertical()
             .id_salt("settings_scroll")
@@ -187,45 +185,44 @@ impl CraApp {
 
         ui.add_space(8.0);
         theme::section_title(ui, "GIT / GITHUB");
-        egui::Grid::new("git_grid")
-            .num_columns(2)
-            .spacing([8.0, 4.0])
-            .show(ui, |ui| {
-                ui.label(theme::dim("fallback base branch"));
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.settings.default_base)
-                        .desired_width(160.0)
-                        .font(egui::TextStyle::Monospace),
-                );
-                ui.end_row();
-                ui.label(theme::dim("gh CLI path"));
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.settings.gh_path)
-                        .desired_width(160.0)
-                        .font(egui::TextStyle::Monospace),
-                );
-                ui.end_row();
-            });
+        egui::Grid::new("git_grid").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
+            ui.label(theme::dim("fallback base branch"));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.settings.default_base)
+                    .desired_width(160.0)
+                    .font(egui::TextStyle::Monospace),
+            );
+            ui.end_row();
+            ui.label(theme::dim("gh CLI path"));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.settings.gh_path)
+                    .desired_width(160.0)
+                    .font(egui::TextStyle::Monospace),
+            );
+            ui.end_row();
+        });
 
         ui.add_space(8.0);
         theme::section_title(ui, "REVIEW");
-        egui::Grid::new("review_grid")
-            .num_columns(2)
-            .spacing([8.0, 4.0])
-            .show(ui, |ui| {
-                ui.label(theme::dim("model timeout (s)"));
-                ui.add(egui::DragValue::new(&mut self.settings.model_timeout_secs).range(5..=900));
-                ui.end_row();
-                ui.label(theme::dim("context lines"));
-                ui.add(egui::DragValue::new(&mut self.settings.context_lines).range(2..=60));
-                ui.end_row();
-            });
+        egui::Grid::new("review_grid").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
+            ui.label(theme::dim("model timeout (s)"));
+            ui.add(egui::DragValue::new(&mut self.settings.model_timeout_secs).range(5..=900));
+            ui.end_row();
+            ui.label(theme::dim("context lines"));
+            ui.add(egui::DragValue::new(&mut self.settings.context_lines).range(2..=60));
+            ui.end_row();
+            ui.label(theme::dim("blind review"));
+            ui.checkbox(&mut self.settings.blind_review, "hide model names until you choose");
+            ui.end_row();
+        });
+        ui.label(theme::dim(
+            "Blind review also shuffles the candidates per comment. Every review is also a \
+labelled example, and knowing which model wrote which suggestion while you choose biases that \
+label — turn it off only if you are not measuring the models against each other.",
+        ));
 
         ui.add_space(10.0);
-        if ui
-            .button(RichText::new("Save and close  [Ctrl+S / Esc]").strong())
-            .clicked()
-        {
+        if ui.button(RichText::new("Save and close  [Ctrl+S / Esc]").strong()).clicked() {
             self.close_settings();
         }
     }

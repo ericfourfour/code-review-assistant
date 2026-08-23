@@ -169,15 +169,24 @@ pub fn side_panel(app: &mut CraApp, ctx: &egui::Context) {
             if app.screen == Screen::Review {
                 ui.add_space(6.0);
                 theme::section_title(ui, "MODELS");
+                // While blinding is on this panel must not pair a name with a
+                // verdict, or the cards on the left are blinded for nothing.
+                let hidden = app.names_hidden();
                 for (i, slot) in app.candidate_models.iter().enumerate() {
                     ui.horizontal(|ui| {
                         ui.label(
                             RichText::new("●").color(theme::model_color(i)).monospace(),
                         );
                         ui.label(RichText::new(&slot.name).monospace().small());
+                        if !slot.model.trim().is_empty() && !hidden {
+                            ui.label(theme::dim(slot.model.trim()));
+                        }
                         match app.candidates.get(i) {
                             Some(CandidateState::Pending) => {
                                 ui.spinner();
+                            }
+                            Some(CandidateState::Ready(s)) if hidden => {
+                                ui.label(theme::dim(&format!("answered · {} ms", s.latency_ms)));
                             }
                             Some(CandidateState::Ready(s)) => {
                                 theme::badge(ui, s.action.label(), theme::action_color(s.action));

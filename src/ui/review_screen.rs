@@ -31,9 +31,10 @@ impl CraApp {
             return;
         }
         if !typing {
-            for (i, key) in NUM_KEYS.iter().enumerate().take(self.candidates.len()) {
+            let order = self.candidate_order();
+            for (pos, key) in NUM_KEYS.iter().enumerate().take(order.len()) {
                 if ctx.input_mut(|inp| inp.consume_key(Modifiers::NONE, *key)) {
-                    self.choose_candidate(i);
+                    self.choose_candidate(order[pos]);
                 }
             }
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::K)) {
@@ -120,16 +121,19 @@ impl CraApp {
         let mut ask_one: Option<usize> = None;
         let mut show_prompt: Option<usize> = None;
         let can_ask_slot: Vec<bool> = (0..n_slots).map(|i| self.can_ask(i)).collect();
+        let order = self.candidate_order();
+        let hidden = self.names_hidden();
         ui.columns(n_slots, |cols| {
-            for (i, ui) in cols.iter_mut().enumerate() {
+            for (pos, ui) in cols.iter_mut().enumerate() {
+                // `pos` is where the card sits on screen; `i` is which slot it
+                // actually belongs to. They differ while blinding is on.
+                let i = order.get(pos).copied().unwrap_or(pos);
                 let can_ask = can_ask_slot.get(i).copied().unwrap_or(false);
-                let name = self
-                    .candidate_models
-                    .get(i)
-                    .map(|m| m.name.clone())
-                    .unwrap_or_else(|| format!("model {i}"));
+                let name = self.slot_label(i, pos);
                 let is_chosen = self.chosen == Some(Choice::Candidate(i));
-                let color = theme::model_color(i);
+                // Colour is per display position while hidden, so the palette
+                // does not give the model away either.
+                let color = theme::model_color(if hidden { pos } else { i });
                 let frame = egui::Frame::group(ui.style())
                     .fill(if is_chosen { theme::RAISED } else { theme::PANEL })
                     .stroke(egui::Stroke::new(
@@ -140,23 +144,24 @@ impl CraApp {
                 frame.show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(
-                            RichText::new(format!("[{}]", i + 1)).monospace().strong().color(color),
+                            RichText::new(format!("[{}]", pos + 1)).monospace().strong().color(color),
                         );
                         ui.label(RichText::new(&name).strong().color(color));
-                        if let Some(variant) = self
-                            .settings
-                            .models
-                            .get(i)
-                            .map(|m| m.model.trim())
-                            .filter(|v| !v.is_empty())
-                        {
-                            ui.label(
-                                RichText::new(variant).monospace().small().color(theme::TEXT_DIM),
-                            );
-                        }
-                        if let Some(Some(id)) = self.sessions.get(i) {
-                            ui.label(theme::dim(&format!("· {}", &id[..8.min(id.len())])))
-                                .on_hover_text(format!("session {id}"));
+                        if !hidden {
+                            if let Some(variant) = self
+                                .candidate_models
+                                .get(i)
+                                .map(|m| m.model.trim())
+                                .filter(|v| !v.is_empty())
+                            {
+                                ui.label(
+                                    RichText::new(variant).monospace().small().color(theme::TEXT_DIM),
+                                );
+                            }
+                            if let Some(Some(id)) = self.sessions.get(i) {
+                                ui.label(theme::dim(&format!("· {}", &id[..8.min(id.len())])))
+                                    .on_hover_text(format!("session {id}"));
+                            }
                         }
                         match self.candidates.get(i) {
                             Some(CandidateState::Ready(s)) => {
@@ -195,7 +200,7 @@ impl CraApp {
                             ui.horizontal(|ui| {
                                 if ui
                                     .add(egui::Button::new(
-                                        RichText::new(format!("PICK [{}]", i + 1)).strong(),
+                                        RichText::new(format!("PICK [{}]", pos + 1)).strong(),
                                     ))
                                     .clicked()
                                 {

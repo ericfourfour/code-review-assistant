@@ -265,8 +265,7 @@ impl CraApp {
         let path = repo.path.clone();
         if gitio::is_dirty(&path) {
             self.ref_error = Some(
-                "working tree has uncommitted changes; commit/stash before checking out a PR"
-                    .into(),
+                "working tree has uncommitted changes; commit/stash before checking out a PR".into(),
             );
             return;
         }
@@ -275,11 +274,7 @@ impl CraApp {
             self.ref_error = Some(e);
             return;
         }
-        self.build_plan(
-            RefKind::Pr(pr.number),
-            pr.head_ref.clone(),
-            pr.base_ref.clone(),
-        );
+        self.build_plan(RefKind::Pr(pr.number), pr.head_ref.clone(), pr.base_ref.clone());
     }
 
     fn build_plan(&mut self, kind: RefKind, ref_name: String, base: String) {
@@ -308,21 +303,11 @@ impl CraApp {
         let n_units: usize = extracted.iter().map(|(_, u)| u.len()).sum();
         let review_files = extracted
             .into_iter()
-            .map(|(path, units)| ReviewFile {
-                path,
-                units,
-                line_offset: 0,
-                decided: 0,
-            })
+            .map(|(path, units)| ReviewFile { path, units, line_offset: 0, decided: 0 })
             .collect::<Vec<_>>();
         self.note(
             "session",
-            &format!(
-                "#{session_id} {} — {} comments in {} files",
-                ref_name,
-                n_units,
-                review_files.len()
-            ),
+            &format!("#{session_id} {} — {} comments in {} files", ref_name, n_units, review_files.len()),
         );
         self.plan = Some(ReviewPlan {
             session_id,
@@ -362,8 +347,7 @@ impl CraApp {
         self.review_error = None;
 
         let Some((unit, file, line)) = self.plan.as_ref().and_then(|p| {
-            p.current()
-                .map(|(_, u)| (u.clone(), u.file.clone(), u.start_line))
+            p.current().map(|(_, u)| (u.clone(), u.file.clone(), u.start_line))
         }) else {
             self.screen = Screen::Summary;
             return;
@@ -380,19 +364,20 @@ impl CraApp {
         self.candidates = self
             .candidate_models
             .iter()
-            .map(|m| {
-                if m.enabled {
-                    CandidateState::Pending
-                } else {
-                    CandidateState::Disabled
-                }
-            })
+            .map(|m| if m.enabled { CandidateState::Pending } else { CandidateState::Disabled })
             .collect();
-        self.convos = vec![Vec::new(); self.settings.models.len()];
-        self.sessions = vec![None; self.settings.models.len()];
+        self.convos = vec![Vec::new(); self.candidate_models.len()];
+        self.sessions = vec![None; self.candidate_models.len()];
         self.follow_up.clear();
         self.show_prompt = None;
-        for (idx, slot) in self.settings.enabled_models() {
+        let enabled_models: Vec<_> = self
+            .candidate_models
+            .iter()
+            .cloned()
+            .enumerate()
+            .filter(|(_, model)| model.enabled)
+            .collect();
+        for (idx, slot) in enabled_models {
             // A slot that names no session key takes an id of our choosing;
             // the rest report theirs in the reply and we pick it up there.
             let command = if slot.session_key.trim().is_empty() && slot.command.contains("{session}")
@@ -431,8 +416,7 @@ impl CraApp {
             Some(CandidateState::Ready(_)) | Some(CandidateState::Failed(_))
         );
         let resumable = self
-            .settings
-            .models
+            .candidate_models
             .get(slot_idx)
             .is_some_and(|m| !m.resume_command.trim().is_empty());
         settled && resumable && self.sessions.get(slot_idx).is_some_and(|s| s.is_some())
@@ -456,7 +440,7 @@ impl CraApp {
             if !self.can_ask(idx) {
                 continue;
             }
-            let Some(slot_cfg) = self.settings.models.get(idx).cloned() else { continue };
+            let Some(slot_cfg) = self.candidate_models.get(idx).cloned() else { continue };
             let Some(session) = self.sessions[idx].clone() else { continue };
             let command = slot_cfg.resume_command.replace("{session}", &session);
             let prompt = models::followup_prompt(&message);
@@ -486,20 +470,45 @@ impl CraApp {
         self.note("follow-up", &format!("asked {}: {}", sent.join(", "), truncate(&message, 80)));
     }
 
+    /// Display position -> slot index for the current comment. Identity when
+    /// blinding is off; a stable shuffle when it is on.
+    pub fn candidate_order(&self) -> Vec<usize> {
+        let n = self.candidates.len();
+        if !self.settings.blind_review {
+            return (0..n).collect();
+        }
+        match self.current_unit() {
+            Some(u) => review::blind_order(review::unit_seed(&u.file, u.start_line), n),
+            None => (0..n).collect(),
+        }
+    }
+
+    /// Whether model identities are currently hidden. Blinding lifts once a
+    /// choice is made, so the provenance being recorded is still visible.
+    pub fn names_hidden(&self) -> bool {
+        self.settings.blind_review && self.chosen.is_none()
+    }
+
+    /// What to call slot `idx` at display position `pos` right now.
+    pub fn slot_label(&self, idx: usize, pos: usize) -> String {
+        if self.names_hidden() {
+            format!("model {}", (b'A' + pos as u8) as char)
+        } else {
+            self.candidate_models
+                .get(idx)
+                .map(|m| m.name.clone())
+                .unwrap_or_else(|| format!("model {idx}"))
+        }
+    }
+
     pub fn current_unit(&self) -> Option<CommentUnit> {
-        self.plan
-            .as_ref()
-            .and_then(|p| p.current().map(|(_, u)| u.clone()))
+        self.plan.as_ref().and_then(|p| p.current().map(|(_, u)| u.clone()))
     }
 
     pub fn choose_candidate(&mut self, slot_idx: usize) {
-        let Some(CandidateState::Ready(s)) = self.candidates.get(slot_idx) else {
-            return;
-        };
+        let Some(CandidateState::Ready(s)) = self.candidates.get(slot_idx) else { return };
         let s = s.clone();
-        let Some(unit) = self.current_unit() else {
-            return;
-        };
+        let Some(unit) = self.current_unit() else { return };
         let text = match s.action {
             Action::Keep => self.original_display.clone(),
             Action::Delete => String::new(),
@@ -533,12 +542,8 @@ impl CraApp {
     /// Shared save/commit path. Applies the editor content to the working
     /// tree, logs the decision, optionally commits, then advances.
     pub fn save_and_continue(&mut self, ctx: &egui::Context, commit: bool) {
-        let Some(unit) = self.current_unit() else {
-            return;
-        };
-        let Some(repo_path) = self.repo.as_ref().map(|r| r.path.clone()) else {
-            return;
-        };
+        let Some(unit) = self.current_unit() else { return };
+        let Some(repo_path) = self.repo.as_ref().map(|r| r.path.clone()) else { return };
 
         let action = review::final_action(&self.editor, &self.original_display);
         let chosen_model = match &self.chosen {
@@ -588,8 +593,7 @@ impl CraApp {
             if action == Action::Keep {
                 self.note("commit", "kept original — nothing to commit");
             } else {
-                let msg =
-                    review::commit_message(&unit, action, &provenance, justification.as_deref());
+                let msg = review::commit_message(&unit, action, &provenance, justification.as_deref());
                 match gitio::stage_and_commit(&repo_path, &unit.file, &msg) {
                     Ok(s) => {
                         committed = true;
@@ -627,13 +631,7 @@ impl CraApp {
         );
         self.note(
             "decision",
-            &format!(
-                "{} {}:{} ({})",
-                action.as_str(),
-                unit.file,
-                unit.start_line,
-                provenance.source_str()
-            ),
+            &format!("{} {}:{} ({})", action.as_str(), unit.file, unit.start_line, provenance.source_str()),
         );
 
         if let Some(plan) = &mut self.plan {
@@ -696,8 +694,7 @@ impl CraApp {
 
     fn handle_candidate(&mut self, c: CandidateMsg) {
         if c.seq != self.review_seq {
-            self.db
-                .log("stale", &format!("discarded late reply from {}", c.model));
+            self.db.log("stale", &format!("discarded late reply from {}", c.model));
             return;
         }
         let (file, start, end) = self
@@ -708,7 +705,11 @@ impl CraApp {
         // Track the CLI's own id so the next turn resumes this conversation.
         // Take the newest one each time: a CLI is free to hand back a fresh id
         // when it resumes, and following it keeps the chain unbroken.
-        if let Some(key) = self.settings.models.get(c.slot_idx).map(|m| m.session_key.clone()) {
+        if let Some(key) = self
+            .candidate_models
+            .get(c.slot_idx)
+            .map(|m| m.session_key.clone())
+        {
             if let Some(id) = models::extract_session_id(&c.raw, &key) {
                 if let Some(slot) = self.sessions.get_mut(c.slot_idx) {
                     *slot = Some(id);
@@ -739,31 +740,22 @@ impl CraApp {
                     s.latency_ms,
                     None,
                 );
-                self.note(
-                    "model",
-                    &format!("{} → {} ({} ms)", c.model, s.action.label(), s.latency_ms),
-                );
+                if self.settings.blind_review {
+                    self.note("model", &format!("{} replied ({} ms)", c.model, s.latency_ms));
+                } else {
+                    self.note(
+                        "model",
+                        &format!("{} → {} ({} ms)", c.model, s.action.label(), s.latency_ms),
+                    );
+                }
                 if let Some(slot) = self.candidates.get_mut(c.slot_idx) {
                     *slot = CandidateState::Ready(s);
                 }
             }
             Err(e) => {
-                self.db.log_suggestion(
-                    session_id,
-                    &file,
-                    start,
-                    end,
-                    &c.model,
-                    None,
-                    None,
-                    None,
-                    0,
-                    Some(&e),
-                );
-                self.note(
-                    "model",
-                    &format!("{} failed: {}", c.model, truncate(&e, 120)),
-                );
+                self.db
+                    .log_suggestion(session_id, &file, start, end, &c.model, None, None, None, 0, Some(&e));
+                self.note("model", &format!("{} failed: {}", c.model, truncate(&e, 120)));
                 if let Some(slot) = self.candidates.get_mut(c.slot_idx) {
                     *slot = CandidateState::Failed(e);
                 }
