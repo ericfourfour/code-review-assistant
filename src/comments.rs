@@ -5,13 +5,15 @@
 //! branch under review introduced or touched. Trailing comments that share a
 //! line with code are out of scope for v1.
 
+use serde::{Deserialize, Serialize};
+
 use crate::diffparse::{DiffFile, Hunk};
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub enum CommentStyle {
     /// The prefix actually used by the original comment (e.g. `//`, `///`, `#`).
     Line { prefix: String },
-    Block { open: &'static str, close: &'static str },
+    Block { open: String, close: String },
 }
 
 pub struct LangSpec {
@@ -52,7 +54,7 @@ pub fn lang_for(path: &str) -> Option<LangSpec> {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct CommentUnit {
     pub file: String,
     pub lang: String,
@@ -202,7 +204,7 @@ fn units_in_hunk(path: &str, spec: &LangSpec, hunk: &Hunk, context_lines: usize)
                         &new_side,
                         i,
                         j,
-                        CommentStyle::Block { open, close },
+                        CommentStyle::Block { open: open.to_string(), close: close.to_string() },
                         context_lines,
                     ));
                     i = j + 1;

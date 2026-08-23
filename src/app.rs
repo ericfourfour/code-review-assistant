@@ -595,23 +595,28 @@ impl CraApp {
         }
 
         let session_id = self.plan.as_ref().map(|p| p.session_id).unwrap_or(0);
-        self.db.log_decision(
+        // Store the unit itself so this judgement can be replayed against a
+        // different model later without needing the repository to still exist.
+        let unit_json = serde_json::to_string(&unit).ok();
+        self.db.log_decision(&crate::db::DecisionRecord {
             session_id,
-            &unit.file,
-            unit.start_line,
-            unit.end_line,
-            &self.original_text,
-            action.as_str(),
-            &final_text,
-            &provenance.source_str(),
-            matches!(
+            file: &unit.file,
+            line_start: unit.start_line,
+            line_end: unit.end_line,
+            original: &self.original_text,
+            action: action.as_str(),
+            final_text: &final_text,
+            source: &provenance.source_str(),
+            human_edited: matches!(
                 provenance,
                 review::Provenance::Human | review::Provenance::Model { edited: true, .. }
             ),
             committed,
-            sha.as_deref(),
-            justification.as_deref(),
-        );
+            commit_sha: sha.as_deref(),
+            justification: justification.as_deref(),
+            unit_json: unit_json.as_deref(),
+            blinded: self.settings.blind_review,
+        });
         self.note(
             "decision",
             &format!("{} {}:{} ({})", action.as_str(), unit.file, unit.start_line, provenance.source_str()),

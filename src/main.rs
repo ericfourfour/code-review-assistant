@@ -4,13 +4,44 @@ mod app;
 mod comments;
 mod db;
 mod diffparse;
+mod eval;
 mod gitio;
 mod models;
 mod review;
 mod settings;
 mod ui;
 
+use std::path::PathBuf;
+
+const USAGE: &str = "\
+Code Review Assistant — review AI-written comments one at a time.
+
+    cra                                  open the review window (default)
+
+Evaluation — measuring the models against your own judgements:
+
+    cra export-corpus [--out FILE] [--limit N]
+        Write the comments you have already reviewed, with your verdicts, to a
+        corpus file. Defaults: --out corpus.json, --limit 500.
+
+    cra replay --corpus FILE [--out FILE]
+        Ask every enabled model about every comment in the corpus and write the
+        answers. Default: --out replay.json.
+
+    cra report [--corpus FILE --results FILE] [--out FILE]
+        Score a replay against the corpus, or with no arguments score the whole
+        review history straight out of the database. Default: --out report.txt.
+
+Output also goes to stdout, which a release build on Windows has no console
+for; the --out file is the reliable channel there.
+";
+
 fn main() -> eframe::Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if !args.is_empty() {
+        std::process::exit(run_cli(&args));
+    }
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1480.0, 940.0])
@@ -24,3 +55,97 @@ fn main() -> eframe::Result<()> {
         Box::new(|cc| Ok(Box::new(app::CraApp::new(cc)))),
     )
 }
+
+/// Value of `--name`, if present.
+fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+    let at = args.iter().position(|a| a == name)?;
+    args.get(at + 1).map(|s| s.as_str()).filter(|v| !v.starts_with("--"))
+}
+
+fn path_flag(args: &[String], name: &str, default: &str) -> PathBuf {
+    PathBuf::from(flag(args, name).unwrap_or(default))
+}
+
+/// Report to both stdout and a file. A release build on Windows is a windowed
+/// subsystem binary with no console attached, so stdout goes nowhere there and
+/// the file is what the user actually reads.
+fn emit(text: &str, path: &std::path::Path) -> Result<(), String> {
+    print!("{text}");
+    std::fs::write(path, text).map_err(|e| format!("write {}: {e}", path.display()))
+}
+
+fn run_cli(args: &[String]) -> i32 {
+    match execute(args) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("error: {e}");
+            let _ = std::fs::write("cra-error.txt", format!("{e}\n"));
+            1
+        }
+    }
+}
+
+fn execute(args: &[String]) -> Result<(), String> {
+    match args[0].as_str() {
+        "-h" | "--help" | "help" => {
+            print!("{USAGE}");
+            Ok(())
+        }
+        "export-corpus" => {
+            let db = db::Db::open()?;
+            let limit: usize = flag(args, "--limit").and_then(|v| v.parse().ok()).unwrap_or(500);
+            let corpus = eval::Corpus::from_db(&db, limit);
+            let out = path_flag(args, "--out", "corpus.json");
+            corpus.save(&out)?;
+            println!("wrote {} labelled comment(s) to {}", corpus.entries.len(), out.display());
+            if corpus.entries.is_empty() {
+                println!(
+                    "Nothing to export yet: a comment enters the corpus only once you have\n\
+                     reviewed it, and only reviews recorded by a build that stores the unit\n\
+                     alongside the verdict are eligible."
+                );
+            }
+            Ok(())
+        }
+        "replay" => {
+            let corpus_path = flag(args, "--corpus")
+                .ok_or("replay needs --corpus FILE (make one with export-corpus)")?;
+            let corpus = eval::Corpus::load(&PathBuf::from(corpus_path))?;
+            let db = db::Db::open()?;
+            let settings = settings::Settings::load(&db);
+            let enabled = settings.enabled_models().len();
+            if enabled == 0 {
+                return Err("no models are enabled in settings".into());
+            }
+            println!("replaying {} comment(s) against {enabled} model(s)...", corpus.entries.len());
+            let results = eval::replay(&settings, &corpus, |done, total, model| {
+                println!("  [{done}/{total}] {model}");
+            });
+            let out = path_flag(args, "--out", "replay.json");
+            let text = serde_json::to_string_pretty(&results)
+                .map_err(|e| format!("serialize results: {e}"))?;
+            std::fs::write(&out, text).map_err(|e| format!("write {}: {e}", out.display()))?;
+            println!("wrote {} answer(s) to {}", results.answers.len(), out.display());
+            Ok(())
+        }
+        "report" => {
+            let out = path_flag(args, "--out", "report.txt");
+            match (flag(args, "--corpus"), flag(args, "--results")) {
+                (Some(c), Some(r)) => {
+                    let corpus = eval::Corpus::load(&PathBuf::from(c))?;
+                    let text = std::fs::read_to_string(r).map_err(|e| format!("read {r}: {e}"))?;
+                    let results: eval::ReplayResults =
+                        serde_json::from_str(&text).map_err(|e| format!("parse {r}: {e}"))?;
+                    emit(&eval::Report::from_replay(&corpus, &results).render(), &out)
+                }
+                (None, None) => {
+                    let db = db::Db::open()?;
+                    emit(&eval::Report::from_db(&db).render(), &out)
+                }
+                _ => Err("report needs both --corpus and --results, or neither".into()),
+            }
+        }
+        other => Err(format!("unknown command {other:?}\n\n{USAGE}")),
+    }
+}
+
