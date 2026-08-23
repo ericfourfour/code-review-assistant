@@ -350,13 +350,26 @@ impl CraApp {
             }
         });
 
+        // ---- commit style ----
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.commit_each, "Commit each decision individually");
+            ui.label(theme::dim(if self.commit_each {
+                "— every decision is its own commit, made immediately"
+            } else {
+                "— decisions batch uncommitted until Commit and Continue, which \
+                 documents all of them in one commit"
+            }));
+        });
+
         // ---- continuation buttons ----
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            if ui
-                .button(RichText::new("💾 Save and Continue  [Ctrl+S]").strong())
-                .clicked()
-            {
+            let save_label = if self.commit_each {
+                "💾 Save and Commit  [Ctrl+S]"
+            } else {
+                "💾 Save and Continue  [Ctrl+S]"
+            };
+            if ui.button(RichText::new(save_label).strong()).clicked() {
                 self.save_and_continue(ctx, false);
                 return;
             }

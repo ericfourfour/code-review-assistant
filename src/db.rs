@@ -38,6 +38,9 @@ pub struct CorpusRow {
     pub source: String,
     pub human_edited: bool,
     pub blinded: bool,
+    /// Repository the comment was reviewed in, so a replay can put the models
+    /// back in it. Empty for a decision recorded without a session.
+    pub repo: String,
 }
 
 /// One model's proposal next to the human verdict for the same comment.
@@ -218,7 +221,10 @@ impl Db {
         );
     }
 
-    pub fn log_decision(&self, d: &DecisionRecord) {
+    /// Returns the new row's id, so a decision saved without committing can
+    /// later be updated once it actually lands in a commit (see
+    /// [`Db::mark_committed`]).
+    pub fn log_decision(&self, d: &DecisionRecord) -> i64 {
         let _ = self.conn.execute(
             "INSERT INTO decisions(ts, session_id, file, line_start, line_end, original, action,
                                    final_text, source, human_edited, committed, commit_sha,
@@ -230,16 +236,29 @@ impl Db {
                 d.justification, d.unit_json, d.blinded as i64
             ],
         );
+        self.conn.last_insert_rowid()
+    }
+
+    /// Back-fills `committed`/`commit_sha` on a decision that was saved
+    /// without committing, once a later `Commit and Continue` folds it into a
+    /// commit alongside the decision that triggered it.
+    pub fn mark_committed(&self, id: i64, sha: &str) {
+        let _ = self.conn.execute(
+            "UPDATE decisions SET committed = 1, commit_sha = ?1 WHERE id = ?2",
+            params![sha, id],
+        );
     }
 
     /// Reviewed comments that carry the unit they were judged on, newest
     /// first. These are the labelled examples a replay is scored against.
     pub fn corpus(&self, limit: usize) -> Vec<CorpusRow> {
         let Ok(mut stmt) = self.conn.prepare(
-            "SELECT unit_json, action, final_text, source, human_edited, blinded
-             FROM decisions
-             WHERE unit_json IS NOT NULL AND unit_json <> ''
-             ORDER BY id DESC LIMIT ?1",
+            "SELECT d.unit_json, d.action, d.final_text, d.source, d.human_edited, d.blinded,
+                    COALESCE(s.repo, '')
+             FROM decisions d
+             LEFT JOIN sessions s ON s.id = d.session_id
+             WHERE d.unit_json IS NOT NULL AND d.unit_json <> ''
+             ORDER BY d.id DESC LIMIT ?1",
         ) else {
             return Vec::new();
         };
@@ -251,6 +270,7 @@ impl Db {
                 source: r.get(3)?,
                 human_edited: r.get::<_, i64>(4)? != 0,
                 blinded: r.get::<_, i64>(5)? != 0,
+                repo: r.get(6)?,
             })
         })
         .map(|rows| rows.flatten().collect())

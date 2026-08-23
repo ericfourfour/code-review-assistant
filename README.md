@@ -55,11 +55,75 @@ Reviewer models run through the CLIs you already have installed and authenticate
 templates are configured in Settings (`Ctrl+,`), tokenized on whitespace — `{prompt}` is
 replaced with the prompt; without it the prompt is piped to stdin. No shell is involved.
 
-Defaults: `claude -p {prompt}`, `codex exec {prompt}`, `agy -p {prompt}`.
+Each CLI is started **in the repository under review**, with the flags that let it read that
+repository and nothing else:
 
-Prompts are deliberately **minimalist** — the file, the surrounding code with the comment
-marked, and a request for a JSON verdict. The models are assumed to already know what a good
-comment looks like; we don't lecture them about it.
+| slot | shipped template |
+| --- | --- |
+| claude | `claude -p --session-id {session} --tools Read,Grep,Glob --allowed-tools Read,Grep,Glob` |
+| codex | `codex exec --skip-git-repo-check --json --sandbox read-only` |
+| agy | `agy --gemini_dir={cli_home} -p {prompt} --output-format json --mode plan --add-dir {repo}` |
+
+The three CLIs spell "read, don't write" differently. claude takes a tool allowlist and codex a
+sandbox mode, both applying to the directory the process starts in. agy scopes access to a
+*workspace* rather than a working directory, and reading inside that workspace needs no
+approval — so it is handed the repository with `--add-dir {repo}`, which is what makes its own
+read and search tools work at all. Plan mode keeps it off the working tree, because a workspace
+is writable by default and applying edits is this app's job.
+
+agy takes its permissions from a settings file rather than from flags, and there is no way to
+pass them per invocation. Writing yours would re-govern every agy session on the machine, so it
+is given a home of its own instead — `--gemini_dir={cli_home}`, pointed at a directory beside
+this app's database and containing only these rules:
+
+```json
+{
+  "enableTerminalSandbox": true,
+  "permissions": {
+    "allow": ["command(*)", "read_file(<the repository under review>)"],
+    "deny":  ["unsandboxed(*)", "write_file(*)", "read_url(*)", "execute_url(*)"]
+  }
+}
+```
+
+Read this repository, run commands only inside the sandbox, write nothing, reach no URLs. Your
+own `~/.gemini` is never touched, and authentication still works because agy reads it from the
+OS keyring. The read grant names one path, so the file is rewritten when you review a different
+repository.
+
+Templates are yours to edit. `{prompt}`, `{session}`, `{repo}` and `{cli_home}` are substituted;
+the last two are replaced inside their argument, so a path with spaces survives.
+
+### What each one can actually reach
+
+All three read files they were not pointed at, and find definitions they were not given a path
+to. They differ at the edge:
+
+| | reads | searches | shell / git history | when a tool is refused |
+| --- | --- | --- | --- | --- |
+| claude | `Read` | `Grep`, `Glob` | no shell; reads `.git/` directly | tool is absent, it works around it |
+| codex | shell | shell (`rg`) | full read-only shell | writes denied, run continues |
+| agy | native | native | **unavailable** | **the run fails** with no verdict |
+
+agy's shell stays closed, but it now fails softly. Two measured facts shape the config above.
+Rule targets match literally — `command(git)`, `command(git log)`, `command(git log*)` and
+anchored regexes are all refused, and only `command(*)` grants anything — so containment is
+meant to come from the sandbox, not from enumerating commands. And the sandbox does not engage
+in print mode: the `--sandbox` flag asks for an admin escalation nobody can answer and the run
+dies with "context canceled", while `enableTerminalSandbox` leaves commands classified
+unsandboxed. So `unsandboxed(*)` denies every command in practice, which is the intended
+reading either way and upgrades by itself if that ever changes.
+
+What this buys is the failure mode. A command refused by a *rule* is something the model routes
+around — it answers from files instead, exactly as claude does — where an unanswered permission
+*prompt* ends the run with no verdict at all. The git-history question that used to kill the
+slot now comes back answered.
+
+The prompt itself stays short — the file, the surrounding code with the comment marked, a note
+that the repository is readable and the path is relative to its root, and a request for a JSON
+verdict. The models are assumed to already know what a good comment looks like; what they
+cannot know from the hunk is the code around it, so they are given the means to go and look.
+Browsing costs time: the model timeout defaults to 300s.
 
 ## Commit provenance
 

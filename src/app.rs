@@ -97,6 +97,17 @@ pub struct CraApp {
     pub show_prompt: Option<usize>,
     pub focus_follow_up: bool,
 
+    /// Decisions applied to the working tree by `Save and Continue` but not
+    /// yet committed, kept so a later `Commit and Continue` can document all
+    /// of them instead of just the one that triggers the commit. Paired with
+    /// the decision's db row id so that row can be back-filled with the
+    /// commit sha once it actually lands in one.
+    pub pending: Vec<(i64, review::PendingDecision)>,
+    /// When set, every decision commits immediately instead of accumulating
+    /// in `pending` — one commit per decision rather than one per batch.
+    /// A per-session toggle (review screen checkbox), not persisted.
+    pub commit_each: bool,
+
     pub tx: Sender<Msg>,
     pub rx: Receiver<Msg>,
 }
@@ -150,6 +161,8 @@ impl CraApp {
             follow_up: String::new(),
             show_prompt: None,
             focus_follow_up: false,
+            pending: Vec::new(),
+            commit_each: false,
             tx,
             rx,
         }
@@ -407,6 +420,10 @@ impl CraApp {
         self.editor = self.original_display.clone();
 
         let prompt = comments::build_prompt(&unit);
+        // The CLIs are started here so the paths in the prompt resolve and the
+        // rest of the codebase is within reach.
+        let repo_path = self.repo.as_ref().map(|r| r.path.clone()).unwrap_or_default();
+        let cli_home = self.cli_home(&repo_path);
         let timeout = self.settings.model_timeout_secs;
         self.candidate_models = self.settings.models.clone();
         self.candidates = self
@@ -445,6 +462,8 @@ impl CraApp {
                 slot,
                 command,
                 prompt.clone(),
+                repo_path.clone(),
+                cli_home.clone(),
                 timeout,
                 move |m| {
                     let _ = tx.send(Msg::Cand(m));
@@ -453,6 +472,30 @@ impl CraApp {
             );
         }
         self.note("review", &format!("{file}:{line} — querying models"));
+    }
+
+    /// Prepare the app-managed CLI home, if any enabled slot asks for one.
+    ///
+    /// Only a template carrying `{cli_home}` needs it, so a user who has
+    /// pointed a slot at their own configured CLI is left alone. A failure to
+    /// write it is not fatal: the CLI falls back to its own defaults, which is
+    /// how it behaved before this existed.
+    fn cli_home(&mut self, repo: &str) -> String {
+        let wanted = self
+            .settings
+            .enabled_models()
+            .iter()
+            .any(|(_, m)| m.command.contains("{cli_home}") || m.resume_command.contains("{cli_home}"));
+        if !wanted {
+            return String::new();
+        }
+        match crate::agycli::configure(repo) {
+            Ok(home) => home.to_string_lossy().to_string(),
+            Err(e) => {
+                self.note("agy", &format!("could not write CLI permissions: {e}"));
+                String::new()
+            }
+        }
     }
 
     /// A slot can take a follow-up once its previous request has come back and
@@ -482,6 +525,8 @@ impl CraApp {
             Some(i) => vec![i],
             None => (0..self.candidates.len()).collect(),
         };
+        let repo_path = self.repo.as_ref().map(|r| r.path.clone()).unwrap_or_default();
+        let cli_home = self.cli_home(&repo_path);
         let timeout = self.settings.model_timeout_secs;
         let mut sent = Vec::new();
         for idx in targets {
@@ -501,6 +546,8 @@ impl CraApp {
                 slot_cfg.clone(),
                 command,
                 prompt,
+                repo_path.clone(),
+                cli_home.clone(),
                 timeout,
                 move |m| {
                     let _ = tx.send(Msg::Cand(m));
@@ -598,16 +645,18 @@ impl CraApp {
             Some(Choice::Candidate(i)) => self
                 .candidate_models
                 .get(*i)
-                .map(|m| (m.name.clone(), m.coauthor.clone())),
+                .map(|m| (m.name.clone(), m.coauthor.clone(), m.model.clone(), m.effort.clone())),
             _ => None,
         };
         let provenance = review::derive_provenance(
             &self.chosen,
-            chosen_model.as_ref().map(|(n, c)| (n.as_str(), c.as_str())),
+            chosen_model.as_ref().map(|(n, c, _, _)| (n.as_str(), c.as_str())),
             &self.editor,
             self.candidate_baseline.as_deref(),
             &self.original_display,
         );
+        let model_info: Option<(String, String)> =
+            chosen_model.as_ref().map(|(_, _, model, effort)| (model.clone(), effort.clone()));
         let justification = match &self.chosen {
             Some(Choice::Candidate(i)) => match self.candidates.get(*i) {
                 Some(CandidateState::Ready(s)) => Some(s.justification.clone()),
@@ -635,19 +684,54 @@ impl CraApp {
             }
         }
 
-        // Commit if asked and there is something to commit.
+        // Commit if asked (or if the "commit each decision" toggle is on) and
+        // there is something to commit.
+        let commit = commit || self.commit_each;
         let mut sha = None;
         let mut committed = false;
         let mut commit_error = None;
-        if commit && !recheck {
-            if action == Action::Keep {
-                self.note("commit", "kept original — nothing to commit");
-            } else {
-                let msg = review::commit_message(&unit, action, &provenance, justification.as_deref());
+        // Set when this decision itself stays uncommitted, so it can be added
+        // to `self.pending` once its db row id is known below.
+        let mut defer: Option<review::PendingDecision> = None;
+        if action != Action::Keep && !recheck {
+            let entry = review::PendingDecision {
+                file: unit.file.clone(),
+                line: unit.start_line,
+                action,
+                provenance: provenance.clone(),
+                justification: justification.clone(),
+                model_info: model_info.clone(),
+            };
+            if commit {
+                // Every decision still pending for this file joins this
+                // commit's message — otherwise a batch of `Save and
+                // Continue`s would land in one commit whose message only
+                // covers the decision that happened to trigger it.
+                let (ids, mut entries): (Vec<i64>, Vec<review::PendingDecision>) = self
+                    .pending
+                    .iter()
+                    .filter(|(_, p)| p.file == unit.file)
+                    .cloned()
+                    .unzip();
+                entries.push(entry.clone());
+                let msg = review::commit_message_batch(&entries);
                 match gitio::stage_and_commit(&repo_path, &unit.file, &msg) {
                     Ok(s) => {
                         committed = true;
-                        self.note("commit", &format!("{} {}", &s[..8.min(s.len())], unit.file));
+                        self.note(
+                            "commit",
+                            &format!(
+                                "{} {} ({} decision{})",
+                                &s[..8.min(s.len())],
+                                unit.file,
+                                entries.len(),
+                                if entries.len() == 1 { "" } else { "s" }
+                            ),
+                        );
+                        for id in &ids {
+                            self.db.mark_committed(*id, &s);
+                        }
+                        self.pending.retain(|(_, p)| p.file != unit.file);
                         sha = Some(s);
                     }
                     Err(e) => {
@@ -656,16 +740,21 @@ impl CraApp {
                         // uncommitted decision so retrying never reapplies the
                         // unit at stale line numbers.
                         commit_error = Some(e);
+                        defer = Some(entry);
                     }
                 }
+            } else {
+                defer = Some(entry);
             }
+        } else if commit && action == Action::Keep {
+            self.note("commit", "kept original — nothing to commit");
         }
 
         let session_id = self.plan.as_ref().map(|p| p.session_id).unwrap_or(0);
         // Store the unit itself so this judgement can be replayed against a
         // different model later without needing the repository to still exist.
         let unit_json = serde_json::to_string(&unit).ok();
-        self.db.log_decision(&crate::db::DecisionRecord {
+        let decision_id = self.db.log_decision(&crate::db::DecisionRecord {
             session_id,
             file: &unit.file,
             line_start: unit.start_line,
@@ -684,6 +773,9 @@ impl CraApp {
             unit_json: unit_json.as_deref(),
             blinded: self.settings.blind_review,
         });
+        if let Some(entry) = defer {
+            self.pending.push((decision_id, entry));
+        }
         self.note(
             "decision",
             &format!("{} {}:{} ({})", action.as_str(), unit.file, unit.start_line, provenance.source_str()),
@@ -778,7 +870,9 @@ impl CraApp {
                     Err(e) => e.clone(),
                 }
             } else {
-                c.raw.clone()
+                // The session id and the verdict have already been pulled out
+                // of the full text; what is left is for a human to read.
+                models::transcript_excerpt(&c.raw)
             };
         }
         match c.result {
@@ -1023,6 +1117,33 @@ mod state_tests {
         assert_eq!(h.app.chosen, Some(Choice::Candidate(0)));
     }
 
+    #[test]
+    fn the_models_are_started_inside_the_repository_under_review() {
+        let dir = TempDir::new("cwd");
+        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let mut h = Harness::new("cwd");
+        h.enter_with(vec![cli.slot("")]);
+        h.settle();
+
+        // Without this the prompt's file paths point at wherever the app was
+        // launched from, and a model that goes looking finds someone else's
+        // code — or nothing at all.
+        let seen = std::fs::canonicalize(cli.cwd_seen()).expect("child cwd");
+        let want = std::fs::canonicalize(h.repo.path()).expect("repo path");
+        assert_eq!(seen, want);
+
+        // The follow-up has to land in the same place, or the second turn
+        // would be reasoning about a different tree than the first.
+        std::fs::remove_file(dir.path().join("fake.cwd")).ok();
+        h.app.sessions[0] = Some("s-1".into());
+        h.app.settings.models[0].resume_command = format!("{} --resume {{session}}", cli.command());
+        h.app.follow_up = "why?".into();
+        h.app.ask_followup(&egui::Context::default(), None);
+        h.settle();
+        let resumed = std::fs::canonicalize(cli.cwd_seen()).expect("follow-up cwd");
+        assert_eq!(resumed, want);
+    }
+
     fn state_name(s: &CandidateState) -> &'static str {
         match s {
             CandidateState::Disabled => "disabled",
@@ -1174,6 +1295,94 @@ mod state_tests {
         assert!(message.contains("Comment-provenance: fake"), "{message}");
         assert!(message.contains("Co-authored-by: Fake <fake@example.com>"), "{message}");
         assert!(message.contains("says why"), "the model's reasoning belongs in the body: {message}");
+    }
+
+    #[test]
+    fn commit_message_records_model_and_effort() {
+        let dir = TempDir::new("model-effort");
+        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let mut slot = cli.slot("");
+        slot.model = "claude-sonnet-5".into();
+        slot.effort = "low".into();
+        let mut h = Harness::new("model-effort");
+        h.enter_with(vec![slot]);
+        h.settle();
+        h.app.choose_candidate(0);
+
+        h.app.save_and_continue(&egui::Context::default(), true);
+        assert!(h.app.review_error.is_none(), "{:?}", h.app.review_error);
+
+        let message = h.repo.git(&["log", "-1", "--format=%B"]);
+        assert!(message.contains("Model: claude-sonnet-5"), "{message}");
+        assert!(message.contains("Effort: low"), "{message}");
+    }
+
+    /// The bug this app was filed over: a `Save and Continue` on one comment
+    /// followed by `Commit and Continue` on the next must not lose the first
+    /// decision's justification from the commit that ends up covering both.
+    #[test]
+    fn batched_saves_are_all_documented_in_the_final_commit() {
+        let dir = TempDir::new("batch");
+        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let mut h = Harness::new("batch");
+        let before = gitio::head_sha(&h.repo.path()).unwrap();
+        h.enter_with(vec![cli.slot("")]);
+
+        h.settle();
+        h.app.choose_candidate(0);
+        h.app.save_and_continue(&egui::Context::default(), false);
+        assert!(h.app.review_error.is_none(), "{:?}", h.app.review_error);
+        assert_eq!(gitio::head_sha(&h.repo.path()).unwrap(), before, "save must not commit");
+
+        h.settle();
+        h.app.choose_candidate(0);
+        h.app.save_and_continue(&egui::Context::default(), true);
+        assert!(h.app.review_error.is_none(), "{:?}", h.app.review_error);
+
+        // Only one commit for both decisions...
+        let new_commits = h.repo.git(&["rev-list", "--count", &format!("{before}..HEAD")]);
+        assert_eq!(new_commits.trim(), "1", "the batch should land as one commit");
+
+        // ...whose message documents both, not just the second.
+        let message = h.repo.git(&["log", "-1", "--format=%B"]);
+        assert!(message.contains("2 comment decisions"), "{message}");
+        assert!(message.contains("src/lib.rs:2"), "{message}");
+        assert!(message.contains("src/lib.rs:4"), "{message}");
+        assert!(message.matches("says why").count() == 2, "each decision's justification: {message}");
+        // Trailers are shared, not duplicated once per decision.
+        assert_eq!(message.matches("Co-authored-by:").count(), 1, "{message}");
+
+        assert!(h.app.pending.is_empty(), "the flushed decisions must leave pending empty");
+    }
+
+    #[test]
+    fn commit_each_toggle_makes_every_save_its_own_commit() {
+        let dir = TempDir::new("commit-each");
+        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let mut h = Harness::new("commit-each");
+        let before = gitio::head_sha(&h.repo.path()).unwrap();
+        h.app.commit_each = true;
+        h.enter_with(vec![cli.slot("")]);
+
+        h.settle();
+        h.app.choose_candidate(0);
+        // `Save and Continue` — not `Commit and Continue` — but the toggle
+        // forces an immediate commit rather than batching.
+        h.app.save_and_continue(&egui::Context::default(), false);
+        assert!(h.app.review_error.is_none(), "{:?}", h.app.review_error);
+
+        h.settle();
+        h.app.choose_candidate(0);
+        h.app.save_and_continue(&egui::Context::default(), false);
+        assert!(h.app.review_error.is_none(), "{:?}", h.app.review_error);
+
+        let new_commits = h.repo.git(&["rev-list", "--count", &format!("{before}..HEAD")]);
+        assert_eq!(new_commits.trim(), "2", "each decision should be its own commit");
+        assert!(h.app.pending.is_empty());
+
+        let latest = h.repo.git(&["log", "-1", "--format=%B"]);
+        assert!(latest.contains("review(comments): rewrite comment in src/lib.rs:4"), "{latest}");
+        assert!(!latest.contains("src/lib.rs:2"), "the first decision has its own commit: {latest}");
     }
 
     #[test]
