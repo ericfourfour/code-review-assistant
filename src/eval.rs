@@ -337,3 +337,133 @@ impl Report {
         out
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::comments::CommentStyle;
+
+    fn unit(file: &str, line: u32) -> CommentUnit {
+        CommentUnit {
+            file: file.into(),
+            lang: "Rust".into(),
+            start_line: line,
+            end_line: line,
+            raw_lines: vec!["    // a".into()],
+            indent: "    ".into(),
+            style: CommentStyle::Line { prefix: "//".into() },
+            context: String::new(),
+            hunk_header: String::new(),
+            has_added: true,
+        }
+    }
+
+    fn entry(action: &str, final_text: &str, blinded: bool) -> CorpusEntry {
+        CorpusEntry {
+            unit: unit("src/lib.rs", 2),
+            action: action.into(),
+            final_text: final_text.into(),
+            source: "human-authored".into(),
+            blinded,
+            human_edited: false,
+        }
+    }
+
+    #[test]
+    fn a_corpus_round_trips_through_a_file() {
+        let dir = crate::testkit::TempDir::new("corpus");
+        let path = dir.path().join("corpus.json");
+        let corpus = Corpus {
+            entries: vec![entry("rewrite", "    // better", true), entry("keep", "    // a", false)],
+        };
+        corpus.save(&path).unwrap();
+
+        let loaded = Corpus::load(&path).unwrap();
+        assert_eq!(loaded.entries.len(), 2);
+        assert_eq!(loaded.entries[0].action, "rewrite");
+        assert_eq!(loaded.entries[0].unit.indent, "    ");
+        assert!(loaded.entries[0].blinded);
+        assert!(!loaded.entries[1].blinded);
+        // The unit has to survive intact, or a replay is not asking the same
+        // question the human answered.
+        assert_eq!(loaded.entries[0].unit.raw_lines, vec!["    // a".to_string()]);
+    }
+
+    #[test]
+    fn scoring_a_replay_counts_agreement_and_errors() {
+        let corpus = Corpus {
+            entries: vec![
+                entry("delete", "", true),
+                entry("keep", "    // a", true),
+                entry("rewrite", "    // Counts retries.", true),
+            ],
+        };
+        let results = ReplayResults {
+            answers: vec![
+                // agrees
+                ReplayAnswer {
+                    model: "m1".into(),
+                    entry: 0,
+                    action: Some("delete".into()),
+                    comment: String::new(),
+                    latency_ms: 100,
+                    error: None,
+                },
+                // disagrees
+                ReplayAnswer {
+                    model: "m1".into(),
+                    entry: 1,
+                    action: Some("delete".into()),
+                    comment: String::new(),
+                    latency_ms: 300,
+                    error: None,
+                },
+                // agrees, and proposed the text the human kept
+                ReplayAnswer {
+                    model: "m1".into(),
+                    entry: 2,
+                    action: Some("rewrite".into()),
+                    comment: "Counts retries.".into(),
+                    latency_ms: 200,
+                    error: None,
+                },
+                // errored: must not count as a disagreement
+                ReplayAnswer {
+                    model: "m2".into(),
+                    entry: 0,
+                    action: None,
+                    comment: String::new(),
+                    latency_ms: 0,
+                    error: Some("timed out".into()),
+                },
+            ],
+        };
+
+        let report = Report::from_replay(&corpus, &results);
+        let m1 = &report.models["m1"];
+        assert_eq!(m1.judged, 3);
+        assert_eq!(m1.errors, 0);
+        assert_eq!(m1.action_agreed, 2);
+        assert!((m1.agreement_pct() - 66.6).abs() < 1.0, "{}", m1.agreement_pct());
+        assert_eq!(m1.accepted, 1, "the matching rewrite should count as accepted");
+        assert_eq!(m1.mean_latency_ms(), 200);
+
+        let m2 = &report.models["m2"];
+        assert_eq!(m2.errors, 1);
+        // One error out of one attempt leaves nothing to agree about, and must
+        // not read as 0% agreement — that would punish a model for a crash the
+        // same as for a wrong answer.
+        assert_eq!(m2.agreement_pct(), 0.0);
+        assert_eq!(m2.judged.saturating_sub(m2.errors), 0);
+    }
+
+    #[test]
+    fn the_report_says_what_it_does_not_know() {
+        let corpus = Corpus { entries: vec![entry("keep", "    // a", false)] };
+        let results = ReplayResults { answers: vec![] };
+        let text = Report::from_replay(&corpus, &results).render();
+        assert!(text.contains("self-agreement: unknown"), "{text}");
+        assert!(text.contains("names\n visible") || text.contains("names"), "{text}");
+        assert!(text.contains("not with any ground truth"), "{text}");
+    }
+}

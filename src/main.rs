@@ -9,6 +9,8 @@ mod gitio;
 mod models;
 mod review;
 mod settings;
+#[cfg(test)]
+mod testkit;
 mod ui;
 
 use std::path::PathBuf;
@@ -149,3 +151,47 @@ fn execute(args: &[String]) -> Result<(), String> {
     }
 }
 
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn flags_are_read_by_name() {
+        let args = argv(&["replay", "--corpus", "c.json", "--out", "r.json"]);
+        assert_eq!(flag(&args, "--corpus"), Some("c.json"));
+        assert_eq!(flag(&args, "--out"), Some("r.json"));
+        assert_eq!(flag(&args, "--missing"), None);
+        assert_eq!(path_flag(&args, "--nope", "default.json"), PathBuf::from("default.json"));
+    }
+
+    #[test]
+    fn a_flag_with_no_value_does_not_swallow_the_next_flag() {
+        // `replay --corpus --out x` must not take "--out" as the corpus path,
+        // which would surface much later as a confusing file-read error.
+        let args = argv(&["replay", "--corpus", "--out", "r.json"]);
+        assert_eq!(flag(&args, "--corpus"), None);
+        let trailing = argv(&["replay", "--corpus"]);
+        assert_eq!(flag(&trailing, "--corpus"), None);
+    }
+
+    #[test]
+    fn unknown_commands_explain_themselves() {
+        let err = execute(&argv(&["frobnicate"])).unwrap_err();
+        assert!(err.contains("unknown command"), "{err}");
+        assert!(err.contains("export-corpus"), "the error should show usage: {err}");
+    }
+
+    #[test]
+    fn replay_without_a_corpus_says_so() {
+        assert!(execute(&argv(&["replay"])).unwrap_err().contains("--corpus"));
+    }
+
+    #[test]
+    fn report_needs_both_halves_or_neither() {
+        assert!(execute(&argv(&["report", "--corpus", "c.json"])).unwrap_err().contains("both"));
+    }
+}

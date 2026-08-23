@@ -378,6 +378,19 @@ diff --git a/a.c b/a.c
     }
 
     #[test]
+    fn dedent_reindent_round_trip() {
+        let out = units_for(RS_DIFF);
+        let u = &out[0].1[0];
+        let flat = u.dedent(&u.raw_lines.join("\n"));
+        assert_eq!(flat, "// Increment the counter by one\n// to increment the counter.");
+        assert_eq!(u.reindent(&flat), u.raw_lines);
+        // deeper relative indentation inside the comment survives the trip
+        let nested = "// a\n//   b";
+        assert_eq!(u.dedent(&u.reindent(nested).join("\n")), nested);
+        assert!(u.reindent("  \n").is_empty());
+    }
+
+    #[test]
     fn prompt_is_minimal_but_contextual() {
         let out = units_for(RS_DIFF);
         let p = build_prompt(&out[0].1[0]);

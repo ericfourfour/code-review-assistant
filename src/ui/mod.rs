@@ -7,3 +7,6 @@ mod repo_picker;
 mod review_screen;
 mod settings_screen;
 mod summary;
+
+#[cfg(test)]
+mod frame_tests;
