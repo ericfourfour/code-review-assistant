@@ -11,6 +11,7 @@ mod findings;
 mod gitio;
 mod models;
 mod review;
+mod scopes;
 mod settings;
 #[cfg(test)]
 mod testkit;

@@ -45,19 +45,21 @@ Pick Repository  →  Pick Branch / PR (or working tree)  →  Start or Pick Fil
 ## Semantic units and hunk units
 
 A code unit's editable region is the tight cluster of changed lines, but its *context* is as
-wide as can be justified. When the language is parsable enough (brace matching for Rust,
-C/C++, JS/TS, JVM languages, Go, Swift, C#, PHP; indentation for Python), the excerpt is the
+wide as can be justified. When the language has a bundled grammar, the excerpt is the
 **whole enclosing function or class** — a change judged against the definition it actually
 lives in, with the scope named in the unit badge (`code · fn main()`). Everywhere else — 
-unknown extensions, config files, code the heuristics cannot read, scopes over ~240 lines — 
+unknown extensions, config files, languages without a grammar, scopes over ~240 lines — 
 the excerpt falls back to the surrounding **hunk**, which needs nothing but the diff. Both
 kinds are reviewable; semantic is simply preferred when possible so the context is relevant
 rather than merely nearby.
 
-Scope detection is heuristic on purpose (strings and comments are blanked before brace
-counting; char literals and lifetimes are told apart by lookahead). Anything that defeats it
-degrades to a hunk unit — never to a wrong edit, because every write re-verifies the on-disk
-lines first.
+Semantic structure comes from **real parsers**: tree-sitter grammars (bundled for Rust,
+Python, JS/TS/TSX, Go, Java, C, C++, C#, PHP) answer both "which definition encloses this
+line" and "where do definitions begin" — a fixture string containing `"fn main() {"` is a
+string to the grammar, not a function. A language without a bundled grammar (Swift, Kotlin,
+Scala, …) degrades to hunk context and blank-line windows — never to a wrong edit, because
+every write re-verifies the on-disk lines first. The grammars compile as C code at build
+time, so building needs a C compiler alongside the Rust toolchain.
 
 ## Seeing what the models read
 
