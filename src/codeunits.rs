@@ -35,10 +35,6 @@ const CLUSTER_GAP: u32 = 10;
 /// where the language is parsable, blank lines otherwise.
 const MAX_REGION_LINES: u32 = 120;
 
-/// How many lines a multi-line signature / attribute stack may extend a
-/// scope's start upward.
-const MAX_SIGNATURE_LINES: usize = 12;
-
 #[derive(Clone, Serialize, Deserialize)]
 pub struct CodeUnit {
     pub file: String,
@@ -106,9 +102,12 @@ fn units_in_file(repo: &str, f: &DiffFile, context_lines: usize) -> Vec<CodeUnit
         }
     }
 
-    let disk: Option<Vec<String>> = std::fs::read_to_string(Path::new(repo).join(&f.path))
-        .ok()
-        .map(|c| c.lines().map(|s| s.to_string()).collect());
+    let disk_src: Option<String> = std::fs::read_to_string(Path::new(repo).join(&f.path)).ok();
+    let disk: Option<Vec<String>> =
+        disk_src.as_ref().map(|c| c.lines().map(|s| s.to_string()).collect());
+    // One real parse per file; every semantic question below goes through it.
+    let parsed: Option<crate::scopes::ParsedFile> =
+        disk_src.as_deref().and_then(|src| crate::scopes::parse(&f.path, src));
 
     let mut units = Vec::new();
     for hunk in &f.hunks {
@@ -163,7 +162,7 @@ fn units_in_file(repo: &str, f: &DiffFile, context_lines: usize) -> Vec<CodeUnit
 
         let windows: Vec<(u32, u32)> = clusters(&positions, CLUSTER_GAP)
             .into_iter()
-            .flat_map(|c| split_region(c, &new_text, disk.as_deref(), spec.as_ref(), &lang))
+            .flat_map(|c| split_region(c, &new_text, disk.as_deref(), parsed.as_ref()))
             .collect();
         for (rs, re) in windows {
             let raw_lines: Vec<String> = match (rs..=re).map(|no| new_text.get(&no).cloned()).collect() {
@@ -173,8 +172,7 @@ fn units_in_file(repo: &str, f: &DiffFile, context_lines: usize) -> Vec<CodeUnit
             let changed_lines: Vec<u32> = added.range(rs..=re).copied().collect();
             let (scope, context) = context_for(
                 disk.as_deref(),
-                spec.as_ref(),
-                &lang,
+                parsed.as_ref(),
                 (rs, re),
                 (first_new, last_new),
                 &new_text,
@@ -253,29 +251,28 @@ fn removed_is_code(spec: Option<&LangSpec>, text: &str) -> bool {
 }
 
 /// Chop an oversized region into consecutive windows of at most
-/// [`MAX_REGION_LINES`]. Semantic boundaries come first: when the language is
-/// parsable and the checkout matches the diff, windows cut at the tops of the
+/// [`MAX_REGION_LINES`]. Semantic boundaries come first: when the file has a
+/// grammar and the checkout matches the diff, windows cut at the tops of the
 /// definitions the region spans, descending into oversized containers (an
 /// `impl` block splits at its methods, a class at its defs). Blank lines are
 /// the fallback — inside a definition that is itself too long, and in files
-/// the scope heuristics cannot read.
+/// no bundled grammar can parse.
 fn split_region(
     region: (u32, u32),
     new_text: &BTreeMap<u32, String>,
     disk: Option<&[String]>,
-    spec: Option<&LangSpec>,
-    lang: &str,
+    parsed: Option<&crate::scopes::ParsedFile>,
 ) -> Vec<(u32, u32)> {
     let (s, e) = region;
     if e - s < MAX_REGION_LINES {
         return vec![region];
     }
-    if let Some(disk) = disk {
+    if let (Some(disk), Some(parsed)) = (disk, parsed) {
         let matches = (s..=e).all(|no| {
             disk.get(no as usize - 1).map(|x| x.as_str()) == new_text.get(&no).map(|x| x.as_str())
         });
         if matches {
-            if let Some(windows) = semantic_split(disk, spec, lang, region) {
+            if let Some(windows) = semantic_split(disk, parsed, region) {
                 return windows;
             }
         }
@@ -290,12 +287,12 @@ fn split_region(
 /// mid-function when the parse succeeded.
 fn semantic_split(
     disk: &[String],
-    spec: Option<&LangSpec>,
-    lang: &str,
+    parsed: &crate::scopes::ParsedFile,
     region: (u32, u32),
 ) -> Option<Vec<(u32, u32)>> {
     let (s, e) = region;
-    let items = semantic_spans(disk, spec, lang, s as usize - 1, e as usize - 1);
+    let items =
+        parsed.definition_spans(s as usize - 1, e as usize - 1, MAX_REGION_LINES as usize);
     let mut segs: Vec<(u32, u32)> = Vec::new();
     let mut cursor = s;
     for (a0, b0) in items {
@@ -357,154 +354,6 @@ fn blank_split(region: (u32, u32), is_blank: &dyn Fn(u32) -> bool) -> Vec<(u32, 
     out
 }
 
-/// Definition spans intersecting [lo0, hi0] (0-based, inclusive), ordered.
-/// A span still longer than the window cap is replaced by its child
-/// definitions when at least two can be found.
-fn semantic_spans(
-    lines: &[String],
-    spec: Option<&LangSpec>,
-    lang: &str,
-    lo0: usize,
-    hi0: usize,
-) -> Vec<(usize, usize)> {
-    match lang {
-        "Python" => indent_spans(lines, lo0, hi0, 0),
-        "Rust" | "C/C++" | "JavaScript" | "TypeScript" | "JVM" | "Go" | "Swift" | "C#" | "PHP" => {
-            let stripped = strip_noncode(lines, spec);
-            let mut blocks: Vec<(usize, usize, usize)> = Vec::new();
-            let mut stack: Vec<usize> = Vec::new();
-            for (i, code) in stripped.iter().enumerate() {
-                for ch in code.chars() {
-                    match ch {
-                        '{' => stack.push(i),
-                        '}' => {
-                            if let Some(open) = stack.pop() {
-                                blocks.push((open, i, stack.len()));
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            brace_spans(lines, &stripped, spec, &blocks, 0, lo0, hi0, 0)
-        }
-        _ => Vec::new(),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn brace_spans(
-    lines: &[String],
-    stripped: &[String],
-    spec: Option<&LangSpec>,
-    blocks: &[(usize, usize, usize)],
-    depth: usize,
-    lo0: usize,
-    hi0: usize,
-    nesting: usize,
-) -> Vec<(usize, usize)> {
-    let mut spans: Vec<(usize, usize)> = blocks
-        .iter()
-        .filter(|(open, close, d)| *d == depth && *close >= lo0 && *open <= hi0)
-        .map(|&(open, close, _)| (open, close))
-        .collect();
-    spans.sort_unstable();
-    let mut out: Vec<(usize, usize)> = Vec::new();
-    for (open, close) in spans {
-        // A `{` on its own line belongs to the signature above it.
-        let mut header_line = open;
-        while header_line > 0 && stripped[header_line].trim_start().starts_with('{') {
-            header_line -= 1;
-            if !lines[header_line].trim().is_empty() {
-                break;
-            }
-        }
-        let start = extend_signature(lines, spec, header_line);
-        let label_line = (start..=header_line)
-            .find(|&i| {
-                let t = lines[i].trim();
-                !t.is_empty() && !is_attached_line(t, spec)
-            })
-            .unwrap_or(header_line);
-        // Top-level blocks are items by position (C functions have no
-        // keyword); nested ones must read like definitions, or every `if`
-        // inside a function would become a boundary.
-        if depth > 0 && !is_definition_header(lines[label_line].trim()) {
-            continue;
-        }
-        if close - start + 1 > MAX_REGION_LINES as usize && nesting < 2 && close > open + 1 {
-            let children = brace_spans(
-                lines,
-                stripped,
-                spec,
-                blocks,
-                depth + 1,
-                open + 1,
-                close - 1,
-                nesting + 1,
-            );
-            if children.len() >= 2 {
-                out.extend(children);
-                continue;
-            }
-        }
-        out.push((start, close));
-    }
-    out
-}
-
-/// Indent-scoped languages: defs at the shallowest indentation in range,
-/// decorators included, descending into an oversized class's own defs.
-fn indent_spans(lines: &[String], lo0: usize, hi0: usize, nesting: usize) -> Vec<(usize, usize)> {
-    let width = |s: &str| -> usize {
-        s.chars()
-            .take_while(|c| c.is_whitespace())
-            .map(|c| if c == '\t' { 8 } else { 1 })
-            .sum()
-    };
-    let is_def = |s: &str| {
-        let t = s.trim_start();
-        t.starts_with("def ") || t.starts_with("async def ") || t.starts_with("class ")
-    };
-    let hi0 = hi0.min(lines.len().saturating_sub(1));
-    if lo0 > hi0 {
-        return Vec::new();
-    }
-    let defs: Vec<usize> = (lo0..=hi0).filter(|&i| is_def(&lines[i])).collect();
-    let Some(min_w) = defs.iter().map(|&i| width(&lines[i])).min() else { return Vec::new() };
-    let mut out: Vec<(usize, usize)> = Vec::new();
-    for &i in defs.iter().filter(|&&i| width(&lines[i]) == min_w) {
-        if out.last().is_some_and(|&(_, b)| i <= b) {
-            continue; // inside the previous span
-        }
-        let dw = width(&lines[i]);
-        let mut end = i;
-        for (j, line) in lines.iter().enumerate().skip(i + 1) {
-            if line.trim().is_empty() {
-                continue;
-            }
-            if width(line) <= dw {
-                break;
-            }
-            end = j;
-        }
-        let mut start = i;
-        while start > 0 && i - start < MAX_SIGNATURE_LINES && lines[start - 1].trim().starts_with('@')
-        {
-            start -= 1;
-        }
-        if end - start + 1 > MAX_REGION_LINES as usize && nesting < 2 && end > i {
-            let children = indent_spans(lines, i + 1, end, nesting + 1);
-            if children.len() >= 2 {
-                out.extend(children);
-                continue;
-            }
-        }
-        out.push((start, end));
-    }
-    out
-}
-
 fn clusters(positions: &BTreeSet<u32>, gap: u32) -> Vec<(u32, u32)> {
     let mut out = Vec::new();
     let mut cur: Option<(u32, u32)> = None;
@@ -529,8 +378,7 @@ fn clusters(positions: &BTreeSet<u32>, gap: u32) -> Vec<(u32, u32)> {
 #[allow(clippy::too_many_arguments)]
 fn context_for(
     disk: Option<&[String]>,
-    spec: Option<&LangSpec>,
-    lang: &str,
+    parsed: Option<&crate::scopes::ParsedFile>,
     region: (u32, u32),
     hunk_span: (u32, u32),
     new_text: &BTreeMap<u32, String>,
@@ -539,7 +387,7 @@ fn context_for(
     context_lines: usize,
 ) -> (Option<String>, String) {
     let (rs, re) = region;
-    if let Some(disk) = disk {
+    if let (Some(disk), Some(parsed)) = (disk, parsed) {
         // The diff and the working tree must agree before disk lines can be
         // shown as "the new side" — an already-dirty checkout must not put
         // words in the branch's mouth.
@@ -548,11 +396,11 @@ fn context_for(
         });
         if matches {
             // Anchor in the middle of the region: its first line may be the
-            // doc comment or signature *above* the body, which no block
+            // doc comment or signature *above* the body, which no node
             // encloses, while the midpoint of a definition-aligned window
             // sits inside the definition itself.
             let mid = (rs + re) / 2;
-            if let Some(scope) = scope_for(disk, spec, lang, mid as usize - 1) {
+            if let Some(scope) = parsed.scope_for(mid as usize - 1) {
                 let start0 = scope.start0.min(rs as usize - 1);
                 let end0 = scope.end0.max(re as usize - 1).min(disk.len().saturating_sub(1));
                 if end0 - start0 < MAX_SCOPE_LINES {
@@ -605,333 +453,6 @@ fn render(
         removed(&mut out, no);
     }
     out
-}
-
-// ---------------------------------------------------------------------------
-// Scope detection: which definition encloses a line. Heuristic on purpose —
-// no parser, so it works on any file that mostly follows its language's
-// shape, and simply returns None (hunk fallback) on anything it cannot read.
-
-struct Scope {
-    start0: usize,
-    end0: usize,
-    header: String,
-}
-
-fn scope_for(lines: &[String], spec: Option<&LangSpec>, lang: &str, target0: usize) -> Option<Scope> {
-    if target0 >= lines.len() {
-        return None;
-    }
-    match lang {
-        "Python" => indent_scope(lines, target0),
-        "Rust" | "C/C++" | "JavaScript" | "TypeScript" | "JVM" | "Go" | "Swift" | "C#" | "PHP" => {
-            brace_scope(lines, spec, target0)
-        }
-        _ => None,
-    }
-}
-
-/// Brace languages: the innermost `{...}` block containing the target whose
-/// header reads like a definition (or that opens at the top level, which
-/// covers C functions and other keyword-less forms).
-fn brace_scope(lines: &[String], spec: Option<&LangSpec>, target0: usize) -> Option<Scope> {
-    let stripped = strip_noncode(lines, spec);
-    let mut stack: Vec<usize> = Vec::new();
-    let mut enclosing: Vec<(usize, usize, usize)> = Vec::new(); // (open, close, depth)
-    for (i, code) in stripped.iter().enumerate() {
-        for ch in code.chars() {
-            match ch {
-                '{' => stack.push(i),
-                '}' => {
-                    if let Some(open) = stack.pop() {
-                        if open <= target0 && i >= target0 {
-                            // Blocks close inner-first, so this vec is already
-                            // ordered innermost to outermost.
-                            enclosing.push((open, i, stack.len()));
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    for (open, close, depth) in enclosing {
-        // A `{` on its own line belongs to the signature above it.
-        let mut header_line = open;
-        while header_line > 0 && stripped[header_line][..].trim_start().starts_with('{') {
-            header_line -= 1;
-            if !lines[header_line].trim().is_empty() {
-                break;
-            }
-        }
-        let start0 = extend_signature(lines, spec, header_line);
-        let label_line = (start0..=header_line)
-            .find(|&i| {
-                let t = lines[i].trim();
-                !t.is_empty() && !is_attached_line(t, spec)
-            })
-            .unwrap_or(header_line);
-        let label = lines[label_line].trim();
-        if depth == 0 || is_definition_header(label) {
-            return Some(Scope { start0, end0: close, header: scope_label(label) });
-        }
-    }
-    None
-}
-
-/// Multi-line signatures, attributes/decorators, and directly attached doc
-/// comments belong to the definition — pull the scope's start up over them.
-fn extend_signature(lines: &[String], spec: Option<&LangSpec>, header_line: usize) -> usize {
-    let mut start = header_line;
-    while start > 0 && header_line - start < MAX_SIGNATURE_LINES {
-        let prev = lines[start - 1].trim();
-        if prev.is_empty() {
-            break;
-        }
-        let continues = prev.ends_with(',') || prev.ends_with('(');
-        // A bare `static int` / `unsigned long` line above a C-style function
-        // name is part of the signature too.
-        let type_line = prev
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '_' || c == ' ' || c == '\t' || c == '*');
-        if continues || type_line || is_attached_line(prev, spec) {
-            start -= 1;
-        } else {
-            break;
-        }
-    }
-    start
-}
-
-/// Attribute, annotation, or comment lines that ride along with a definition.
-fn is_attached_line(trimmed: &str, spec: Option<&LangSpec>) -> bool {
-    if trimmed.starts_with("#[") || trimmed.starts_with('@') {
-        return true;
-    }
-    spec.map(|s| s.line_prefixes.iter().any(|p| trimmed.starts_with(p))).unwrap_or(false)
-}
-
-/// Does this line read like the head of a definition rather than control
-/// flow? Modifier keywords are stripped first, so `pub async fn`, `public
-/// static void`, and friends all resolve to their core.
-fn is_definition_header(line: &str) -> bool {
-    let mut t = line.trim();
-    loop {
-        let before = t;
-        for m in [
-            "pub(crate)", "pub(super)", "pub(in", "pub", "export", "default", "static", "public",
-            "private", "protected", "internal", "abstract", "final", "sealed", "override",
-            "virtual", "async", "unsafe", "extern", "inline", "constexpr",
-        ] {
-            if let Some(rest) = t.strip_prefix(m) {
-                if rest.starts_with(' ') || rest.starts_with(')') {
-                    t = rest.trim_start_matches(')').trim_start();
-                    break;
-                }
-            }
-        }
-        if t == before {
-            break;
-        }
-    }
-    let first: String = t
-        .chars()
-        .take_while(|c| c.is_alphanumeric() || *c == '_')
-        .collect();
-    if matches!(
-        first.as_str(),
-        "if" | "else" | "while" | "for" | "switch" | "match" | "loop" | "do" | "catch" | "try"
-            | "return" | "unless" | "select" | "defer" | "go"
-    ) {
-        return false;
-    }
-    if matches!(
-        first.as_str(),
-        "fn" | "def" | "func" | "function" | "class" | "impl" | "trait" | "struct" | "enum"
-            | "union" | "interface" | "record" | "object" | "namespace" | "mod" | "constructor"
-            | "init"
-    ) {
-        return true;
-    }
-    // Keyword-less function heads: `int main(void) {`, `void Foo::bar() const {`
-    t.contains('(') && (t.ends_with('{') || t.ends_with(')') || t.ends_with("=> {"))
-}
-
-fn scope_label(header: &str) -> String {
-    let cleaned = header.trim_end_matches('{').trim_end();
-    crate::app::truncate(cleaned, 60)
-}
-
-/// Per-line code with strings and comments blanked out, so brace counting
-/// sees only structural braces. Heuristic: raw strings and multi-line string
-/// literals are not tracked — a file that defeats this simply gets a hunk
-/// unit instead of a semantic one.
-fn strip_noncode(lines: &[String], spec: Option<&LangSpec>) -> Vec<String> {
-    let block = spec.and_then(|s| s.block);
-    let no_prefixes: Vec<&str> = Vec::new();
-    let prefixes: Vec<&str> =
-        spec.map(|s| s.line_prefixes.to_vec()).unwrap_or(no_prefixes);
-    let mut in_block = false;
-    let mut out = Vec::with_capacity(lines.len());
-    for line in lines {
-        let s = line.as_str();
-        let mut code = String::with_capacity(s.len());
-        let mut i = 0;
-        while i < s.len() {
-            if in_block {
-                if let Some((_, close)) = block {
-                    if s[i..].starts_with(close) {
-                        in_block = false;
-                        i += close.len();
-                        continue;
-                    }
-                }
-                i += s[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
-                continue;
-            }
-            if prefixes.iter().any(|p| s[i..].starts_with(p)) {
-                break;
-            }
-            if let Some((open, close)) = block {
-                if s[i..].starts_with(open) {
-                    in_block = true;
-                    i += open.len();
-                    // `/* ... */` on one line closes immediately in the loop.
-                    let _ = close;
-                    continue;
-                }
-            }
-            let c = s[i..].chars().next().unwrap();
-            match c {
-                '"' | '`' => {
-                    i += c.len_utf8();
-                    i += skip_string(&s[i..], c);
-                }
-                '\'' => {
-                    // A char literal (possibly escaped, `'{'` included) is
-                    // skipped; a lone quote — a lifetime, an apostrophe — is
-                    // left alone rather than swallowing the rest of the line.
-                    i += c.len_utf8();
-                    match char_literal_len(&s[i..]) {
-                        Some(n) => i += n,
-                        None => code.push(' '),
-                    }
-                }
-                '{' | '}' => {
-                    code.push(c);
-                    i += 1;
-                }
-                _ => {
-                    code.push(if c.is_whitespace() { ' ' } else { 'x' });
-                    i += c.len_utf8();
-                }
-            }
-        }
-        out.push(code);
-    }
-    out
-}
-
-/// Bytes to skip until the closing `quote` (or end of line), escapes honoured.
-fn skip_string(rest: &str, quote: char) -> usize {
-    let mut esc = false;
-    let mut n = 0;
-    for c in rest.chars() {
-        n += c.len_utf8();
-        if esc {
-            esc = false;
-        } else if c == '\\' {
-            esc = true;
-        } else if c == quote {
-            return n;
-        }
-    }
-    n
-}
-
-/// Length of a short `...'` char-literal body, or None if the quote does not
-/// close within a few characters (then it was not a char literal at all).
-fn char_literal_len(rest: &str) -> Option<usize> {
-    let mut n = 0;
-    for (count, c) in rest.chars().enumerate() {
-        n += c.len_utf8();
-        if c == '\'' && count > 0 {
-            return Some(n);
-        }
-        // `'a'`, `'\n'`, `'\u{7f}'` at most — anything longer is a lifetime.
-        if count >= 8 {
-            break;
-        }
-    }
-    // `''` (empty) or unterminated within reach.
-    if rest.starts_with('\'') {
-        return Some(1);
-    }
-    None
-}
-
-/// Python and friends: the nearest `def`/`class` line above the target with
-/// less indentation than everything between them.
-fn indent_scope(lines: &[String], target0: usize) -> Option<Scope> {
-    let width = |s: &str| -> usize {
-        s.chars()
-            .take_while(|c| c.is_whitespace())
-            .map(|c| if c == '\t' { 8 } else { 1 })
-            .sum()
-    };
-    let is_def = |s: &str| {
-        let t = s.trim_start();
-        t.starts_with("def ") || t.starts_with("async def ") || t.starts_with("class ")
-    };
-    let mut t = target0;
-    while t > 0 && lines[t].trim().is_empty() {
-        t -= 1;
-    }
-    let def = if is_def(&lines[t]) {
-        t
-    } else {
-        let mut bound = width(&lines[t]);
-        let mut found = None;
-        for i in (0..t).rev() {
-            if lines[i].trim().is_empty() {
-                continue;
-            }
-            let w = width(&lines[i]);
-            if w < bound {
-                if is_def(&lines[i]) {
-                    found = Some(i);
-                    break;
-                }
-                bound = w;
-                if w == 0 {
-                    break;
-                }
-            }
-        }
-        found?
-    };
-    let dw = width(&lines[def]);
-    let mut end = def;
-    for (j, line) in lines.iter().enumerate().skip(def + 1) {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if width(line) <= dw {
-            break;
-        }
-        end = j;
-    }
-    let mut start = def;
-    while start > 0 && def - start < MAX_SIGNATURE_LINES {
-        let prev = lines[start - 1].trim();
-        if prev.starts_with('@') {
-            start -= 1;
-        } else {
-            break;
-        }
-    }
-    let header = lines[def].trim().trim_end_matches(':');
-    Some(Scope { start0: start, end0: end, header: scope_label(header) })
 }
 
 /// The prompt sent to each model CLI for a code unit. Same contract as the
@@ -1311,96 +832,6 @@ diff --git a/src/main.rs b/src/main.rs
         let u = &out[0].1[0];
         assert!(u.scope.is_none(), "a {MAX_SCOPE_LINES}+ line scope is not an excerpt");
         assert!(u.context.contains(">  302| "), "{}", u.context);
-    }
-
-    // -- scope detection ----------------------------------------------------
-
-    fn lines(text: &str) -> Vec<String> {
-        text.lines().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn brace_scope_finds_the_function_not_the_if() {
-        let src = lines(
-            "use x;\n\nimpl Foo {\n    /// Doc.\n    #[inline]\n    pub fn bar(&self) -> u32 {\n        if self.ready {\n            self.count += 1;\n        }\n        self.count\n    }\n}\n",
-        );
-        let spec = crate::comments::lang_for("a.rs");
-        let s = scope_for(&src, spec.as_ref(), "Rust", 7).expect("scope");
-        // The `if` block does not qualify; the fn does — with its doc comment
-        // and attribute attached.
-        assert_eq!(s.header, "pub fn bar(&self) -> u32");
-        assert_eq!((s.start0, s.end0), (3, 10));
-    }
-
-    #[test]
-    fn brace_scope_handles_braces_in_strings_and_chars() {
-        let src = lines(
-            "fn a() {\n    let s = \"}}}{\";\n    let c = '{';\n    work();\n}\nfn b() {\n    other();\n}\n",
-        );
-        let spec = crate::comments::lang_for("a.rs");
-        let s = scope_for(&src, spec.as_ref(), "Rust", 3).expect("scope");
-        assert_eq!(s.header, "fn a()");
-        assert_eq!((s.start0, s.end0), (0, 4));
-    }
-
-    #[test]
-    fn brace_scope_covers_keywordless_c_functions() {
-        let src = lines(
-            "#include <stdio.h>\n\nstatic int\nhelper(int a,\n       int b)\n{\n    return a + b;\n}\n",
-        );
-        let spec = crate::comments::lang_for("a.c");
-        let s = scope_for(&src, spec.as_ref(), "C/C++", 6).expect("scope");
-        // Brace on its own line: the signature above it is the header, and a
-        // multi-line signature is walked all the way up.
-        assert_eq!((s.start0, s.end0), (2, 7));
-    }
-
-    #[test]
-    fn go_methods_and_top_level_blocks_qualify() {
-        let src = lines(
-            "package main\n\nfunc (s *Server) Handle(w http.ResponseWriter) {\n\tif s.ok {\n\t\tserve(w)\n\t}\n}\n",
-        );
-        let spec = crate::comments::lang_for("a.go");
-        let s = scope_for(&src, spec.as_ref(), "Go", 4).expect("scope");
-        assert!(s.header.starts_with("func (s *Server) Handle"), "{}", s.header);
-    }
-
-    #[test]
-    fn indent_scope_finds_the_python_method() {
-        let src = lines(
-            "import os\n\nclass Greeter:\n    @property\n    def name(self):\n        if self.formal:\n            return self.title\n\n        return self.nick\n\nTOP = 1\n",
-        );
-        let s = scope_for(&src, None, "Python", 8).expect("scope");
-        // Nearest enclosing def, decorator included, trailing blank excluded.
-        assert_eq!(s.header, "def name(self)");
-        assert_eq!((s.start0, s.end0), (3, 8));
-    }
-
-    #[test]
-    fn indent_scope_at_module_level_is_none() {
-        let src = lines("import os\n\nX = 1\n");
-        assert!(scope_for(&src, None, "Python", 2).is_none());
-    }
-
-    #[test]
-    fn a_changed_def_line_scopes_to_itself() {
-        let src = lines("class A:\n    def f(self, x):\n        return x\n");
-        let s = scope_for(&src, None, "Python", 1).expect("scope");
-        assert_eq!(s.header, "def f(self, x)");
-        assert_eq!((s.start0, s.end0), (1, 2));
-    }
-
-    #[test]
-    fn definition_headers_are_recognised_and_control_flow_is_not() {
-        assert!(is_definition_header("pub async fn go() {"));
-        assert!(is_definition_header("public static void main(String[] args) {"));
-        assert!(is_definition_header("int main(void) {"));
-        assert!(is_definition_header("export default function App() {"));
-        assert!(is_definition_header("constructor(props) {"));
-        assert!(!is_definition_header("if ready(now) {"));
-        assert!(!is_definition_header("for (int i = 0; i < n; i++) {"));
-        assert!(!is_definition_header("} else {"));
-        assert!(!is_definition_header("return call(x)"));
     }
 
     #[test]
