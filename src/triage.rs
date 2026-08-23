@@ -239,7 +239,7 @@ mod tests {
     fn test_files_are_halved_and_the_score_is_bounded() {
         let prod = assess(&code("src/auth.rs", 1, &["    check_password(secret);"], Some("fn f"), ""));
         let test = assess(&code("tests/auth.rs", 1, &["    check_password(secret);"], Some("fn f"), ""));
-        assert!(test.score < prod.score);
+        assert_eq!(test.score, prod.score / 2);
         assert!(test.reasons.iter().any(|r| r.contains("test code")));
 
         let everything = assess(&code(
@@ -251,7 +251,6 @@ mod tests {
         ));
         assert!(everything.score <= 100, "{}", everything.score);
     }
-
     #[test]
     fn scores_are_deterministic() {
         let u = code("src/a.rs", 1, &["    spawn(worker);"], Some("fn f"), "");
