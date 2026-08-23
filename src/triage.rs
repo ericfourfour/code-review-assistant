@@ -227,15 +227,14 @@ mod tests {
 
     #[test]
     fn prose_about_risky_things_does_not_outrank_the_code() {
-        // Found by running the tool on its own branch: the README hit risk
-        // 100 because it *describes* the vocabulary buckets.
+        // Documentation changes carry no runtime risk, so review attention
+        // should prioritize executable code even when prose mentions risky terms.
         let prose = &["This guards secrets with a mutex; unsafe code panics on TODO."];
         let doc = assess(&code("README.md", 1, prose, None, ""));
         let src = assess(&code("src/vault.rs", 1, prose, None, ""));
         assert!(doc.score < src.score / 2, "doc {} vs code {}", doc.score, src.score);
         assert!(doc.reasons.iter().any(|r| r.contains("documentation")), "{:?}", doc.reasons);
     }
-
     #[test]
     fn test_files_are_halved_and_the_score_is_bounded() {
         let prod = assess(&code("src/auth.rs", 1, &["    check_password(secret);"], Some("fn f"), ""));
