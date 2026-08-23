@@ -69,6 +69,33 @@ it. A model that misreports a path is caught by the same viewer: the failure to 
 shown, which is itself worth knowing when weighing the verdict. Evidence is stored alongside
 every suggestion in the database.
 
+## Triage: riskiest first
+
+The walk visits units riskiest-first by default (Settings → walk order turns it back to diff
+order). Risk is a **local, deterministic heuristic** — deliberately not a model call, which
+would stall plan building and add a failure mode to the one step that must always work. The
+score (0–100) adds up inspectable signals: code outranks comments, size, removed lines, a
+missing enclosing scope, and vocabulary buckets for the things that go wrong (secrets and
+auth, locks and threads, `unsafe`/`unwrap`/`panic!`, subprocesses and SQL, `TODO`/`FIXME`
+markers); test files are halved. The review screen shows each unit's score with the reasons
+on hover, and the file picker shows each file's peak risk. It orders attention — the models
+still judge every unit on its merits when it is reached, and per-edit line offsets are
+tracked individually so an out-of-order walk edits exactly as safely as a linear one.
+
+## The branch pass: cross-cutting findings
+
+Every unit is judged in isolation, which is exactly what a per-unit pass cannot see past.
+When the walk finishes, the summary screen offers a **branch pass** (`G`): each enabled model
+gets the branch's full diff (truncated past ~60k characters, with the seam marked) and the
+run of the repository, and reports only cross-cutting findings — hunks that contradict each
+other, half-applied renames, code left dead, the test or doc a change obviously needs,
+new logic that duplicates something that already exists. Findings come back with severity,
+affected files, and the same clickable evidence chips as unit verdicts; they are recorded in
+the database, sorted high-severity-first for human triage, dismissable one by one (the
+dismissal is recorded too, not deleted), and exportable as markdown for a PR description.
+Nothing is ever edited by this pass — an empty list is an acceptable answer, and the prompt
+says so.
+
 ## Per-edit validation
 
 Settings takes a **check command** (e.g. `cargo check`, `tsc --noEmit`, `go build ./...`) run
@@ -195,6 +222,7 @@ Every action has one; the bottom bar always shows what's live. Highlights:
 | Files | `Enter` start at file · `S` start full review |
 | Review | `1/2/3` pick candidate · `K` keep/approve · `D` delete · `E` edit · `R` re-run models · `P` prev · `N` skip |
 | Continue | `Ctrl+S` save + continue · `Ctrl+Enter` commit + continue |
+| Summary | `G` run branch pass · `F` files · `B` branches/PRs |
 
 ## Build & run
 

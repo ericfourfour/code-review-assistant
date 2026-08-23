@@ -181,6 +181,16 @@ pub fn base_label(base: &str) -> &str {
     }
 }
 
+/// Inverse of [`base_label`], so a plan (which stores the label) can re-run
+/// the diff it was built from.
+pub fn base_from_label(label: &str) -> String {
+    match label {
+        "HEAD" => String::new(),
+        "root" => EMPTY_TREE.to_string(),
+        other => other.to_string(),
+    }
+}
+
 /// Diff of `base...HEAD` (merge-base) with generous context. When `base` is
 /// empty, diff the working tree against HEAD instead; when it is
 /// [`EMPTY_TREE`], diff the entire history.
@@ -423,7 +433,7 @@ mod repo_tests {
         let unit = &units[0];
         assert_eq!(unit.lang, "Rust");
         assert!(unit.has_added);
-        let file = ReviewFile { path: path.clone(), units: vec![], line_offset: 0, decided: 0 };
+        let file = ReviewFile { path: path.clone(), units: vec![], edits: Vec::new(), decided: 0 };
         let replacement = unit.format_replacement("Counting retries, not requests.");
         let wrapped = crate::units::ReviewUnit::Comment(unit.clone());
         let delta = apply_edit(&repo.path(), &file, &wrapped, &replacement).unwrap();
@@ -453,7 +463,7 @@ mod repo_tests {
         let diff = review_diff(&repo.path(), "main", 12).unwrap();
         let extracted = comments::extract_units(&crate::diffparse::parse(&diff), 12);
         let (path, units) = &extracted[0];
-        let file = ReviewFile { path: path.clone(), units: vec![], line_offset: 0, decided: 0 };
+        let file = ReviewFile { path: path.clone(), units: vec![], edits: Vec::new(), decided: 0 };
 
         // Someone edits the file behind our back.
         repo.write("src/lib.rs", "fn main() {\n    counter += 1;\n}\n");

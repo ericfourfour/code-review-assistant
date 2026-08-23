@@ -4,10 +4,12 @@ use std::collections::VecDeque;
 use std::sync::mpsc::{channel, Receiver, Sender};
 
 use crate::db::Db;
+use crate::findings::{self, BranchMsg, Finding};
 use crate::gitio::{self, BranchInfo, PrInfo};
 use crate::models::{self, Action, CandidateMsg, Evidence, Suggestion, Turn};
 use crate::review::{self, Choice, RefKind, ReviewFile, ReviewPlan};
 use crate::settings::Settings;
+use crate::triage;
 use crate::units::{self, ReviewUnit};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -42,6 +44,24 @@ pub enum CandidateState {
 pub enum Msg {
     Prs(Result<Vec<PrInfo>, String>),
     Cand(CandidateMsg),
+    Branch(BranchMsg),
+}
+
+/// One model's slice of the branch pass.
+pub enum BranchPassState {
+    Idle,
+    Pending,
+    Done { n: usize, latency_ms: i64 },
+    Failed(String),
+}
+
+/// A branch-pass finding as the summary screen holds it: the db row id so a
+/// dismissal can be written back, and who reported it.
+pub struct FindingRow {
+    pub id: i64,
+    pub model: String,
+    pub finding: Finding,
+    pub dismissed: bool,
 }
 
 pub struct CraApp {
@@ -108,6 +128,13 @@ pub struct CraApp {
     /// A per-session toggle (review screen checkbox), not persisted.
     pub commit_each: bool,
 
+    /// Monotonic id for branch passes, so a late reply from an abandoned run
+    /// cannot land findings against a newer plan.
+    pub branch_seq: u64,
+    /// Parallel to `settings.models`; empty until a pass is started.
+    pub branch_pass: Vec<BranchPassState>,
+    pub findings: Vec<FindingRow>,
+
     pub tx: Sender<Msg>,
     pub rx: Receiver<Msg>,
 }
@@ -163,6 +190,9 @@ impl CraApp {
             focus_follow_up: false,
             pending: Vec::new(),
             commit_each: false,
+            branch_seq: 0,
+            branch_pass: Vec::new(),
+            findings: Vec::new(),
             tx,
             rx,
         }
@@ -303,8 +333,11 @@ impl CraApp {
         let files = crate::diffparse::parse(&diff);
         let (want_comments, want_code) =
             (self.settings.review_comments, self.settings.review_code);
-        let extracted =
+        let mut extracted =
             units::assemble(&path, &files, self.settings.context_lines, want_comments, want_code);
+        if self.settings.triage_order {
+            triage::order_riskiest_first(&mut extracted);
+        }
         if extracted.is_empty() {
             let what = match (want_comments, want_code) {
                 (true, true) => "units",
@@ -330,7 +363,7 @@ impl CraApp {
             extracted.iter().map(|(_, u)| u.iter().filter(|u| u.is_code()).count()).sum();
         let review_files = extracted
             .into_iter()
-            .map(|(path, units)| ReviewFile { path, units, line_offset: 0, decided: 0 })
+            .map(|(path, units)| ReviewFile { path, units, edits: Vec::new(), decided: 0 })
             .collect::<Vec<_>>();
         self.note(
             "session",
@@ -351,6 +384,10 @@ impl CraApp {
             unit_idx: 0,
             decided_total: 0,
         });
+        // A new plan invalidates any branch pass, in flight or done.
+        self.branch_seq += 1;
+        self.branch_pass.clear();
+        self.findings.clear();
         self.ref_error = None;
         self.file_sel = 0;
         self.screen = Screen::FilePicker;
@@ -391,7 +428,7 @@ impl CraApp {
                 None => files.push(ReviewFile {
                     path: entry.unit.file().to_string(),
                     units: vec![entry.unit],
-                    line_offset: 0,
+                    edits: Vec::new(),
                     decided: 0,
                 }),
             }
@@ -723,7 +760,7 @@ impl CraApp {
         if makes_edit {
             let Some(plan) = &self.plan else { return };
             let file = &plan.files[plan.file_idx];
-            let line_offset = file.line_offset;
+            let line_offset = file.offset_for(unit.start_line());
             match review::apply_edit(&repo_path, file, &unit, &new_lines) {
                 Ok(d) => delta = d,
                 Err(e) => {
@@ -869,7 +906,9 @@ impl CraApp {
         );
 
         if let Some(plan) = &mut self.plan {
-            plan.files[plan.file_idx].line_offset += delta;
+            if makes_edit {
+                plan.files[plan.file_idx].edits.push((unit.start_line(), delta));
+            }
             plan.files[plan.file_idx].decided += 1;
             plan.decided_total += 1;
             if plan.advance() {
@@ -902,6 +941,161 @@ impl CraApp {
         }
     }
 
+    // -- branch pass ---------------------------------------------------------
+
+    /// Ask every enabled model for cross-cutting findings over the whole
+    /// branch: what the per-unit walk, judging changes in isolation, cannot
+    /// see. Runs from the summary screen once the walk is done (or whenever
+    /// the human asks again).
+    pub fn start_branch_pass(&mut self, ctx: &egui::Context) {
+        let Some(plan) = &self.plan else { return };
+        if plan.is_recheck() {
+            self.note("branch", "a re-check has no branch to pass over");
+            return;
+        }
+        let Some(repo) = self.repo.as_ref().map(|r| r.path.clone()) else { return };
+        let base = gitio::base_from_label(&plan.base_ref);
+        let diff = match gitio::review_diff(&repo, &base, self.settings.context_lines) {
+            Ok(d) => d,
+            Err(e) => {
+                self.note("error", &format!("branch pass diff: {e}"));
+                return;
+            }
+        };
+        let prompt = findings::build_prompt(
+            &plan.ref_name,
+            &plan.base_ref,
+            plan.files.len(),
+            plan.total_units(),
+            &diff,
+        );
+        self.branch_seq += 1;
+        self.findings.clear();
+        self.branch_pass = self
+            .settings
+            .models
+            .iter()
+            .map(|m| if m.enabled { BranchPassState::Pending } else { BranchPassState::Idle })
+            .collect();
+        let cli_home = self.cli_home(&repo);
+        // The whole branch takes longer to weigh than one unit.
+        let timeout = self.settings.model_timeout_secs.saturating_mul(2);
+        let mut launched = 0;
+        for (idx, slot) in self.settings.enabled_models() {
+            // One-shot: no follow-ups, so a `{session}` slot just gets a
+            // fresh id, exactly as the evaluation replay does.
+            let command = slot.command.replace("{session}", &uuid::Uuid::new_v4().to_string());
+            let tx = self.tx.clone();
+            findings::spawn_pass(
+                self.branch_seq,
+                idx,
+                slot,
+                command,
+                prompt.clone(),
+                repo.clone(),
+                cli_home.clone(),
+                timeout,
+                move |m| {
+                    let _ = tx.send(Msg::Branch(m));
+                },
+                ctx.clone(),
+            );
+            launched += 1;
+        }
+        if launched == 0 {
+            self.branch_pass.clear();
+            self.note("branch", "no models enabled — nothing to run the branch pass with");
+            return;
+        }
+        self.note("branch", &format!("branch pass started — {launched} model(s) reading the branch"));
+    }
+
+    pub fn branch_pass_running(&self) -> bool {
+        self.branch_pass.iter().any(|s| matches!(s, BranchPassState::Pending))
+    }
+
+    fn handle_branch(&mut self, m: BranchMsg) {
+        if m.seq != self.branch_seq {
+            self.db.log("stale", &format!("discarded late branch pass from {}", m.model));
+            return;
+        }
+        let session_id = self.plan.as_ref().map(|p| p.session_id).unwrap_or(0);
+        match m.result {
+            Ok(list) => {
+                let n = list.len();
+                for f in list {
+                    let files_json =
+                        serde_json::to_string(&f.files).unwrap_or_else(|_| "[]".into());
+                    let evidence_json = if f.evidence.is_empty() {
+                        None
+                    } else {
+                        serde_json::to_string(&f.evidence).ok()
+                    };
+                    let id = self.db.log_finding(
+                        session_id,
+                        &m.model,
+                        f.severity.trim(),
+                        &f.title,
+                        &f.detail,
+                        &files_json,
+                        evidence_json.as_deref(),
+                    );
+                    self.findings.push(FindingRow {
+                        id,
+                        model: m.model.clone(),
+                        finding: f,
+                        dismissed: false,
+                    });
+                }
+                // High first; equal severities keep arrival order via the id.
+                self.findings.sort_by_key(|r| (r.finding.severity_rank(), r.id));
+                if let Some(s) = self.branch_pass.get_mut(m.slot_idx) {
+                    *s = BranchPassState::Done { n, latency_ms: m.latency_ms };
+                }
+                self.note("branch", &format!("{} reported {n} finding(s) ({} ms)", m.model, m.latency_ms));
+            }
+            Err(e) => {
+                if let Some(s) = self.branch_pass.get_mut(m.slot_idx) {
+                    *s = BranchPassState::Failed(e.clone());
+                }
+                self.note("branch", &format!("{} branch pass failed: {}", m.model, truncate(&e, 120)));
+            }
+        }
+    }
+
+    /// Human triage: a dismissed finding stays on the record, marked as such.
+    pub fn dismiss_finding(&mut self, id: i64) {
+        let mut title = None;
+        if let Some(row) = self.findings.iter_mut().find(|r| r.id == id) {
+            row.dismissed = true;
+            title = Some(truncate(&row.finding.title, 60));
+        }
+        if let Some(title) = title {
+            self.db.set_finding_status(id, "dismissed");
+            self.note("branch", &format!("dismissed: {title}"));
+        }
+    }
+
+    /// The open findings as markdown, for handing to a PR description or an
+    /// issue tracker.
+    pub fn findings_markdown(&self) -> String {
+        let mut out = String::new();
+        for row in self.findings.iter().filter(|r| !r.dismissed) {
+            let f = &row.finding;
+            out.push_str(&format!(
+                "- **[{}]** {} _({})_\n  {}\n",
+                if f.severity.trim().is_empty() { "?" } else { f.severity.trim() },
+                f.title.trim(),
+                row.model,
+                f.detail.trim().replace('\n', "\n  ")
+            ));
+            if !f.files.is_empty() {
+                out.push_str(&format!("  files: {}\n", f.files.join(", ")));
+            }
+        }
+        out
+    }
+
     // -- async pump ----------------------------------------------------------
 
     fn pump_messages(&mut self) {
@@ -918,6 +1112,7 @@ impl CraApp {
                     }
                 }
                 Msg::Cand(c) => self.handle_candidate(c),
+                Msg::Branch(m) => self.handle_branch(m),
             }
         }
     }
@@ -1039,6 +1234,7 @@ impl eframe::App for CraApp {
             .iter()
             .any(|c| matches!(c, CandidateState::Pending))
             || self.prs_loading
+            || self.branch_pass_running()
         {
             ctx.request_repaint_after(std::time::Duration::from_millis(150));
         }
@@ -1147,7 +1343,7 @@ mod state_tests {
                 .map(|(path, units)| ReviewFile {
                     path,
                     units: units.into_iter().map(ReviewUnit::Comment).collect(),
-                    line_offset: 0,
+                    edits: Vec::new(),
                     decided: 0,
                 })
                 .collect();
@@ -1362,7 +1558,7 @@ mod state_tests {
         h.app.choose_candidate(0);
         h.app.save_and_continue(&egui::Context::default(), false);
         assert!(h.app.review_error.is_none(), "{:?}", h.app.review_error);
-        assert_eq!(h.app.plan.as_ref().unwrap().files[0].line_offset, 1);
+        assert_eq!(h.app.plan.as_ref().unwrap().files[0].edits, vec![(2, 1)]);
 
         // The second edit has to land on the shifted lines, not the original.
         h.settle();
@@ -1682,7 +1878,7 @@ mod state_tests {
         assert_eq!(extracted.len(), 1, "expected one reviewable file");
         let files = extracted
             .into_iter()
-            .map(|(path, units)| ReviewFile { path, units, line_offset: 0, decided: 0 })
+            .map(|(path, units)| ReviewFile { path, units, edits: Vec::new(), decided: 0 })
             .collect();
         app.repo = Some(RepoCtx {
             path: repo.path(),
@@ -1853,6 +2049,154 @@ mod state_tests {
         h.app.save_and_continue(&egui::Context::default(), false);
         assert!(h.app.review_error.is_none(), "{:?}", h.app.review_error);
         assert!(h.repo.read("src/lib.rs").contains("count = 5"));
+    }
+
+    // -- triage order and out-of-order edits --------------------------------
+
+    /// The riskiest-first walk visits a late-in-file unit before an earlier
+    /// one; both edits still have to land exactly where they belong.
+    #[test]
+    fn triage_walks_risky_code_first_and_edits_still_land_correctly() {
+        let dir = TempDir::new("triage");
+        let db = Db::open_at(&dir.path().join("cra.db")).expect("open test db");
+        let mut app = CraApp::with_db(db);
+        app.settings.models.clear();
+        assert!(app.settings.triage_order, "riskiest-first is the default");
+
+        let repo = TempRepo::new("triage");
+        repo.write("src/lib.rs", "fn safe() {\n}\n\nfn danger() {\n}\n");
+        repo.commit("base");
+        repo.git(&["checkout", "-b", "feature"]);
+        repo.write(
+            "src/lib.rs",
+            "fn safe() {\n    // gentle note\n}\n\nfn danger() {\n    unsafe { launch(); }\n}\n",
+        );
+        repo.commit("both fns");
+        app.repo = Some(RepoCtx {
+            path: repo.path(),
+            name: "test-repo".into(),
+            default_branch: "main".into(),
+        });
+
+        // Through the same entry point the ref picker uses, so the triage
+        // ordering in build_plan is what gets exercised.
+        app.select_branch("feature");
+        let ctx = egui::Context::default();
+        app.start_review(&ctx, 0);
+
+        // The unsafe code unit (line 6) outranks the comment (line 2).
+        let first = app.current_unit().expect("a unit");
+        assert!(first.is_code(), "risky code should lead the walk");
+        assert_eq!(first.start_line(), 6);
+        assert!(crate::triage::assess(&first).score > 30);
+
+        // Grow the code unit by a line, then edit the comment above it.
+        app.editor = "    unsafe { launch(); }\n    log();".into();
+        app.save_and_continue(&ctx, false);
+        assert!(app.review_error.is_none(), "{:?}", app.review_error);
+
+        let second = app.current_unit().expect("the comment unit");
+        assert!(!second.is_code());
+        assert_eq!(second.start_line(), 2);
+        app.editor = "// tightened".into();
+        app.save_and_continue(&ctx, false);
+        assert!(app.review_error.is_none(), "{:?}", app.review_error);
+
+        // Both edits landed despite the walk running bottom-up.
+        assert_eq!(
+            repo.read("src/lib.rs"),
+            "fn safe() {\n    // tightened\n}\n\nfn danger() {\n    unsafe { launch(); }\n    log();\n}\n"
+        );
+    }
+
+    // -- branch pass ---------------------------------------------------------
+
+    fn settle_branch(h: &mut Harness) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while h.app.branch_pass_running() {
+            h.app.pump_messages();
+            assert!(std::time::Instant::now() < deadline, "branch pass never came back");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        h.app.pump_messages();
+    }
+
+    #[test]
+    fn the_branch_pass_records_findings_for_human_triage() {
+        let dir = TempDir::new("branchpass");
+        let reply = "{\"findings\":[\
+{\"title\":\"minor duplication\",\"severity\":\"low\",\"detail\":\"copyable\",\"files\":[]},\
+{\"title\":\"rename half applied\",\"severity\":\"high\",\
+\"detail\":\"old name still read in lib.rs\",\"files\":[\"src/lib.rs\"],\
+\"evidence\":[{\"file\":\"src/lib.rs\",\"lines\":\"1-4\",\"note\":\"checked callers\"}]}]}";
+        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply, ..Default::default() });
+        let mut h = code_harness("branchpass");
+        h.app.settings.models = vec![cli.slot("")];
+
+        h.app.start_branch_pass(&egui::Context::default());
+        assert!(h.app.branch_pass_running());
+        settle_branch(&mut h);
+
+        // The pass ran in the repository, with the branch's diff in the prompt.
+        let seen = std::fs::canonicalize(cli.cwd_seen()).expect("cwd");
+        assert_eq!(seen, std::fs::canonicalize(h.repo.path()).unwrap());
+        let sent = cli.stdin_seen();
+        assert!(sent.contains("cross-cutting"), "{sent}");
+        assert!(sent.contains("let count = 1;"), "the diff must travel: {sent}");
+
+        assert!(matches!(h.app.branch_pass[0], BranchPassState::Done { n: 2, .. }));
+        assert_eq!(h.app.findings.len(), 2);
+        // Sorted for triage: high first, whatever order the model used.
+        assert_eq!(h.app.findings[0].finding.title, "rename half applied");
+        assert_eq!(h.app.findings[0].finding.evidence.len(), 1);
+
+        // Dismissal is written through to the record, and the markdown export
+        // carries only what is still open.
+        let (keep_id, drop_id) = (h.app.findings[0].id, h.app.findings[1].id);
+        h.app.dismiss_finding(drop_id);
+        assert_eq!(h.app.db.finding_status(drop_id).as_deref(), Some("dismissed"));
+        assert_eq!(h.app.db.finding_status(keep_id).as_deref(), Some("open"));
+        let md = h.app.findings_markdown();
+        assert!(md.contains("rename half applied"), "{md}");
+        assert!(!md.contains("minor duplication"), "{md}");
+    }
+
+    #[test]
+    fn a_stale_branch_reply_from_an_abandoned_plan_is_discarded() {
+        let mut h = code_harness("stalebranch");
+        h.app.branch_seq = 5;
+        h.app.branch_pass = vec![BranchPassState::Pending];
+        h.app.handle_branch(BranchMsg {
+            seq: 4,
+            slot_idx: 0,
+            model: "fake".into(),
+            result: Ok(vec![Finding {
+                title: "ghost".into(),
+                detail: String::new(),
+                severity: "high".into(),
+                files: Vec::new(),
+                evidence: Vec::new(),
+            }]),
+            latency_ms: 1,
+        });
+        assert!(h.app.findings.is_empty(), "a stale pass must not land findings");
+        assert!(h.app.branch_pass_running(), "and must not settle the new pass's slot");
+    }
+
+    #[test]
+    fn a_recheck_has_no_branch_pass() {
+        let dir = TempDir::new("norecheck");
+        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let mut h = Harness::new("norecheck");
+        h.enter_with(vec![cli.slot("")]);
+        h.settle();
+        h.app.choose_candidate(0);
+        h.app.save_and_continue(&egui::Context::default(), false);
+        h.app.settings.models.clear();
+        h.app.start_recheck(&egui::Context::default(), 10);
+
+        h.app.start_branch_pass(&egui::Context::default());
+        assert!(h.app.branch_pass.is_empty(), "nothing should launch for a re-check");
     }
 
     #[test]

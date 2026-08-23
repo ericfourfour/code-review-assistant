@@ -145,6 +145,21 @@ impl Db {
              );",
         )
         .map_err(|e| e.to_string())?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS findings(
+                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                 ts         TEXT NOT NULL,
+                 session_id INTEGER,
+                 model      TEXT NOT NULL,
+                 severity   TEXT NOT NULL,
+                 title      TEXT NOT NULL,
+                 detail     TEXT NOT NULL,
+                 files      TEXT NOT NULL,
+                 evidence   TEXT,
+                 status     TEXT NOT NULL DEFAULT 'open'
+             );",
+        )
+        .map_err(|e| e.to_string())?;
         // Added after the first release; existing databases get them here so a
         // review history recorded before evaluation existed stays usable.
         add_column(&conn, "decisions", "unit_json", "TEXT");
@@ -314,6 +329,42 @@ impl Db {
         }
         grouped.retain(|(_, actions)| actions.len() > 1);
         grouped
+    }
+
+    /// Record one branch-pass finding; returns its row id so a later human
+    /// dismissal can be written back.
+    #[allow(clippy::too_many_arguments)]
+    pub fn log_finding(
+        &self,
+        session_id: i64,
+        model: &str,
+        severity: &str,
+        title: &str,
+        detail: &str,
+        files_json: &str,
+        evidence_json: Option<&str>,
+    ) -> i64 {
+        let _ = self.conn.execute(
+            "INSERT INTO findings(ts, session_id, model, severity, title, detail, files, evidence)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![now(), session_id, model, severity, title, detail, files_json, evidence_json],
+        );
+        self.conn.last_insert_rowid()
+    }
+
+    /// Human triage of a finding: 'open' or 'dismissed'.
+    pub fn set_finding_status(&self, id: i64, status: &str) {
+        let _ = self.conn.execute(
+            "UPDATE findings SET status = ?1 WHERE id = ?2",
+            params![status, id],
+        );
+    }
+
+    #[cfg(test)]
+    pub fn finding_status(&self, id: i64) -> Option<String> {
+        self.conn
+            .query_row("SELECT status FROM findings WHERE id = ?1", params![id], |r| r.get(0))
+            .ok()
     }
 
     pub fn decision_counts(&self, session_id: i64) -> (i64, i64) {

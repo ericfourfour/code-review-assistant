@@ -32,9 +32,22 @@ impl RefKind {
 pub struct ReviewFile {
     pub path: String,
     pub units: Vec<ReviewUnit>,
-    /// Line-number shift accumulated by earlier edits in this file.
-    pub line_offset: i64,
+    /// Every edit applied to this file so far, as (original start line,
+    /// line-count delta). Kept per edit rather than as one running total so
+    /// the walk may visit units in any order — riskiest first included — and
+    /// still land each edit exactly where it belongs: only edits *above* a
+    /// unit shift it.
+    pub edits: Vec<(u32, i64)>,
     pub decided: usize,
+}
+
+impl ReviewFile {
+    /// How far the given (original) line has drifted on disk: the sum of the
+    /// deltas of every applied edit that started above it. Units are
+    /// disjoint, so comparing original start lines is exact.
+    pub fn offset_for(&self, start_line: u32) -> i64 {
+        self.edits.iter().filter(|(at, _)| *at < start_line).map(|(_, d)| d).sum()
+    }
 }
 
 pub struct ReviewPlan {
@@ -208,7 +221,8 @@ pub fn apply_edit(
     unit: &ReviewUnit,
     new_lines: &[String],
 ) -> Result<i64, String> {
-    let start = (unit.start_line() as i64 - 1 + file.line_offset).max(0) as usize;
+    let offset = file.offset_for(unit.start_line());
+    let start = (unit.start_line() as i64 - 1 + offset).max(0) as usize;
     splice_lines(repo, unit.file(), start, unit.raw_lines(), new_lines)
 }
 
@@ -605,7 +619,7 @@ mod tests {
             "fn main() {\n    // a\n    // b\n    x();\n}\n",
         )
         .unwrap();
-        let file = ReviewFile { path: "src/lib.rs".into(), units: vec![], line_offset: 0, decided: 0 };
+        let file = ReviewFile { path: "src/lib.rs".into(), units: vec![], edits: Vec::new(), decided: 0 };
         let wrapped = ReviewUnit::Comment(unit());
         let delta = apply_edit(
             dir.to_str().unwrap(),
@@ -621,6 +635,18 @@ mod tests {
         let err = apply_edit(dir.to_str().unwrap(), &file, &wrapped, &[]).unwrap_err();
         assert!(err.contains("mismatch") || err.contains("out of bounds"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn offsets_only_count_edits_above_the_unit() {
+        let mut f = ReviewFile { path: "a".into(), units: vec![], edits: Vec::new(), decided: 0 };
+        f.edits.push((50, 3));
+        assert_eq!(f.offset_for(10), 0, "an edit below must not shift a unit above it");
+        assert_eq!(f.offset_for(60), 3);
+        f.edits.push((5, -2));
+        assert_eq!(f.offset_for(10), -2);
+        assert_eq!(f.offset_for(60), 1, "deltas above accumulate");
+        assert_eq!(f.offset_for(5), 0, "an edit at the unit's own line is that unit's own");
     }
 
     #[test]

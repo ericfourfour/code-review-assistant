@@ -41,18 +41,20 @@ impl CraApp {
         ui.add_space(4.0);
 
         if let Some(plan) = &self.plan {
-            let rows: Vec<(String, usize, usize, usize)> = plan
+            let rows: Vec<(String, usize, usize, u32, usize)> = plan
                 .files
                 .iter()
                 .map(|f| {
                     let code = f.units.iter().filter(|u| u.is_code()).count();
-                    (f.path.clone(), f.units.len() - code, code, f.decided)
+                    let risk =
+                        f.units.iter().map(|u| crate::triage::assess(u).score).max().unwrap_or(0);
+                    (f.path.clone(), f.units.len() - code, code, risk, f.decided)
                 })
                 .collect();
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                for (i, (path, comments, code, decided)) in rows.iter().enumerate() {
+                for (i, (path, comments, code, risk, decided)) in rows.iter().enumerate() {
                     let text = format!(
-                        "{path:<70} {comments:>3} comments {code:>3} code  ({decided} decided)"
+                        "{path:<70} {comments:>3} comments {code:>3} code  risk {risk:>3}  ({decided} decided)"
                     );
                     let resp =
                         ui.selectable_label(i == self.file_sel, RichText::new(text).monospace());

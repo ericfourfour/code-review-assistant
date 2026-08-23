@@ -152,6 +152,10 @@ pub struct Settings {
     /// edit rarely breaks a build, and checks are slow.
     #[serde(default)]
     pub validate_comment_edits: bool,
+    /// Walk the plan riskiest-unit-first (local heuristic score) instead of
+    /// diff order, so attention lands on the changes most likely to need it.
+    #[serde(default = "default_true")]
+    pub triage_order: bool,
     /// Bumped when a migration step must run exactly once. Absent (0) in rows
     /// written before this field existed.
     #[serde(default)]
@@ -223,6 +227,7 @@ impl Default for Settings {
             check_command: String::new(),
             check_timeout_secs: default_check_timeout(),
             validate_comment_edits: false,
+            triage_order: true,
             schema_version: SCHEMA_VERSION,
         }
     }

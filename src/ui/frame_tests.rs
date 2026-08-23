@@ -165,7 +165,7 @@ fn review_hotkeys_reach_their_handlers() {
         .map(|(path, units)| crate::review::ReviewFile {
             path,
             units: units.into_iter().map(crate::units::ReviewUnit::Comment).collect(),
-            line_offset: 0,
+            edits: Vec::new(),
             decided: 0,
         })
         .collect();
