@@ -29,6 +29,12 @@ pub const MAX_SCOPE_LINES: usize = 240;
 /// verdicts.
 const CLUSTER_GAP: u32 = 10;
 
+/// An editable region longer than this is split into windows — a brand-new
+/// thousand-line file is not one reviewable thought (dogfooding produced a
+/// single 993-line unit before this existed). Splits prefer blank lines so
+/// the windows follow the file's own paragraphing.
+const MAX_REGION_LINES: u32 = 120;
+
 /// How many lines a multi-line signature / attribute stack may extend a
 /// scope's start upward.
 const MAX_SIGNATURE_LINES: usize = 12;
@@ -155,7 +161,11 @@ fn units_in_file(repo: &str, f: &DiffFile, context_lines: usize) -> Vec<CodeUnit
             continue;
         }
 
-        for (rs, re) in clusters(&positions, CLUSTER_GAP) {
+        let windows: Vec<(u32, u32)> = clusters(&positions, CLUSTER_GAP)
+            .into_iter()
+            .flat_map(|c| split_region(c, &new_text))
+            .collect();
+        for (rs, re) in windows {
             let raw_lines: Vec<String> = match (rs..=re).map(|no| new_text.get(&no).cloned()).collect() {
                 Some(lines) => lines,
                 None => continue, // hole in the diff — should not happen
@@ -240,6 +250,25 @@ fn removed_is_code(spec: Option<&LangSpec>, text: &str) -> bool {
         }
     }
     true
+}
+
+/// Chop an oversized region into consecutive windows of at most
+/// [`MAX_REGION_LINES`], cutting at a blank line in the back half of each
+/// window when one exists.
+fn split_region(region: (u32, u32), new_text: &BTreeMap<u32, String>) -> Vec<(u32, u32)> {
+    let (mut start, end) = region;
+    let mut out = Vec::new();
+    while end - start + 1 > MAX_REGION_LINES {
+        let hard = start + MAX_REGION_LINES - 1;
+        let cut = (start + MAX_REGION_LINES / 2..=hard)
+            .rev()
+            .find(|no| new_text.get(no).is_some_and(|t| t.trim().is_empty()))
+            .unwrap_or(hard);
+        out.push((start, cut));
+        start = cut + 1;
+    }
+    out.push((start, end));
+    out
 }
 
 fn clusters(positions: &BTreeSet<u32>, gap: u32) -> Vec<(u32, u32)> {
@@ -862,6 +891,45 @@ diff --git a/src/main.rs b/src/main.rs
         assert_eq!(units.len(), 2, "a {CLUSTER_GAP}-line gap should split");
         assert_eq!((units[0].start_line, units[0].end_line), (3, 3));
         assert_eq!((units[1].start_line, units[1].end_line), (25, 25));
+    }
+
+    #[test]
+    fn a_huge_new_file_splits_into_windows_at_blank_lines() {
+        let dir = TempDir::new("windows");
+        // A brand-new 300-line file: blocks of 9 lines separated by blanks.
+        let mut body = String::new();
+        for i in 0..300 {
+            if i % 10 == 9 {
+                body.push('\n');
+            } else {
+                body.push_str(&format!("line{i}();\n"));
+            }
+        }
+        write(&dir, "big.js", &body);
+        let mut diff = String::from("diff --git a/big.js b/big.js\n--- a/big.js\n+++ b/big.js\n@@ -0,0 +1,300 @@\n");
+        for line in body.lines() {
+            diff.push_str(&format!("+{line}\n"));
+        }
+        let out = extract_one(&dir.path().to_string_lossy(), &diff);
+        let units = &out[0].1;
+        assert!(units.len() >= 3, "300 added lines should not be one unit: {}", units.len());
+        for (i, u) in units.iter().enumerate() {
+            let len = u.end_line - u.start_line + 1;
+            assert!(len <= MAX_REGION_LINES, "window {i} is {len} lines");
+            assert!(!u.changed_lines.is_empty(), "window {i} reviews nothing");
+            if i > 0 {
+                assert_eq!(u.start_line, units[i - 1].end_line + 1, "windows must stay consecutive");
+            }
+            if i < units.len() - 1 {
+                assert!(
+                    u.raw_lines.last().is_some_and(|l| l.trim().is_empty()),
+                    "window {i} should cut at a blank line: {:?}",
+                    u.raw_lines.last()
+                );
+            }
+        }
+        assert_eq!(units.first().unwrap().start_line, 1);
+        assert_eq!(units.last().unwrap().end_line, 299, "the last content line ends the last window");
     }
 
     #[test]

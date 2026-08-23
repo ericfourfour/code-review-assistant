@@ -178,6 +178,10 @@ pub fn side_panel(app: &mut CraApp, ctx: &egui::Context) {
                 // the palette even with the name itself hidden.
                 let hidden = app.names_hidden();
                 let order = app.candidate_order();
+                let kind = app
+                    .current_unit()
+                    .map(|u| u.kind())
+                    .unwrap_or(crate::units::UnitKind::Comment);
                 for (i, slot) in app.settings.models.iter().enumerate() {
                     let pos = order.iter().position(|&s| s == i).unwrap_or(i);
                     ui.horizontal(|ui| {
@@ -198,7 +202,11 @@ pub fn side_panel(app: &mut CraApp, ctx: &egui::Context) {
                                 ui.label(theme::dim(&format!("answered · {} ms", s.latency_ms)));
                             }
                             Some(CandidateState::Ready(s)) => {
-                                theme::badge(ui, s.action.label(), theme::action_color(s.action));
+                                theme::badge(
+                                    ui,
+                                    crate::units::action_label(s.action, kind),
+                                    theme::action_color(s.action),
+                                );
                                 ui.label(theme::dim(&format!("{} ms", s.latency_ms)));
                             }
                             Some(CandidateState::Failed(_)) => {

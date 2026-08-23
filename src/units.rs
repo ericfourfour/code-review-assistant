@@ -6,6 +6,19 @@ use serde::{Deserialize, Serialize};
 use crate::codeunits::CodeUnit;
 use crate::comments::CommentUnit;
 use crate::diffparse::DiffFile;
+use crate::models::Action;
+
+/// UI label for a verdict, phrased for what was reviewed: a code unit's Keep
+/// is an "approve" and its Rewrite a "revise" — the words the code prompt
+/// itself uses. Found by this app's own branch pass: the badges said KEEP
+/// next to previews saying "approve — sound as written".
+pub fn action_label(action: Action, kind: UnitKind) -> &'static str {
+    match (kind, action) {
+        (UnitKind::Code, Action::Keep) => "APPROVE",
+        (UnitKind::Code, Action::Rewrite) => "REVISE",
+        _ => action.label(),
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum UnitKind {
@@ -256,6 +269,16 @@ diff --git a/src/main.rs b/src/main.rs
         let code_only = assemble(&dir.path().to_string_lossy(), &files, 12, false, true);
         assert!(code_only[0].1.iter().all(|u| u.is_code()));
         assert_eq!(code_only[0].1.len(), 1);
+    }
+
+    #[test]
+    fn verdict_labels_speak_the_unit_kind() {
+        assert_eq!(action_label(Action::Keep, UnitKind::Code), "APPROVE");
+        assert_eq!(action_label(Action::Rewrite, UnitKind::Code), "REVISE");
+        assert_eq!(action_label(Action::Delete, UnitKind::Code), "DELETE");
+        assert_eq!(action_label(Action::Flag, UnitKind::Code), "FLAG");
+        assert_eq!(action_label(Action::Keep, UnitKind::Comment), "KEEP");
+        assert_eq!(action_label(Action::Rewrite, UnitKind::Comment), "REWRITE");
     }
 
     #[test]

@@ -77,7 +77,10 @@ would stall plan building and add a failure mode to the one step that must alway
 score (0–100) adds up inspectable signals: code outranks comments, size, removed lines, a
 missing enclosing scope, and vocabulary buckets for the things that go wrong (secrets and
 auth, locks and threads, `unsafe`/`unwrap`/`panic!`, subprocesses and SQL, `TODO`/`FIXME`
-markers); test files are halved. The review screen shows each unit's score with the reasons
+markers); test files are halved and documentation files cut to a third — prose *about* locks
+and secrets is not the same risk as code that takes them (dogfooding this tool on its own
+branch put the README at risk 100 before that rule existed). The review screen shows each
+unit's score with the reasons
 on hover, and the file picker shows each file's peak risk. It orders attention — the models
 still judge every unit on its merits when it is reached, and per-edit line offsets are
 tracked individually so an out-of-order walk edits exactly as safely as a linear one.
@@ -242,7 +245,9 @@ scope detection, provenance, edit application and revert, validation, model-outp
   SQL, HTML/XML, and more — see `src/comments.rs`).
 - Code units cover every changed cluster of code, including pure removals (anchored to the
   line the removal followed, with the removed lines shown in context). Files with unknown
-  extensions still get hunk units — a `.conf` change is still a change.
+  extensions still get hunk units — a `.conf` change is still a change. A cluster longer
+  than ~120 lines (a brand-new large file, typically) is split into consecutive windows at
+  blank lines, so no single unit is an unreviewable wall.
 - A cross-cutting concern that spans units is what **flag** is for: the concern is recorded
   and attributed even though no line in the unit moves.
 - Edits apply to the working tree of the checked-out branch; the app verifies the on-disk
