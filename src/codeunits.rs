@@ -31,8 +31,8 @@ const CLUSTER_GAP: u32 = 10;
 
 /// An editable region longer than this is split into windows — a brand-new
 /// thousand-line file is not one reviewable thought (dogfooding produced a
-/// single 993-line unit before this existed). Splits prefer blank lines so
-/// the windows follow the file's own paragraphing.
+/// single 993-line unit before this existed). Splits cut at definition tops
+/// where the language is parsable, blank lines otherwise.
 const MAX_REGION_LINES: u32 = 120;
 
 /// How many lines a multi-line signature / attribute stack may extend a
@@ -163,7 +163,7 @@ fn units_in_file(repo: &str, f: &DiffFile, context_lines: usize) -> Vec<CodeUnit
 
         let windows: Vec<(u32, u32)> = clusters(&positions, CLUSTER_GAP)
             .into_iter()
-            .flat_map(|c| split_region(c, &new_text))
+            .flat_map(|c| split_region(c, &new_text, disk.as_deref(), spec.as_ref(), &lang))
             .collect();
         for (rs, re) in windows {
             let raw_lines: Vec<String> = match (rs..=re).map(|no| new_text.get(&no).cloned()).collect() {
@@ -253,21 +253,255 @@ fn removed_is_code(spec: Option<&LangSpec>, text: &str) -> bool {
 }
 
 /// Chop an oversized region into consecutive windows of at most
-/// [`MAX_REGION_LINES`], cutting at a blank line in the back half of each
-/// window when one exists.
-fn split_region(region: (u32, u32), new_text: &BTreeMap<u32, String>) -> Vec<(u32, u32)> {
+/// [`MAX_REGION_LINES`]. Semantic boundaries come first: when the language is
+/// parsable and the checkout matches the diff, windows cut at the tops of the
+/// definitions the region spans, descending into oversized containers (an
+/// `impl` block splits at its methods, a class at its defs). Blank lines are
+/// the fallback — inside a definition that is itself too long, and in files
+/// the scope heuristics cannot read.
+fn split_region(
+    region: (u32, u32),
+    new_text: &BTreeMap<u32, String>,
+    disk: Option<&[String]>,
+    spec: Option<&LangSpec>,
+    lang: &str,
+) -> Vec<(u32, u32)> {
+    let (s, e) = region;
+    if e - s < MAX_REGION_LINES {
+        return vec![region];
+    }
+    if let Some(disk) = disk {
+        let matches = (s..=e).all(|no| {
+            disk.get(no as usize - 1).map(|x| x.as_str()) == new_text.get(&no).map(|x| x.as_str())
+        });
+        if matches {
+            if let Some(windows) = semantic_split(disk, spec, lang, region) {
+                return windows;
+            }
+        }
+    }
+    blank_split(region, &|no| new_text.get(&no).is_some_and(|t| t.trim().is_empty()))
+}
+
+/// Cut the region into definition and gap segments, blank-split any segment
+/// still over the cap, then pack consecutive segments greedily back up to it.
+/// A cut can therefore only land at a definition top, at a blank line inside
+/// an oversized definition, or at a blank line in unparsed territory — never
+/// mid-function when the parse succeeded.
+fn semantic_split(
+    disk: &[String],
+    spec: Option<&LangSpec>,
+    lang: &str,
+    region: (u32, u32),
+) -> Option<Vec<(u32, u32)>> {
+    let (s, e) = region;
+    let items = semantic_spans(disk, spec, lang, s as usize - 1, e as usize - 1);
+    let mut segs: Vec<(u32, u32)> = Vec::new();
+    let mut cursor = s;
+    for (a0, b0) in items {
+        let (a, b) = ((a0 as u32 + 1).max(cursor), (b0 as u32 + 1).min(e));
+        if a > b || a > e {
+            continue;
+        }
+        if a > cursor {
+            segs.push((cursor, a - 1));
+        }
+        segs.push((a, b));
+        cursor = b + 1;
+        if cursor > e {
+            break;
+        }
+    }
+    if cursor <= e {
+        segs.push((cursor, e));
+    }
+    if segs.len() <= 1 {
+        return None; // no boundaries worth cutting at
+    }
+    let is_blank = |no: u32| disk.get(no as usize - 1).is_some_and(|t| t.trim().is_empty());
+    let mut pieces: Vec<(u32, u32)> = Vec::new();
+    for seg in segs {
+        pieces.extend(blank_split(seg, &is_blank));
+    }
+    let mut out: Vec<(u32, u32)> = Vec::new();
+    let mut cur: Option<(u32, u32)> = None;
+    for (a, b) in pieces {
+        cur = match cur {
+            None => Some((a, b)),
+            Some((cs, _)) if b - cs < MAX_REGION_LINES => Some((cs, b)),
+            Some(done) => {
+                out.push(done);
+                Some((a, b))
+            }
+        };
+    }
+    out.extend(cur);
+    Some(out)
+}
+
+/// Blank-line splitting, the last resort: windows of at most the cap, each
+/// cut at a blank line in its back half when one exists.
+fn blank_split(region: (u32, u32), is_blank: &dyn Fn(u32) -> bool) -> Vec<(u32, u32)> {
     let (mut start, end) = region;
     let mut out = Vec::new();
     while end - start + 1 > MAX_REGION_LINES {
         let hard = start + MAX_REGION_LINES - 1;
         let cut = (start + MAX_REGION_LINES / 2..=hard)
             .rev()
-            .find(|no| new_text.get(no).is_some_and(|t| t.trim().is_empty()))
+            .find(|no| is_blank(*no))
             .unwrap_or(hard);
         out.push((start, cut));
         start = cut + 1;
     }
     out.push((start, end));
+    out
+}
+
+/// Definition spans intersecting [lo0, hi0] (0-based, inclusive), ordered.
+/// A span still longer than the window cap is replaced by its child
+/// definitions when at least two can be found.
+fn semantic_spans(
+    lines: &[String],
+    spec: Option<&LangSpec>,
+    lang: &str,
+    lo0: usize,
+    hi0: usize,
+) -> Vec<(usize, usize)> {
+    match lang {
+        "Python" => indent_spans(lines, lo0, hi0, 0),
+        "Rust" | "C/C++" | "JavaScript" | "TypeScript" | "JVM" | "Go" | "Swift" | "C#" | "PHP" => {
+            let stripped = strip_noncode(lines, spec);
+            let mut blocks: Vec<(usize, usize, usize)> = Vec::new();
+            let mut stack: Vec<usize> = Vec::new();
+            for (i, code) in stripped.iter().enumerate() {
+                for ch in code.chars() {
+                    match ch {
+                        '{' => stack.push(i),
+                        '}' => {
+                            if let Some(open) = stack.pop() {
+                                blocks.push((open, i, stack.len()));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            brace_spans(lines, &stripped, spec, &blocks, 0, lo0, hi0, 0)
+        }
+        _ => Vec::new(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn brace_spans(
+    lines: &[String],
+    stripped: &[String],
+    spec: Option<&LangSpec>,
+    blocks: &[(usize, usize, usize)],
+    depth: usize,
+    lo0: usize,
+    hi0: usize,
+    nesting: usize,
+) -> Vec<(usize, usize)> {
+    let mut spans: Vec<(usize, usize)> = blocks
+        .iter()
+        .filter(|(open, close, d)| *d == depth && *close >= lo0 && *open <= hi0)
+        .map(|&(open, close, _)| (open, close))
+        .collect();
+    spans.sort_unstable();
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    for (open, close) in spans {
+        // A `{` on its own line belongs to the signature above it.
+        let mut header_line = open;
+        while header_line > 0 && stripped[header_line].trim_start().starts_with('{') {
+            header_line -= 1;
+            if !lines[header_line].trim().is_empty() {
+                break;
+            }
+        }
+        let start = extend_signature(lines, spec, header_line);
+        let label_line = (start..=header_line)
+            .find(|&i| {
+                let t = lines[i].trim();
+                !t.is_empty() && !is_attached_line(t, spec)
+            })
+            .unwrap_or(header_line);
+        // Top-level blocks are items by position (C functions have no
+        // keyword); nested ones must read like definitions, or every `if`
+        // inside a function would become a boundary.
+        if depth > 0 && !is_definition_header(lines[label_line].trim()) {
+            continue;
+        }
+        if close - start + 1 > MAX_REGION_LINES as usize && nesting < 2 && close > open + 1 {
+            let children = brace_spans(
+                lines,
+                stripped,
+                spec,
+                blocks,
+                depth + 1,
+                open + 1,
+                close - 1,
+                nesting + 1,
+            );
+            if children.len() >= 2 {
+                out.extend(children);
+                continue;
+            }
+        }
+        out.push((start, close));
+    }
+    out
+}
+
+/// Indent-scoped languages: defs at the shallowest indentation in range,
+/// decorators included, descending into an oversized class's own defs.
+fn indent_spans(lines: &[String], lo0: usize, hi0: usize, nesting: usize) -> Vec<(usize, usize)> {
+    let width = |s: &str| -> usize {
+        s.chars()
+            .take_while(|c| c.is_whitespace())
+            .map(|c| if c == '\t' { 8 } else { 1 })
+            .sum()
+    };
+    let is_def = |s: &str| {
+        let t = s.trim_start();
+        t.starts_with("def ") || t.starts_with("async def ") || t.starts_with("class ")
+    };
+    let hi0 = hi0.min(lines.len().saturating_sub(1));
+    if lo0 > hi0 {
+        return Vec::new();
+    }
+    let defs: Vec<usize> = (lo0..=hi0).filter(|&i| is_def(&lines[i])).collect();
+    let Some(min_w) = defs.iter().map(|&i| width(&lines[i])).min() else { return Vec::new() };
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    for &i in defs.iter().filter(|&&i| width(&lines[i]) == min_w) {
+        if out.last().is_some_and(|&(_, b)| i <= b) {
+            continue; // inside the previous span
+        }
+        let dw = width(&lines[i]);
+        let mut end = i;
+        for (j, line) in lines.iter().enumerate().skip(i + 1) {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if width(line) <= dw {
+                break;
+            }
+            end = j;
+        }
+        let mut start = i;
+        while start > 0 && i - start < MAX_SIGNATURE_LINES && lines[start - 1].trim().starts_with('@')
+        {
+            start -= 1;
+        }
+        if end - start + 1 > MAX_REGION_LINES as usize && nesting < 2 && end > i {
+            let children = indent_spans(lines, i + 1, end, nesting + 1);
+            if children.len() >= 2 {
+                out.extend(children);
+                continue;
+            }
+        }
+        out.push((start, end));
+    }
     out
 }
 
@@ -313,7 +547,12 @@ fn context_for(
             disk.get(no as usize - 1).map(|s| s.as_str()) == new_text.get(&no).map(|s| s.as_str())
         });
         if matches {
-            if let Some(scope) = scope_for(disk, spec, lang, rs as usize - 1) {
+            // Anchor in the middle of the region: its first line may be the
+            // doc comment or signature *above* the body, which no block
+            // encloses, while the midpoint of a definition-aligned window
+            // sits inside the definition itself.
+            let mid = (rs + re) / 2;
+            if let Some(scope) = scope_for(disk, spec, lang, mid as usize - 1) {
                 let start0 = scope.start0.min(rs as usize - 1);
                 let end0 = scope.end0.max(re as usize - 1).min(disk.len().saturating_sub(1));
                 if end0 - start0 < MAX_SCOPE_LINES {
@@ -893,8 +1132,114 @@ diff --git a/src/main.rs b/src/main.rs
         assert_eq!((units[1].start_line, units[1].end_line), (25, 25));
     }
 
+    /// Shared checks for any split: bounded, consecutive, each reviewing
+    /// something.
+    fn assert_windows(units: &[CodeUnit]) {
+        for (i, u) in units.iter().enumerate() {
+            let len = u.end_line - u.start_line + 1;
+            assert!(len <= MAX_REGION_LINES, "window {i} is {len} lines");
+            assert!(!u.changed_lines.is_empty(), "window {i} reviews nothing");
+            if i > 0 {
+                assert_eq!(u.start_line, units[i - 1].end_line + 1, "windows must stay consecutive");
+            }
+        }
+    }
+
+    fn added_file_diff(path: &str, body: &str) -> String {
+        let n = body.lines().count();
+        let mut diff =
+            format!("diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -0,0 +1,{n} @@\n");
+        for line in body.lines() {
+            diff.push_str(&format!("+{line}\n"));
+        }
+        diff
+    }
+
     #[test]
-    fn a_huge_new_file_splits_into_windows_at_blank_lines() {
+    fn a_huge_new_rust_file_splits_at_function_tops_not_blank_lines() {
+        let dir = TempDir::new("fnsplit");
+        // Ten top-level functions, each with a doc line, big enough that one
+        // window cannot hold them all.
+        let mut body = String::new();
+        for f in 0..10 {
+            body.push_str(&format!("/// Does thing {f}.\nfn f{f}() {{\n"));
+            for j in 0..21 {
+                body.push_str(&format!("    step{j}();\n"));
+            }
+            body.push_str("}\n\n");
+        }
+        write(&dir, "src/gen.rs", &body);
+        let out = extract_one(&dir.path().to_string_lossy(), &added_file_diff("src/gen.rs", &body));
+        let units = &out[0].1;
+        assert!(units.len() >= 2, "{} lines must split", body.lines().count());
+        assert_windows(units);
+        let lines: Vec<&str> = body.lines().collect();
+        for u in &units[1..] {
+            let first = lines[u.start_line as usize - 1].trim();
+            // Every cut lands at a definition top (doc line or fn header) —
+            // never mid-function, even though blank lines exist inside none
+            // and between all of them.
+            assert!(
+                first.starts_with("///") || first.starts_with("fn "),
+                "window starts mid-item: {first:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_oversized_impl_splits_at_its_methods() {
+        let dir = TempDir::new("implsplit");
+        let mut body = String::from("struct S;\n\nimpl S {\n");
+        for k in 0..8 {
+            body.push_str(&format!("    fn m{k}(&self) {{\n"));
+            for j in 0..20 {
+                body.push_str(&format!("        step{j}();\n"));
+            }
+            body.push_str("    }\n");
+            if k < 7 {
+                body.push('\n');
+            }
+        }
+        body.push_str("}\n");
+        write(&dir, "src/s.rs", &body);
+        let out = extract_one(&dir.path().to_string_lossy(), &added_file_diff("src/s.rs", &body));
+        let units = &out[0].1;
+        assert!(units.len() >= 2, "the impl is bigger than one window");
+        assert_windows(units);
+        let lines: Vec<&str> = body.lines().collect();
+        for u in &units[1..] {
+            let first = lines[u.start_line as usize - 1].trim();
+            // The impl itself is over the cap, so the split must descend to
+            // its methods rather than falling back to blank lines.
+            assert!(first.starts_with("fn m"), "window starts mid-method: {first:?}");
+        }
+    }
+
+    #[test]
+    fn an_oversized_python_module_splits_at_defs() {
+        let dir = TempDir::new("pysplit");
+        let mut body = String::from("import os\n\n");
+        for d in 0..2 {
+            body.push_str(&format!("def handler_{d}(request):\n"));
+            for j in 0..68 {
+                body.push_str(&format!("    step_{j}()\n"));
+            }
+            body.push('\n');
+        }
+        write(&dir, "svc.py", &body);
+        let out = extract_one(&dir.path().to_string_lossy(), &added_file_diff("svc.py", &body));
+        let units = &out[0].1;
+        assert!(units.len() >= 2);
+        assert_windows(units);
+        let lines: Vec<&str> = body.lines().collect();
+        for u in &units[1..] {
+            let first = lines[u.start_line as usize - 1].trim();
+            assert!(first.starts_with("def "), "window starts mid-def: {first:?}");
+        }
+    }
+
+    #[test]
+    fn an_unparsable_file_falls_back_to_blank_line_windows() {
         let dir = TempDir::new("windows");
         // A brand-new 300-line file: blocks of 9 lines separated by blanks.
         let mut body = String::new();
