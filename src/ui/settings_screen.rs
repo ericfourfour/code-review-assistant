@@ -235,6 +235,12 @@ than the other way round.",
                 ui.checkbox(&mut self.settings.review_code, "code");
             });
             ui.end_row();
+            ui.label(theme::dim("walk order"));
+            ui.checkbox(
+                &mut self.settings.triage_order,
+                "riskiest first (local heuristic; hover the risk badge for its reasons)",
+            );
+            ui.end_row();
         });
         ui.label(theme::dim(
             "Blind review also shuffles the candidates per comment. Every review is also a \

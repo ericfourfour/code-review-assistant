@@ -242,22 +242,32 @@ pub fn extract_session_id(output: &str, key: &str) -> Option<String> {
     json_documents(output).iter().find_map(|v| find_string_key(v, key))
 }
 
-/// Pull the verdict out of whatever the CLI printed. Asking a CLI for
+/// Pull a typed payload out of whatever the CLI printed. Asking a CLI for
 /// machine-readable output (needed to recover the session id) wraps the
-/// model's answer in the CLI's own envelope, so the verdict arrives as an
-/// escaped string inside it rather than as bare text.
-fn extract_verdict(output: &str) -> Option<RawSuggestion> {
-    if let Some(raw) = extract_json(output) {
-        return Some(raw);
+/// model's answer in the CLI's own envelope, so the payload arrives as an
+/// escaped string inside it rather than as bare text — first scan the output
+/// itself, then every string embedded in its JSON documents.
+pub(crate) fn extract_payload<T: serde::de::DeserializeOwned>(output: &str) -> Option<T> {
+    if let Some(v) = scan_json::<T>(output) {
+        return Some(v);
     }
     let mut strings = Vec::new();
     for doc in json_documents(output) {
         collect_strings(&doc, &mut strings);
     }
-    strings.iter().rev().find_map(|s| extract_json(s))
+    strings.iter().rev().find_map(|s| scan_json::<T>(s))
 }
 
+fn extract_verdict(output: &str) -> Option<RawSuggestion> {
+    extract_payload(output)
+}
+
+#[cfg(test)]
 fn extract_json(output: &str) -> Option<RawSuggestion> {
+    scan_json(output)
+}
+
+fn scan_json<T: serde::de::DeserializeOwned>(output: &str) -> Option<T> {
     // Model CLIs often wrap JSON in prose or code fences; scan for the first
     // balanced object that parses into the expected shape.
     let bytes = output.as_bytes();
@@ -283,7 +293,7 @@ fn extract_json(output: &str) -> Option<RawSuggestion> {
                 depth -= 1;
                 if depth == 0 {
                     if let Some(s) = start {
-                        if let Ok(raw) = serde_json::from_str::<RawSuggestion>(&output[s..=i]) {
+                        if let Ok(raw) = serde_json::from_str::<T>(&output[s..=i]) {
                             return Some(raw);
                         }
                     }
@@ -301,7 +311,7 @@ fn extract_json(output: &str) -> Option<RawSuggestion> {
 /// A CLI that refuses one of its own tools reports it in its envelope and
 /// still exits 0, so without this the slot shows a wall of JSON with the one
 /// line that explains it buried inside.
-fn cli_error(name: &str, stdout: &str, stderr: &str) -> String {
+pub(crate) fn cli_error(name: &str, stdout: &str, stderr: &str) -> String {
     for out in [stdout, stderr] {
         let reported = json_documents(out).iter().find_map(|v| find_string_key(v, "error"));
         if let Some(msg) = reported.filter(|m| !m.trim().is_empty()) {
@@ -355,8 +365,13 @@ fn run_model(
     (result, raw_output)
 }
 
+/// Run a model CLI to completion and collect what it printed: everything up
+/// to — but not including — parsing a verdict out of the output. Shared by
+/// the per-unit review and the branch pass, which want different payloads
+/// from the same plumbing. Returns (stdout, stderr, latency_ms) and appends
+/// the transcript-worthy text to `raw_output`.
 #[allow(clippy::too_many_arguments)]
-fn run_inner(
+pub(crate) fn capture_cli(
     slot: &ModelSlot,
     command: &str,
     prompt: &str,
@@ -364,7 +379,7 @@ fn run_inner(
     cli_home: &str,
     timeout: Duration,
     raw_output: &mut String,
-) -> Result<Suggestion, String> {
+) -> Result<(String, String, i64), String> {
     let (argv, via_stdin) = build_argv(command, prompt, repo, cli_home, slot);
     if argv.is_empty() {
         return Err("empty command template".into());
@@ -422,8 +437,8 @@ fn run_inner(
     let stderr_bytes = stderr_thread
         .join()
         .map_err(|_| "stderr reader panicked".to_string())?;
-    let stdout = String::from_utf8_lossy(&stdout_bytes);
-    let stderr = String::from_utf8_lossy(&stderr_bytes);
+    let stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
     let latency_ms = started.elapsed().as_millis() as i64;
     raw_output.push_str(stdout.trim());
     if !stderr.trim().is_empty() {
@@ -433,10 +448,24 @@ fn run_inner(
         raw_output.push_str("[stderr] ");
         raw_output.push_str(stderr.trim());
     }
-
     if !status.success() && stdout.trim().is_empty() && stderr.trim().is_empty() {
         return Err(format!("model exited with {status}"));
     }
+    Ok((stdout, stderr, latency_ms))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_inner(
+    slot: &ModelSlot,
+    command: &str,
+    prompt: &str,
+    repo: &str,
+    cli_home: &str,
+    timeout: Duration,
+    raw_output: &mut String,
+) -> Result<Suggestion, String> {
+    let (stdout, stderr, latency_ms) =
+        capture_cli(slot, command, prompt, repo, cli_home, timeout, raw_output)?;
 
     let raw = extract_verdict(&stdout)
         .or_else(|| extract_verdict(&stderr))

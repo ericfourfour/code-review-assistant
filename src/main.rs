@@ -7,12 +7,14 @@ mod comments;
 mod db;
 mod diffparse;
 mod eval;
+mod findings;
 mod gitio;
 mod models;
 mod review;
 mod settings;
 #[cfg(test)]
 mod testkit;
+mod triage;
 mod ui;
 mod units;
 

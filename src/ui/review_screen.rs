@@ -77,6 +77,18 @@ impl CraApp {
                 &unit.kind_label(),
                 if is_code { theme::WARN } else { theme::ACCENT },
             );
+            let risk = crate::triage::assess(&unit);
+            let risk_color = if risk.score >= 60 {
+                theme::BAD
+            } else if risk.score >= 30 {
+                theme::WARN
+            } else {
+                egui::Color32::from_gray(120)
+            };
+            ui.label(
+                RichText::new(format!("risk {}", risk.score)).small().strong().color(risk_color),
+            )
+            .on_hover_text(risk.reasons.join("\n"));
             if let Some(p) = &self.plan {
                 let (fi, ft) = p.file_progress();
                 ui.label(theme::dim(&format!("unit {}/{} in file", fi + 1, ft)));
@@ -458,7 +470,7 @@ impl CraApp {
     /// Floating viewer for one evidence entry: the real file at the spot a
     /// model says it read, so the human can weigh the verdict against the
     /// same context — not the model's paraphrase of it.
-    fn evidence_window(&mut self, ctx: &egui::Context) {
+    pub(crate) fn evidence_window(&mut self, ctx: &egui::Context) {
         let Some(ev) = self.show_evidence.clone() else { return };
         let mut open = true;
         egui::Window::new(format!("evidence · {}", ev.file))

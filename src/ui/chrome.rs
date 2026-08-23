@@ -97,6 +97,7 @@ pub fn hotkey_bar(app: &mut CraApp, ctx: &egui::Context) {
                     k(ui, "Esc", "files");
                 }
                 Screen::Summary => {
+                    k(ui, "G", "branch pass");
                     k(ui, "F", "files");
                     k(ui, "B", "branches/PRs");
                     k(ui, "Esc", "repos");
