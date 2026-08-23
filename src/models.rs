@@ -59,9 +59,13 @@ pub struct CandidateMsg {
     pub result: Result<Suggestion, String>,
 }
 
-/// Split the command template into argv, substituting `{prompt}`.
-/// Returns (argv, prompt_via_stdin).
-fn build_argv(template: &str, prompt: &str) -> (Vec<String>, bool) {
+/// Split the command template into argv, substituting `{prompt}` and
+/// appending the model selection. Returns (argv, prompt_via_stdin).
+///
+/// Piping is the default: a template without `{prompt}` gets the prompt on
+/// stdin, which sidesteps both the command-line length limit and Windows'
+/// refusal to pass multi-line arguments to a `.cmd` shim.
+fn build_argv(template: &str, prompt: &str, slot: &ModelSlot) -> (Vec<String>, bool) {
     let mut argv: Vec<String> = Vec::new();
     let mut used_placeholder = false;
     for tok in template.split_whitespace() {
@@ -71,6 +75,21 @@ fn build_argv(template: &str, prompt: &str) -> (Vec<String>, bool) {
         } else {
             argv.push(tok.to_string());
         }
+    }
+    // Append rather than splice: inserting ahead of the prompt would land
+    // between a flag and its value for templates like `agy -p {prompt}`, where
+    // the prompt *is* `-p`'s argument. All three shipped CLIs accept these
+    // trailing. A CLI that needs them elsewhere can spell them out in the
+    // command template and leave these fields empty.
+    for (value, flag, fallback) in [
+        (&slot.model, &slot.model_flag, "--model"),
+        (&slot.effort, &slot.effort_flag, "--effort"),
+    ] {
+        if value.trim().is_empty() {
+            continue;
+        }
+        argv.push(if flag.trim().is_empty() { fallback } else { flag.trim() }.to_string());
+        argv.push(value.trim().to_string());
     }
     (argv, !used_placeholder)
 }
@@ -115,7 +134,7 @@ fn extract_json(output: &str) -> Option<RawSuggestion> {
 }
 
 fn run_model(slot: &ModelSlot, prompt: &str, timeout: Duration) -> Result<Suggestion, String> {
-    let (argv, via_stdin) = build_argv(&slot.command, prompt);
+    let (argv, via_stdin) = build_argv(&slot.command, prompt, slot);
     if argv.is_empty() {
         return Err("empty command template".into());
     }
@@ -208,14 +227,51 @@ mod tests {
         assert_eq!(raw.action, "keep");
         assert!(raw.justification.contains("{braces}"));
     }
+    fn slot(model: &str, model_flag: &str, effort: &str, effort_flag: &str) -> ModelSlot {
+        ModelSlot {
+            name: "t".into(),
+            command: String::new(),
+            coauthor: String::new(),
+            enabled: true,
+            model: model.into(),
+            model_flag: model_flag.into(),
+            effort: effort.into(),
+            effort_flag: effort_flag.into(),
+        }
+    }
 
     #[test]
     fn argv_placeholder_vs_stdin() {
-        let (argv, stdin) = build_argv("claude -p {prompt}", "hello");
+        let bare = slot("", "--model", "", "--effort");
+        let (argv, stdin) = build_argv("claude -p {prompt}", "hello", &bare);
         assert_eq!(argv, vec!["claude", "-p", "hello"]);
         assert!(!stdin);
-        let (argv, stdin) = build_argv("codex exec", "hello");
+        let (argv, stdin) = build_argv("codex exec", "hello", &bare);
         assert_eq!(argv, vec!["codex", "exec"]);
         assert!(stdin);
+    }
+
+    #[test]
+    fn model_and_effort_trail_so_they_never_split_a_flag_from_its_value() {
+        let (argv, _) = build_argv("claude -p", "hi", &slot("haiku", "--model", "low", "--effort"));
+        assert_eq!(argv, vec!["claude", "-p", "--model", "haiku", "--effort", "low"]);
+        // `agy -p {prompt}` passes the prompt as -p's value, so the flags must
+        // land after it — inserting ahead would make -p consume "--model".
+        let (argv, _) =
+            build_argv("agy -p {prompt}", "hi", &slot("gemini-3.7-flash-low", "--model", "", ""));
+        assert_eq!(argv, vec!["agy", "-p", "hi", "--model", "gemini-3.7-flash-low"]);
+        // codex routes effort through a config override rather than a flag
+        let (argv, _) = build_argv(
+            "codex exec",
+            "hi",
+            &slot("gpt-5.6-luna", "--model", "model_reasoning_effort=low", "-c"),
+        );
+        assert_eq!(
+            argv,
+            vec!["codex", "exec", "--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=low"]
+        );
+        // empty values leave argv untouched
+        let (argv, _) = build_argv("claude -p", "hi", &slot("  ", "--model", " ", "--effort"));
+        assert_eq!(argv, vec!["claude", "-p"]);
     }
 }
