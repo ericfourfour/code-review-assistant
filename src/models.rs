@@ -325,6 +325,17 @@ fn run_inner(
     })
 }
 
+/// Run a model outside the review loop — the evaluation replay uses this so a
+/// measurement goes through exactly the same path as a real review.
+pub fn run_for_eval(
+    slot: &ModelSlot,
+    command: &str,
+    prompt: &str,
+    timeout: Duration,
+) -> (Result<Suggestion, String>, String) {
+    run_model(slot, command, prompt, timeout)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_model(
     seq: u64,
