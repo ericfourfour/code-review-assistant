@@ -11,6 +11,9 @@ pub enum RefKind {
     Branch,
     Pr(u64),
     WorkingTree,
+    /// Re-judging comments already decided once, to measure how consistent the
+    /// reviewer is with their own earlier self. Nothing is written to disk.
+    Recheck,
 }
 
 impl RefKind {
@@ -19,6 +22,7 @@ impl RefKind {
             RefKind::Branch => "branch".into(),
             RefKind::Pr(n) => format!("PR #{n}"),
             RefKind::WorkingTree => "working tree".into(),
+            RefKind::Recheck => "re-check".into(),
         }
     }
 }
@@ -43,6 +47,13 @@ pub struct ReviewPlan {
 }
 
 impl ReviewPlan {
+    /// A re-check re-judges history, so it must not touch the working tree:
+    /// the files may have moved on, and the point is the judgement, not the
+    /// edit.
+    pub fn is_recheck(&self) -> bool {
+        self.ref_kind == RefKind::Recheck
+    }
+
     pub fn total_units(&self) -> usize {
         self.files.iter().map(|f| f.units.len()).sum()
     }

@@ -339,6 +339,54 @@ impl CraApp {
         self.enter_unit(ctx);
     }
 
+    /// Start re-judging comments that were decided before. Comparing a
+    /// reviewer against their own earlier self is the only way to know how
+    /// much of a model's disagreement is noise rather than error — without it
+    /// an agreement score has no scale to be read against.
+    pub fn start_recheck(&mut self, ctx: &egui::Context, limit: usize) {
+        let corpus = crate::eval::Corpus::from_db(&self.db, limit);
+        if corpus.entries.is_empty() {
+            self.ref_error = Some(
+                "no past decisions to re-check yet — review some comments first".into(),
+            );
+            return;
+        }
+        // Group by file so the plan looks like any other review.
+        let mut files: Vec<ReviewFile> = Vec::new();
+        for entry in corpus.entries {
+            match files.iter_mut().find(|f| f.path == entry.unit.file) {
+                Some(f) => f.units.push(entry.unit),
+                None => files.push(ReviewFile {
+                    path: entry.unit.file.clone(),
+                    units: vec![entry.unit],
+                    line_offset: 0,
+                    decided: 0,
+                }),
+            }
+        }
+        let n_units: usize = files.iter().map(|f| f.units.len()).sum();
+        let session_id = self.db.new_session(
+            self.repo.as_ref().map(|r| r.path.as_str()).unwrap_or(""),
+            "re-check",
+            "past decisions",
+            "n/a",
+        );
+        self.note("session", &format!("#{session_id} re-check — {n_units} past comment(s)"));
+        self.plan = Some(ReviewPlan {
+            session_id,
+            ref_kind: RefKind::Recheck,
+            ref_name: "past decisions".into(),
+            base_ref: "n/a".into(),
+            files,
+            file_idx: 0,
+            unit_idx: 0,
+            decided_total: 0,
+        });
+        self.ref_error = None;
+        self.file_sel = 0;
+        self.start_review(ctx, 0);
+    }
+
     /// Prepare state for the current unit and fire the model CLIs.
     pub fn enter_unit(&mut self, ctx: &egui::Context) {
         self.review_seq += 1;
@@ -568,11 +616,13 @@ impl CraApp {
             _ => None,
         };
 
-        // Apply to the working tree when the text changed.
+        // Apply to the working tree when the text changed. A re-check is
+        // measuring the reviewer, not editing code, so it stops short of this.
+        let recheck = self.plan.as_ref().is_some_and(|p| p.is_recheck());
         let new_lines = unit.reindent(&self.editor);
         let final_text = new_lines.join("\n");
         let mut delta = 0i64;
-        if action != Action::Keep {
+        if action != Action::Keep && !recheck {
             let Some(plan) = &self.plan else { return };
             let file = &plan.files[plan.file_idx];
             match review::apply_edit(&repo_path, file, &unit, &new_lines) {
@@ -589,7 +639,7 @@ impl CraApp {
         let mut sha = None;
         let mut committed = false;
         let mut commit_error = None;
-        if commit {
+        if commit && !recheck {
             if action == Action::Keep {
                 self.note("commit", "kept original — nothing to commit");
             } else {
