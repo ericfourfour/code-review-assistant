@@ -121,26 +121,24 @@ pub fn assess(unit: &ReviewUnit) -> Risk {
     Risk { score: score.min(100), reasons }
 }
 
-/// Order units riskiest-first (stable: ties keep their line order), and files
-/// by the riskiest unit they contain. Called on the assembled plan when the
-/// triage setting is on; the offset bookkeeping tolerates any walk order.
 pub fn order_riskiest_first(files: &mut Vec<(String, Vec<ReviewUnit>)>) {
-    for (_, units) in files.iter_mut() {
-        let mut scored: Vec<(u32, ReviewUnit)> =
-            units.drain(..).map(|u| (assess(&u).score, u)).collect();
-        scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.start_line().cmp(&b.1.start_line())));
-        units.extend(scored.into_iter().map(|(_, u)| u));
-    }
-    // Units are now sorted riskiest-first, so a file's risk is its first unit.
-    let mut scored: Vec<(u32, (String, Vec<ReviewUnit>))> = files
+    let mut file_scores: Vec<(u32, (String, Vec<ReviewUnit>))> = files
         .drain(..)
-        .map(|f| (f.1.first().map(|u| assess(u).score).unwrap_or(0), f))
+        .map(|(name, units)| {
+            let mut scored: Vec<(u32, ReviewUnit)> =
+                units.into_iter().map(|u| (assess(&u).score, u)).collect();
+            scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.start_line().cmp(&b.1.start_line())));
+            
+            let file_risk = scored.first().map(|s| s.0).unwrap_or(0);
+            let sorted_units = scored.into_iter().map(|(_, u)| u).collect();
+            
+            (file_risk, (name, sorted_units))
+        })
         .collect();
-    // Stable, so equally risky files keep their diff order.
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
-    files.extend(scored.into_iter().map(|(_, f)| f));
+    
+    file_scores.sort_by(|a, b| b.0.cmp(&a.0));
+    files.extend(file_scores.into_iter().map(|(_, f)| f));
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
