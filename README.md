@@ -277,6 +277,56 @@ the models are assumed to know what good comments and good code look like, and w
 cannot know from the excerpt is the code around it, so they are given the means to go and
 look rather than a checklist. Browsing costs time: the model timeout defaults to 300s.
 
+## Processes, sessions and usage
+
+A model CLI is a process this app started and a conversation the CLI goes on holding
+afterwards. Both are tracked, on every page that runs one.
+
+**The ledger** (`Ctrl+P`, or the badge in the top bar) lists every call this run has made:
+state, model, which page started it, **pid**, **session id**, elapsed time, what it spent, and
+the last step it was seen taking. Each live row has a stop button, and there is a stop-all.
+The badge shows what is running and what is paused without opening anything.
+
+**Leaving a page stops that page's models.** Walking off the review screen used to leave three
+CLIs reading the repository for minutes, spending the whole time on a verdict nobody would
+ever see, against sessions the app had already forgotten the ids of. Now navigating away
+terminates them — the whole process tree, because the CLIs are npm shims and killing
+`claude.cmd` leaves the node process underneath it working — and a banner names every process
+by pid. It says *terminating* until each process confirms it is gone, and only then
+*terminated*: the confirmation is of the kill, not of the request.
+
+**Coming back shows what was paused, and starts nothing.** The unit's cards are where you left
+them, each stopped call showing its pid, its session, how long it ran and what it spent, with
+two offers:
+
+- **Resume this session** — continues the conversation the CLI still holds, so the model keeps
+  everything it had read and worked out before the kill;
+- **Ask again** — a new conversation, paying for that work a second time.
+
+Where there is no session id to continue, only the second is possible and the card says why:
+a CLI that reports its id in its reply (rather than taking one this app generates, claude's
+`--session-id`) leaves nothing behind when it is killed mid-answer. Returning never picks for
+you — that is the whole point of pausing rather than cancelling. `R` on the review screen
+still re-runs the models outright; asking again is what that key is for.
+
+The same applies to the whole-branch review on the summary screen and to the fix session on
+the follow-up screen. Quitting stops everything first: an orphaned CLI has no window left to
+report itself in.
+
+**Usage.** Every call's tokens and cost are read from the CLI's own accounting and totalled
+for the run — including calls that were stopped part-way, whose spend was real. Settings takes
+a **spend limit** and a **token limit** per run; past either, no new call starts and the page
+says why and where to change it. Zero means no ceiling, which is the default. Silence about
+spend is never counted as zero: a CLI that reports no tokens is *unmeasured*, and a limit that
+stopped work on an estimate would be stopping it for the wrong reason.
+
+A stopped call is recorded with what it spent but marked as stopped, so the evaluation page
+never scores a model for a call you cut short — walking away says nothing about the model.
+
+Sessions outlive the app that opened them: the CLI still holds the conversation after the
+window closes, so each one is written to the database with its model, page, state and running
+spend. Conversations an earlier run left paused are listed at the bottom of the ledger.
+
 ## Commit provenance
 
 Commits made with **Commit each decision individually** checked carry metadata about the app and where the final
@@ -360,7 +410,8 @@ cra report                              # or just score the whole review history
 ## Storage
 
 All activity — sessions, every model suggestion (with latency, errors, tokens and cost),
-every human decision, every commit — plus settings live in a local SQLite database at
+every human decision, every commit, and every CLI conversation the app opened (with its
+model, page, state and spend) — plus settings live in a local SQLite database at
 `~/.local/share/code-review-assistant/cra.db` (platform data dir; override with `CRA_DB`).
 
 ## Hotkeys
@@ -369,7 +420,7 @@ Every action has one; the bottom bar always shows what's live. Highlights:
 
 | Context | Keys |
 |---|---|
-| Everywhere | `Ctrl+E` model evaluation · `Ctrl+,` settings · `Ctrl+Q` quit · `Esc` back |
+| Everywhere | `Ctrl+E` model evaluation · `Ctrl+P` processes & sessions · `Ctrl+,` settings · `Ctrl+Q` quit · `Esc` back |
 | Pickers | `↑/↓` select · `Enter` open · `Tab` branches⇄PRs · `W` working tree · `S` staged · `U` toggle untracked · `R` refresh |
 | Files | `Enter` start at file · `S` start full review |
 | Review | `1/2/3` pick candidate · `K` keep/approve · `D` delete · `E` edit · `C` note for follow-up · `R` re-run models · `P` prev · `N` skip |
