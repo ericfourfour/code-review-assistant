@@ -10,45 +10,48 @@ pub struct Risk {
     /// Why the score is what it is, in the order the points were added.
     pub reasons: Vec<String>,
 }
-/// One vocabulary bucket: a label, the points it adds, and the substrings
-/// (matched case-insensitively) that trigger it. A bucket fires at most once
+/// One risk rule: a label, the points it adds, and the terms
+/// (matched case-insensitively) that trigger it. A rule fires at most once
 /// per unit — five `unwrap`s are not five times as risky as one.
-struct Bucket {
+/// Keyword pattern that signals risky code to help prioritize human review attention.
+struct RiskRule {
+    /// Label shown in the risk assessment explanation.
     label: &'static str,
+    /// Points added to the risk score when a term matches.
     points: u32,
-    needles: &'static [&'static str],
+    /// Keywords that trigger this rule (matched case-insensitively).
+    terms: &'static [&'static str],
 }
-
-const BUCKETS: &[Bucket] = &[
-    Bucket {
+const RISK_RULES: &[RiskRule] = &[
+    RiskRule {
         label: "security-sensitive terms",
         points: 15,
-        needles: &["passw", "secret", "credential", "api_key", "apikey", "private_key",
+        terms: &["passw", "secret", "credential", "api_key", "apikey", "private_key",
                    "authent", "authoriz", "permission", "crypt", "certif"],
     },
-    Bucket {
+    RiskRule {
         label: "concurrency",
         points: 12,
-        needles: &["mutex", "rwlock", ".lock(", "atomic", "thread", "spawn", "channel",
+        terms: &["mutex", "rwlock", ".lock(", "atomic", "thread", "spawn", "channel",
                    "semaphore", "concurren", "race "],
     },
-    Bucket {
+    RiskRule {
         label: "panics or unsafe code",
         points: 12,
-        needles: &["unsafe", ".unwrap(", ".expect(", "panic!", "unimplemented!", "todo!",
+        terms: &["unsafe", ".unwrap(", ".expect(", "panic!", "unimplemented!", "todo!",
                    "unreachable!", "assert!", "raise ", "throw "],
     },
-    Bucket {
+    RiskRule {
         label: "external effects",
         points: 10,
-        needles: &["subprocess", "command", "exec(", "system(", "eval(", "shell",
+        terms: &["subprocess", "command", "exec(", "system(", "eval(", "shell",
                    "sql", "query(", "http", "request(", "socket", "std::fs", "os.remove",
                    "unlink", "rmdir", "delete", "truncate", "drop table", "migrat"],
     },
-    Bucket {
+    RiskRule {
         label: "unfinished-work markers",
         points: 8,
-        needles: &["todo", "fixme", "hack", "xxx", "workaround", "temporar"],
+        terms: &["todo", "fixme", "hack", "xxx", "workaround", "temporar"],
     },
 ];
 
@@ -103,10 +106,10 @@ pub fn assess(unit: &ReviewUnit) -> Risk {
         add(&mut score, &mut reasons, pts, format!("removes {removed} line(s)"));
     }
 
-    let haystack = unit.raw_lines().join("\n").to_ascii_lowercase();
-    for bucket in BUCKETS {
-        if bucket.needles.iter().any(|n| haystack.contains(n)) {
-            add(&mut score, &mut reasons, bucket.points, bucket.label.to_string());
+    let unit_text = unit.raw_lines().join("\n").to_ascii_lowercase();
+    for rule in RISK_RULES {
+        if rule.terms.iter().any(|term| unit_text.contains(term)) {
+            add(&mut score, &mut reasons, rule.points, rule.label.to_string());
         }
     }
 
