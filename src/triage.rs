@@ -3,13 +3,13 @@
 
 use crate::units::ReviewUnit;
 
+/// A deterministic score and explanation used to prioritize review units.
 pub struct Risk {
     /// 0–100. Ordering signal, not a judgement.
     pub score: u32,
     /// Why the score is what it is, in the order the points were added.
     pub reasons: Vec<String>,
 }
-
 /// One vocabulary bucket: a label, the points it adds, and the substrings
 /// (matched case-insensitively) that trigger it. A bucket fires at most once
 /// per unit — five `unwrap`s are not five times as risky as one.
