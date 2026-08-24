@@ -1,0 +1,9 @@
+[package]
+name = "code-review-assistant"
+version = "0.1.0"
+edition = "2021"
+description = "A local assistant for reviewing code changes"
+license = "MIT"
+
+[dependencies]
+
