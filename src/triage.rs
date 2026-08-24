@@ -1,4 +1,4 @@
-//! Risk triage: a fast, local, deterministic score per unit so the walk can
+//! Risk triage: a fast, local, deterministic score per unit so the review can
 //! visit the changes most worth human attention first.
 
 use crate::units::ReviewUnit;
@@ -10,9 +10,7 @@ pub struct Risk {
     /// Why the score is what it is, in the order the points were added.
     pub reasons: Vec<String>,
 }
-/// One risk rule: a label, the points it adds, and the terms
-/// (matched case-insensitively) that trigger it. A rule fires at most once
-/// per unit — five `unwrap`s are not five times as risky as one.
+
 /// Keyword pattern that signals risky code to help prioritize human review attention.
 struct RiskRule {
     /// Label shown in the risk assessment explanation.
@@ -22,6 +20,7 @@ struct RiskRule {
     /// Keywords that trigger this rule (matched case-insensitively).
     terms: &'static [&'static str],
 }
+
 const RISK_RULES: &[RiskRule] = &[
     RiskRule {
         label: "security-sensitive terms",
@@ -56,7 +55,7 @@ const RISK_RULES: &[RiskRule] = &[
 ];
 
 /// Path fragments that mark lower-stakes files. Tests matter, but a bug in a
-/// test rarely ships; halving keeps them in the walk without letting a big
+/// test rarely ships; halving keeps them in the review without letting a big
 /// test file outrank the code it tests.
 fn is_test_path(path: &str) -> bool {
     let p = path.to_ascii_lowercase();
@@ -241,7 +240,7 @@ mod tests {
     }
 
     #[test]
-    fn ordering_walks_riskiest_first_but_keeps_diff_order_on_ties() {
+    fn ordering_puts_riskiest_first_but_keeps_diff_order_on_ties() {
         // Surfacing highest-risk changes first makes effective use of human reviewer
         // time and attention. For equal risk, preserving diff order lets reviewers
         // lean on their built-up mental model.

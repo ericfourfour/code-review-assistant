@@ -9,7 +9,7 @@ use crate::db::Db;
 /// replaced with the prompt text. If no `{prompt}` token is present the
 /// prompt is piped to the process on stdin. No shell is involved.
 #[derive(Clone, Serialize, Deserialize)]
-pub struct ModelSlot {
+pub struct ModelConfig {
     pub name: String,
     pub command: String,
     /// `Name <email>` used in the Co-authored-by trailer when this model's
@@ -32,7 +32,7 @@ pub struct ModelSlot {
     pub effort_flag: String,
     /// Command used to continue an existing conversation. `{session}` is
     /// replaced with the session id. Empty means the CLI has no resume mode,
-    /// so follow-ups are unavailable for the slot.
+    /// so follow-ups are unavailable for the model.
     #[serde(default)]
     pub resume_command: String,
     /// JSON key in the CLI output that carries the session id. Empty means
@@ -40,6 +40,14 @@ pub struct ModelSlot {
     /// (that is claude's `--session-id <uuid>`).
     #[serde(default)]
     pub session_key: String,
+    /// USD per million tokens, used to price a call whose CLI reports tokens
+    /// but not money. Zero means "unpriced": the evaluation page then shows
+    /// this model's tokens with no cost rather than pretending it was free.
+    /// A CLI that reports its own cost is always believed over these.
+    #[serde(default)]
+    pub price_in: f64,
+    #[serde(default)]
+    pub price_out: f64,
 }
 
 fn default_model_flag() -> String {
@@ -60,6 +68,10 @@ fn default_true() -> bool {
 
 fn default_check_timeout() -> u64 {
     120
+}
+
+fn default_repo_max_age_days() -> u32 {
+    180
 }
 
 /// Known effort settings for a command template, offered as a dropdown.
@@ -118,7 +130,7 @@ pub fn model_presets(command: &str) -> &'static [&'static str] {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Settings {
-    pub models: Vec<ModelSlot>,
+    pub models: Vec<ModelConfig>,
     /// Fallback base branch when origin/HEAD cannot be resolved.
     pub default_base: String,
     /// Command used for PR listing/checkout (normally `gh`).
@@ -128,10 +140,22 @@ pub struct Settings {
     /// Context lines shown around a comment in the prompt and the UI.
     pub context_lines: usize,
     pub recent_repos: Vec<String>,
+    /// Discovered repositories with no activity in this many days are hidden
+    /// from the picker. 0 shows everything ever found.
+    #[serde(default = "default_repo_max_age_days")]
+    pub repo_max_age_days: u32,
+    /// Repositories the picker must not offer again — local paths or GitHub
+    /// `owner/name` slugs. Grown from the picker's exclude action, edited here.
+    #[serde(default)]
+    pub excluded_repos: Vec<String>,
+    /// Where a repository that only exists on GitHub is cloned when opened.
+    /// Empty means the home folder, next to where the scan looks.
+    #[serde(default)]
+    pub clone_dir: String,
     /// Hide which model produced each candidate, and shuffle their order, until
     /// a choice is made. Reviewing is also labelling: seeing the name while
     /// choosing biases the label toward whichever model you already trust, and
-    /// a fixed left-to-right order biases it toward the first slot.
+    /// a fixed left-to-right order biases it toward the first model.
     #[serde(default = "default_blind_review")]
     pub blind_review: bool,
     /// Review the comment runs the branch touched (the original flow).
@@ -152,30 +176,48 @@ pub struct Settings {
     /// edit rarely breaks a build, and checks are slow.
     #[serde(default)]
     pub validate_comment_edits: bool,
-    /// Walk the plan riskiest-unit-first (local heuristic score) instead of
-    /// diff order, so attention lands on the changes most likely to need it.
+    /// Working-tree reviews also take in untracked files, rendered as
+    /// new-file diffs. Off by default: untracked often means scratch files,
+    /// and `git diff HEAD` not showing them is what git users expect.
+    #[serde(default)]
+    pub include_untracked: bool,
+    /// Review the plan riskiest-unit-first (local heuristic score) instead of
+    /// diff order, so the changes most likely to need attention come first.
     #[serde(default = "default_true")]
     pub triage_order: bool,
-    /// Bumped when a migration step must run exactly once. Absent (0) in rows
-    /// written before this field existed.
-    #[serde(default)]
-    pub schema_version: u32,
+    /// Leave units out of a new plan when this repository already has a
+    /// verdict on them. A decision is meant to stick: without this, every
+    /// session re-offers everything the branch touched, and the work of
+    /// reviewing is paid again each time the app is opened.
+    #[serde(default = "default_true")]
+    pub skip_decided: bool,
+    /// Prepend the reviewer's standing preferences — mined from past follow-up
+    /// questions and verdicts — to every review prompt, so the models apply
+    /// them from round one instead of waiting to be corrected per unit.
+    #[serde(default = "default_true")]
+    pub send_profile: bool,
+    /// Query the models for the next unit while the current one is being
+    /// decided. Deciding takes minutes and the models seconds, so by the time
+    /// the review advances the verdicts are usually already in.
+    #[serde(default = "default_true")]
+    pub prefetch_next: bool,
+    /// When a prefetched unit comes back with every model saying keep, push it
+    /// to the end of its file so the units the models disagree about — the
+    /// ones worth attention — are reviewed first.
+    #[serde(default = "default_true")]
+    pub defer_unanimous_keeps: bool,
 }
-
-/// Current settings schema. Bump when adding a one-shot migration step.
-const SCHEMA_VERSION: u32 = 2;
 
 /// A model that reads its way around the repository before answering takes far
 /// longer than one that only reads the hunk, so the ceiling that was generous
 /// for a single-shot verdict is not generous for a browsing one.
 const DEFAULT_TIMEOUT_SECS: u64 = 300;
-const PRE_BROWSE_TIMEOUT_SECS: u64 = 120;
 
 impl Default for Settings {
     fn default() -> Self {
         Settings {
             models: vec![
-                ModelSlot {
+                ModelConfig {
                     name: "claude".into(),
                     command: CLAUDE_CMD.into(),
                     coauthor: "Claude <noreply@anthropic.com>".into(),
@@ -186,8 +228,12 @@ impl Default for Settings {
                     effort_flag: "--effort".into(),
                     resume_command: CLAUDE_RESUME.into(),
                     session_key: String::new(),
+                    // Claude's CLI prices its own calls, so these stay unset;
+                    // they exist for a model whose CLI only counts tokens.
+                    price_in: 0.0,
+                    price_out: 0.0,
                 },
-                ModelSlot {
+                ModelConfig {
                     name: "codex".into(),
                     command: CODEX_CMD.into(),
                     coauthor: "Codex <codex@openai.com>".into(),
@@ -198,10 +244,12 @@ impl Default for Settings {
                     effort_flag: "-c".into(),
                     resume_command: CODEX_RESUME.into(),
                     session_key: "thread_id".into(),
+                    price_in: 0.0,
+                    price_out: 0.0,
                 },
                 // agy has no stdin mode, but it is a native .exe, so the
                 // prompt goes as an argument (32k limit, not cmd.exe's 8k).
-                ModelSlot {
+                ModelConfig {
                     name: "agy".into(),
                     command: AGY_CMD.into(),
                     coauthor: "Antigravity <antigravity@google.com>".into(),
@@ -214,6 +262,8 @@ impl Default for Settings {
                     effort_flag: "--effort".into(),
                     resume_command: AGY_RESUME.into(),
                     session_key: "conversation_id".into(),
+                    price_in: 0.0,
+                    price_out: 0.0,
                 },
             ],
             default_base: "main".into(),
@@ -221,14 +271,21 @@ impl Default for Settings {
             model_timeout_secs: DEFAULT_TIMEOUT_SECS,
             context_lines: 12,
             recent_repos: Vec::new(),
+            repo_max_age_days: default_repo_max_age_days(),
+            excluded_repos: Vec::new(),
+            clone_dir: String::new(),
             blind_review: default_blind_review(),
             review_comments: true,
             review_code: true,
             check_command: String::new(),
             check_timeout_secs: default_check_timeout(),
             validate_comment_edits: false,
+            include_untracked: false,
             triage_order: true,
-            schema_version: SCHEMA_VERSION,
+            skip_decided: true,
+            send_profile: true,
+            prefetch_next: true,
+            defer_unanimous_keeps: true,
         }
     }
 }
@@ -257,9 +314,16 @@ const KEY: &str = "settings";
 // is deliberately absent: measured on Windows, a command run under it wants an
 // admin escalation that print mode cannot prompt for, and the run dies with
 // "context canceled".
-const CLAUDE_CMD: &str = "claude -p --session-id {session} \
+// claude asks for `stream-json` rather than `json`: same envelope keys — the
+// verdict arrives escaped inside the final result event, the usage beside it —
+// but printed as one event per line *as they happen*, which is what feeds the
+// live "what is it doing" view while a call is running. Print mode requires
+// `--verbose` before it will stream.
+const CLAUDE_CMD: &str = "claude -p --verbose --output-format stream-json \
+                          --session-id {session} \
                           --tools Read,Grep,Glob --allowed-tools Read,Grep,Glob";
-const CLAUDE_RESUME: &str = "claude -p --resume {session} \
+const CLAUDE_RESUME: &str = "claude -p --verbose --output-format stream-json \
+                             --resume {session} \
                              --tools Read,Grep,Glob --allowed-tools Read,Grep,Glob";
 const CODEX_CMD: &str = "codex exec --skip-git-repo-check --json --sandbox read-only";
 const CODEX_RESUME: &str =
@@ -271,136 +335,19 @@ const AGY_RESUME: &str = "agy --gemini_dir={cli_home} -p {prompt} --output-forma
 
 // Start small and cheap: a first-pass comment reviewer runs on every hunk, and
 // the cheapest tier of each family handles "does this comment restate the
-// code" perfectly well. Raise per slot in settings when a repo needs it.
+// code" perfectly well. Raise per model in settings when a repo needs it.
 const CLAUDE_MODEL: &str = "haiku";
 const CLAUDE_EFFORT: &str = "low";
 const CODEX_MODEL: &str = "gpt-5.6-luna";
 const CODEX_EFFORT: &str = "model_reasoning_effort=low";
 const AGY_MODEL: &str = "gemini-3.7-flash-low";
 
-/// Starting model/effort per shipped command, applied once by [`Settings::migrate`]
-/// to installs that predate these fields: (command, model, effort, effort flag).
-const STARTING_TIER: &[(&str, &str, &str, &str)] = &[
-    (CLAUDE_CMD, CLAUDE_MODEL, CLAUDE_EFFORT, "--effort"),
-    (CODEX_CMD, CODEX_MODEL, CODEX_EFFORT, "-c"),
-    (AGY_CMD, AGY_MODEL, "", "--effort"),
-];
-
-/// Session wiring keyed by the command it belongs to: (command, resume, key).
-const SESSION_WIRING: &[(&str, &str, &str)] = &[
-    (CLAUDE_CMD, CLAUDE_RESUME, ""),
-    (CODEX_CMD, CODEX_RESUME, "thread_id"),
-    (AGY_CMD, AGY_RESUME, "conversation_id"),
-];
-
-/// Command templates that shipped in earlier versions, mapped to the current
-/// one. Applied on load to both the opening and the resume template, so an
-/// existing install picks up fixes — and session support, and repo access —
-/// without the user having to notice and edit settings by hand.
-const COMMAND_FIXUPS: &[(&str, &str)] = &[
-    // Multi-line arguments are rejected outright for `.cmd` shims on Windows
-    // ("batch file arguments are invalid"), so codex has to take stdin.
-    ("codex exec {prompt}", CODEX_CMD),
-    ("codex exec --skip-git-repo-check", CODEX_CMD),
-    ("claude -p {prompt}", CLAUDE_CMD),
-    ("claude -p", CLAUDE_CMD),
-    ("agy -p {prompt}", AGY_CMD),
-    ("agy --print -", AGY_CMD),
-    // Shipped before the models were allowed to read the repository: same
-    // CLIs, same sessions, no way to look past the hunk.
-    ("claude -p --session-id {session}", CLAUDE_CMD),
-    ("claude -p --resume {session}", CLAUDE_RESUME),
-    ("codex exec --skip-git-repo-check --json", CODEX_CMD),
-    ("codex exec --skip-git-repo-check --json resume {session} -", CODEX_RESUME),
-    ("agy -p {prompt} --output-format json", AGY_CMD),
-    ("agy -p {prompt} --output-format json --conversation {session}", AGY_RESUME),
-    // Shipped briefly with repo access but no home of its own, which left it
-    // running under whatever rules the machine happened to have.
-    ("agy -p {prompt} --output-format json --mode plan --add-dir {repo}", AGY_CMD),
-    (
-        "agy -p {prompt} --output-format json --mode plan --add-dir {repo} \
-         --conversation {session}",
-        AGY_RESUME,
-    ),
-];
-
 impl Settings {
     pub fn load(db: &Db) -> Settings {
-        let mut settings: Settings = db
+        db
             .get_setting(KEY)
             .and_then(|v| serde_json::from_str(&v).ok())
-            .unwrap_or_default();
-        settings.migrate();
-        settings
-    }
-
-    /// Repair known-broken command templates. Only exact matches against a
-    /// shipped default are touched — a template the user has edited is theirs.
-    fn migrate(&mut self) -> bool {
-        let mut changed = false;
-        // Each step is gated on the version it was introduced at, so an install
-        // that has already taken one is not walked through it twice.
-        let fresh_fields = self.schema_version < 1;
-        let repo_access = self.schema_version < 2;
-        for m in &mut self.models {
-            // Both templates, not just the opening one: a follow-up that
-            // resumed without repo access would answer from a different vantage
-            // point than the turn it is continuing.
-            for template in [&mut m.command, &mut m.resume_command] {
-                if let Some((_, fixed)) =
-                    COMMAND_FIXUPS.iter().find(|(broken, _)| template.trim() == *broken)
-                {
-                    *template = (*fixed).to_string();
-                    changed = true;
-                }
-            }
-            if m.model_flag.trim().is_empty() {
-                m.model_flag = default_model_flag();
-                changed = true;
-            }
-            if m.effort_flag.trim().is_empty() {
-                m.effort_flag = default_effort_flag();
-                changed = true;
-            }
-            // Give a recognised command its starting model/effort, but only
-            // on the one pass that upgrades the row — after that an empty
-            // model means the user chose the CLI default, and we leave it be.
-            if fresh_fields {
-                if let Some((_, model, effort, effort_flag)) =
-                    STARTING_TIER.iter().find(|(cmd, ..)| m.command.trim() == *cmd)
-                {
-                    if m.model.trim().is_empty() {
-                        m.model = (*model).to_string();
-                    }
-                    if m.effort.trim().is_empty() {
-                        m.effort = (*effort).to_string();
-                        m.effort_flag = (*effort_flag).to_string();
-                    }
-                    changed = true;
-                }
-            }
-            // Fill in session wiring for a recognised command that predates it.
-            if m.resume_command.trim().is_empty() {
-                if let Some((_, resume, key)) =
-                    SESSION_WIRING.iter().find(|(cmd, _, _)| m.command.trim() == *cmd)
-                {
-                    m.resume_command = (*resume).to_string();
-                    m.session_key = (*key).to_string();
-                    changed = true;
-                }
-            }
-        }
-        // Only a timeout still sitting on the old default is raised; one the
-        // user has typed in is their answer to the same question.
-        if repo_access && self.model_timeout_secs == PRE_BROWSE_TIMEOUT_SECS {
-            self.model_timeout_secs = DEFAULT_TIMEOUT_SECS;
-            changed = true;
-        }
-        if self.schema_version < SCHEMA_VERSION {
-            self.schema_version = SCHEMA_VERSION;
-            changed = true;
-        }
-        changed
+            .unwrap_or_default()
     }
 
     pub fn save(&self, db: &Db) {
@@ -415,7 +362,7 @@ impl Settings {
         self.recent_repos.truncate(15);
     }
 
-    pub fn enabled_models(&self) -> Vec<(usize, ModelSlot)> {
+    pub fn enabled_models(&self) -> Vec<(usize, ModelConfig)> {
         self.models
             .iter()
             .enumerate()
@@ -430,169 +377,54 @@ mod tests {
     use super::*;
 
     #[test]
-    fn migrate_repairs_shipped_defaults_only() {
-        let mut s = Settings {
-            models: vec![
-                ModelSlot {
-                    name: "codex".into(),
-                    command: "codex exec {prompt}".into(),
-                    coauthor: String::new(),
-                    enabled: true,
-                    model: String::new(),
-                    model_flag: String::new(),
-                    effort: String::new(),
-                    effort_flag: String::new(),
-                    resume_command: String::new(),
-                    session_key: String::new(),
-                },
-                ModelSlot {
-                    name: "mine".into(),
-                    command: "mycli --weird {prompt}".into(),
-                    coauthor: String::new(),
-                    enabled: true,
-                    model: String::new(),
-                    model_flag: "-m".into(),
-                    effort: String::new(),
-                    effort_flag: "-e".into(),
-                    resume_command: String::new(),
-                    session_key: String::new(),
-                },
-            ],
-            // a row written before the model/effort/session fields existed
-            schema_version: 0,
-            ..Settings::default()
-        };
-        assert!(s.migrate());
-        assert_eq!(s.models[0].command, CODEX_CMD);
-        assert_eq!(s.models[0].model_flag, "--model");
-        // the repaired command also picks up its session wiring
-        assert_eq!(s.models[0].session_key, "thread_id");
-        assert!(s.models[0].resume_command.contains("resume {session}"));
-        // and its starting tier
-        assert_eq!(s.models[0].model, CODEX_MODEL);
-        assert_eq!(s.models[0].effort, CODEX_EFFORT);
-        assert_eq!(s.models[0].effort_flag, "-c");
-        // a hand-edited template is left exactly as the user wrote it
-        assert_eq!(s.models[1].command, "mycli --weird {prompt}");
-        assert_eq!(s.models[1].model_flag, "-m");
-        assert!(s.models[1].resume_command.is_empty());
-        assert!(s.models[1].model.is_empty());
-        assert_eq!(s.models[1].effort_flag, "-e");
-        // running it again is a no-op
-        assert!(!s.migrate());
-    }
-
-    #[test]
-    fn an_install_from_before_repo_access_picks_it_up_on_both_templates() {
-        let mut s = Settings {
-            models: vec![ModelSlot {
-                name: "claude".into(),
-                command: "claude -p --session-id {session}".into(),
-                coauthor: String::new(),
-                enabled: true,
-                model: "haiku".into(),
-                model_flag: "--model".into(),
-                effort: "low".into(),
-                effort_flag: "--effort".into(),
-                resume_command: "claude -p --resume {session}".into(),
-                session_key: String::new(),
-            }],
-            model_timeout_secs: PRE_BROWSE_TIMEOUT_SECS,
-            // already through the model/effort migration, so only the repo
-            // access step is outstanding
-            schema_version: 1,
-            ..Settings::default()
-        };
-        assert!(s.migrate());
-        assert_eq!(s.models[0].command, CLAUDE_CMD);
-        // The follow-up resumes through its own template, so it needs the same
-        // access as the turn it continues.
-        assert_eq!(s.models[0].resume_command, CLAUDE_RESUME);
-        assert_eq!(s.model_timeout_secs, DEFAULT_TIMEOUT_SECS);
-        // The step that was already taken must not run again.
-        assert_eq!(s.models[0].model, "haiku", "the tier fill re-ran");
-        assert!(!s.migrate());
-    }
-
-    #[test]
-    fn a_timeout_the_user_chose_survives_the_upgrade() {
-        let mut s = Settings { model_timeout_secs: 45, schema_version: 1, ..Settings::default() };
-        s.migrate();
-        assert_eq!(s.model_timeout_secs, 45);
-    }
-
-    #[test]
-    fn no_shipped_template_buys_access_by_switching_permissions_off() {
+    fn shipped_commands_do_not_disable_cli_permissions() {
         // Read access is granted per CLI by naming what may be read, not by
         // approving whatever the model decides to run. A flag like this in a
         // default would hand every reviewed repository to an unattended agent.
-        for m in Settings::default().models {
-            for template in [&m.command, &m.resume_command] {
+        for model_config in Settings::default().models {
+            for command in [&model_config.command, &model_config.resume_command] {
                 assert!(
-                    !template.contains("dangerously") && !template.contains("bypass"),
-                    "{} ships a permission bypass: {template}",
-                    m.name
+                    !command.contains("dangerously") && !command.contains("bypass"),
+                    "{} ships a permission bypass: {command}",
+                    model_config.name
                 );
             }
         }
     }
 
     #[test]
-    fn shipped_defaults_are_not_themselves_broken() {
-        let mut s = Settings::default();
-        assert!(!s.migrate(), "a default template matches a known-broken one");
-    }
-}
-
-#[cfg(test)]
-mod session_tests {
-    use super::*;
-
-    #[test]
-    fn tier_fill_runs_once_and_then_respects_the_users_choice() {
-        let mut s = Settings { schema_version: 0, ..Settings::default() };
-        s.models[0].model.clear();
-        s.models[0].effort.clear();
-        assert!(s.migrate(), "the upgrade pass should fill the starting tier");
-        assert_eq!(s.models[0].model, CLAUDE_MODEL);
-        assert_eq!(s.schema_version, SCHEMA_VERSION);
-
-        // Now the user picks "(CLI default)" — a later load must not undo it.
-        s.models[0].model.clear();
-        s.models[0].effort.clear();
-        assert!(!s.migrate());
-        assert!(s.models[0].model.is_empty(), "migrate clobbered a deliberate choice");
-        assert!(s.models[0].effort.is_empty());
-    }
-
-    #[test]
-    fn every_shipped_slot_has_model_presets() {
+    fn every_default_model_has_model_presets() {
         // A preset list that does not match its command is a silent dead end
         // in the settings dropdown, so tie them together.
-        for m in Settings::default().models {
-            let argv0 = m.command.split_whitespace().next().unwrap_or("");
+        for model_config in Settings::default().models {
+            let program = model_config.command.split_whitespace().next().unwrap_or("");
             assert!(
-                !model_presets(argv0).is_empty(),
-                "{} ({argv0}) offers no model presets",
-                m.name
+                !model_presets(program).is_empty(),
+                "{} ({program}) offers no model presets",
+                model_config.name
             );
         }
     }
 
     #[test]
-    fn every_shipped_slot_can_resume() {
-        for m in Settings::default().models {
-            assert!(!m.resume_command.is_empty(), "{} has no resume command", m.name);
+    fn every_default_model_can_resume() {
+        for model_config in Settings::default().models {
             assert!(
-                m.resume_command.contains("{session}"),
+                !model_config.resume_command.is_empty(),
+                "{} has no resume command",
+                model_config.name
+            );
+            assert!(
+                model_config.resume_command.contains("{session}"),
                 "{} resume command must carry the session id",
-                m.name
+                model_config.name
             );
             // Either the CLI reports the id, or we hand it one.
             assert!(
-                !m.session_key.is_empty() || m.command.contains("{session}"),
+                !model_config.session_key.is_empty()
+                    || model_config.command.contains("{session}"),
                 "{} can neither report nor accept a session id",
-                m.name
+                model_config.name
             );
         }
     }

@@ -1,6 +1,6 @@
 use egui::{Key, Modifiers, RichText};
 
-use crate::app::{BranchPassState, CraApp, Screen};
+use crate::app::{WholeBranchReviewState, CraApp, Screen};
 use crate::ui::theme;
 
 impl CraApp {
@@ -17,13 +17,27 @@ impl CraApp {
                 return;
             }
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::G))
-                && !self.branch_pass_running()
+                && !self.whole_branch_review_running()
             {
-                self.start_branch_pass(ctx);
+                self.start_whole_branch_review(ctx);
+            }
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::N)) {
+                self.open_followup();
+                return;
             }
         }
 
-        ui.heading("Review complete");
+        // An early exit opens this screen too (End session on the review screen), and
+        // a summary that says "complete" over a partially reviewed plan would be
+        // claiming a review that never happened.
+        let complete =
+            self.plan.as_ref().map(|p| p.decided_total >= p.total_units()).unwrap_or(true);
+        ui.heading(if complete { "Review complete" } else { "Review in progress" });
+        if !complete {
+            ui.label(theme::dim(
+                "the session was ended early — undecided units resume from the file picker [F]",
+            ));
+        }
         ui.add_space(6.0);
         if let Some(p) = &self.plan {
             let (decided, committed) = self.db.decision_counts(p.session_id);
@@ -51,6 +65,30 @@ impl CraApp {
         }
         ui.add_space(8.0);
         ui.horizontal(|ui| {
+            let open_notes =
+                self.repo.as_ref().map(|r| self.db.count_open_notes(&r.path)).unwrap_or(0);
+            if ui
+                .button(format!("Follow-up notes ({open_notes}) [N]"))
+                .on_hover_text(
+                    "triage the notes left during review, then hand the checked ones to a \
+                     model with room for bigger changes",
+                )
+                .clicked()
+            {
+                self.open_followup();
+                return;
+            }
+            ui.separator();
+            if ui
+                .button("Model evaluation [Ctrl+E]")
+                .on_hover_text(
+                    "which model's suggestions you actually take, and what each one costs",
+                )
+                .clicked()
+            {
+                self.open_eval();
+                return;
+            }
             if ui.button("Back to files [F]").clicked() {
                 self.screen = Screen::FilePicker;
             }
@@ -67,32 +105,32 @@ impl CraApp {
         if self.plan.is_some() && !recheck {
             ui.add_space(10.0);
             ui.separator();
-            self.branch_pass_section(ctx, ui);
+            self.whole_branch_review_section(ctx, ui);
         }
         self.evidence_window(ctx);
     }
 
-    /// The cross-cutting pass: each unit was judged in isolation, so this is
-    /// where the models look at the branch as one thing.
-    fn branch_pass_section(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
-        theme::section_title(ui, "BRANCH PASS — CROSS-CUTTING FINDINGS");
+    /// The whole-branch review finds interactions that isolated unit reviews
+    /// cannot show.
+    fn whole_branch_review_section(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        theme::section_title(ui, "WHOLE-BRANCH REVIEW — CROSS-CUTTING FINDINGS");
         ui.label(theme::dim(
-            "Each unit was judged on its own. This pass hands every enabled model the whole \
+            "Each unit was judged on its own. This review gives every enabled model the whole \
 branch diff (and the repository) to look for what no single unit shows: hunks that contradict \
 each other, half-applied renames, dead code left behind, the missing test. Findings are \
 recorded and yours to dismiss — nothing is edited.",
         ));
         ui.add_space(4.0);
 
-        let running = self.branch_pass_running();
+        let running = self.whole_branch_review_running();
         ui.horizontal(|ui| {
-            let label = if self.branch_pass.is_empty() {
-                "▶ Run branch pass [G]"
+            let label = if self.whole_branch_review.is_empty() {
+                "▶ Run whole-branch review [G]"
             } else {
-                "↻ Re-run branch pass [G]"
+                "↻ Re-run whole-branch review [G]"
             };
             if ui.add_enabled(!running, egui::Button::new(RichText::new(label).strong())).clicked() {
-                self.start_branch_pass(ctx);
+                self.start_whole_branch_review(ctx);
             }
             let open = self.findings.iter().filter(|r| !r.dismissed).count();
             if open > 0 && ui.button("⧉ copy findings").on_hover_text("as markdown").clicked() {
@@ -101,29 +139,37 @@ recorded and yours to dismiss — nothing is edited.",
         });
 
         // Per-model status row.
-        if !self.branch_pass.is_empty() {
+        if !self.whole_branch_review.is_empty() {
             ui.horizontal_wrapped(|ui| {
-                for (i, slot) in self.settings.models.iter().enumerate() {
-                    match self.branch_pass.get(i) {
-                        Some(BranchPassState::Idle) | None => continue,
+                for (i, model_config) in self.settings.models.iter().enumerate() {
+                    match self.whole_branch_review.get(i) {
+                        Some(WholeBranchReviewState::Idle) | None => continue,
                         Some(state) => {
                             ui.label(
-                                RichText::new(&slot.name)
+                                RichText::new(&model_config.name)
                                     .monospace()
                                     .small()
                                     .color(theme::model_color(i)),
                             );
                             match state {
-                                BranchPassState::Pending => {
+                                WholeBranchReviewState::Pending(live) => {
                                     ui.spinner();
+                                    let snap = live.snapshot();
+                                    // The whole-branch review runs on a doubled deadline.
+                                    ui.label(theme::dim(
+                                        &snap.clock(self.settings.model_timeout_secs.saturating_mul(2)),
+                                    ));
+                                    if let Some(a) = snap.activity_line() {
+                                        ui.label(theme::dim(&a));
+                                    }
                                 }
-                                BranchPassState::Done { n, latency_ms } => {
+                                WholeBranchReviewState::Done { n, latency_ms } => {
                                     ui.label(theme::dim(&format!("{n} finding(s) · {latency_ms} ms")));
                                 }
-                                BranchPassState::Failed(e) => {
+                                WholeBranchReviewState::Failed(e) => {
                                     ui.colored_label(theme::BAD, crate::app::truncate(e, 90));
                                 }
-                                BranchPassState::Idle => {}
+                                WholeBranchReviewState::Idle => {}
                             }
                             ui.add_space(10.0);
                         }
@@ -203,7 +249,7 @@ recorded and yours to dismiss — nothing is edited.",
                         });
                     ui.add_space(4.0);
                 }
-                let done = !self.branch_pass.is_empty() && !self.branch_pass_running();
+                let done = !self.whole_branch_review.is_empty() && !self.whole_branch_review_running();
                 if done && self.findings.iter().all(|r| r.dismissed) {
                     ui.label(theme::dim(if self.findings.is_empty() {
                         "no cross-cutting findings reported"
