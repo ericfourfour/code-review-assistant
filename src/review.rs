@@ -40,19 +40,47 @@ pub struct ReviewFile {
     /// unit shift it.
     pub edits: Vec<(u32, i64)>,
     pub decided: usize,
+    /// What the diff did to this file, as `(added, removed)` lines. Both zero
+    /// for a plan with no diff behind it, which is what a re-check is.
+    pub churn: (usize, usize),
+    /// Lines in the file as it sits on disk, or 0 when it could not be read.
+    /// Only a scale for the rest — the picker says how much of a file is up
+    /// for review, and "38 lines" means something different in a 60-line file
+    /// than in a 2,000-line one.
+    pub total_lines: usize,
 }
 
 impl ReviewFile {
+    /// A file with no measurements taken. The picker's counts are filled in by
+    /// whoever has the diff and the working tree to hand; everywhere else
+    /// (a re-check, the tests) they stay zero and simply go unshown.
+    pub fn new(path: String, units: Vec<ReviewUnit>) -> Self {
+        ReviewFile { path, units, edits: Vec::new(), decided: 0, churn: (0, 0), total_lines: 0 }
+    }
+
     /// How far the given (original) line has drifted on disk: the sum of the
     /// deltas of every applied edit that started above it. Units are
     /// disjoint, so comparing original start lines is exact.
     pub fn offset_for(&self, start_line: u32) -> i64 {
-        self.edits
-            .iter()
-            .filter(|(at, _)| *at < start_line)
-            .map(|(_, d)| d)
-            .sum()
+        self.edits.iter().filter(|(at, _)| *at < start_line).map(|(_, d)| d).sum()
     }
+
+    /// Lines the reviewer is actually being asked to read: every unit's own
+    /// lines, without the context shown around them. Units in a file are
+    /// disjoint, so the spans add up without double-counting.
+    pub fn review_lines(&self) -> usize {
+        self.units.iter().map(|u| u.raw_lines().len()).sum()
+    }
+}
+
+/// Lines in a file of the checkout, or 0 when there is nothing to read — a
+/// deleted file, or a plan whose repository has moved on. Unknown is reported
+/// as a number the picker can recognise rather than as an error, because a
+/// missing line count is worth exactly one dash in a list and nothing more.
+pub fn file_line_count(repo: &str, path: &str) -> usize {
+    std::fs::read_to_string(Path::new(repo).join(path))
+        .map(|s| s.lines().count())
+        .unwrap_or(0)
 }
 
 pub struct ReviewPlan {
@@ -67,6 +95,10 @@ pub struct ReviewPlan {
     pub file_idx: usize,
     pub unit_idx: usize,
     pub decided_total: usize,
+    /// Units the diff offered but the plan left out because this repository
+    /// already holds a verdict on them. Shown so a short plan reads as
+    /// "the rest is done", not "the extractor missed things".
+    pub skipped_decided: usize,
 }
 
 impl ReviewPlan {
@@ -85,6 +117,32 @@ impl ReviewPlan {
         let f = self.files.get(self.file_idx)?;
         let u = f.units.get(self.unit_idx)?;
         Some((f, u))
+    }
+
+    /// The unit the walk will offer after the current one, without moving —
+    /// what a prefetch queries while the current unit is still being decided.
+    pub fn peek_next(&self) -> Option<&ReviewUnit> {
+        let f = self.files.get(self.file_idx)?;
+        if let Some(u) = f.units.get(self.unit_idx + 1) {
+            return Some(u);
+        }
+        self.files
+            .get(self.file_idx + 1..)?
+            .iter()
+            .find_map(|f| f.units.first())
+    }
+
+    /// Push the current unit to the end of its file, so the walk offers it
+    /// after everything else there. Returns false when nothing follows it in
+    /// the file — last place is where it already is.
+    pub fn defer_current(&mut self) -> bool {
+        let Some(f) = self.files.get_mut(self.file_idx) else { return false };
+        if self.unit_idx + 1 >= f.units.len() {
+            return false;
+        }
+        let u = f.units.remove(self.unit_idx);
+        f.units.push(u);
+        true
     }
 
     /// Advance to the next unit. Returns false when the plan is exhausted.
@@ -141,13 +199,9 @@ impl ReviewPlan {
 /// comments, not cryptographic.
 pub fn blind_order(seed: u64, n: usize) -> Vec<usize> {
     let mut order: Vec<usize> = (0..n).collect();
-    let mut state = seed
-        .wrapping_mul(6364136223846793005)
-        .wrapping_add(1442695040888963407);
+    let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
     for i in (1..n).rev() {
-        state = state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         let j = (state >> 33) as usize % (i + 1);
         order.swap(i, j);
     }
@@ -179,11 +233,7 @@ pub enum Choice {
 #[derive(Clone)]
 pub enum Provenance {
     Unchanged,
-    Model {
-        name: String,
-        coauthor: String,
-        edited: bool,
-    },
+    Model { name: String, coauthor: String, edited: bool },
     Human,
 }
 
@@ -191,14 +241,8 @@ impl Provenance {
     pub fn source_str(&self) -> String {
         match self {
             Provenance::Unchanged => "original".into(),
-            Provenance::Model {
-                name,
-                edited: false,
-                ..
-            } => name.clone(),
-            Provenance::Model {
-                name, edited: true, ..
-            } => format!("{name}+human-edited"),
+            Provenance::Model { name, edited: false, .. } => name.clone(),
+            Provenance::Model { name, edited: true, .. } => format!("{name}+human-edited"),
             Provenance::Human => "human-authored".into(),
         }
     }
@@ -218,11 +262,7 @@ pub fn derive_provenance(
     match (chosen, chosen_model) {
         (Some(Choice::Candidate(_)), Some((name, coauthor))) => {
             let edited = candidate_baseline.map(|b| b != editor_text).unwrap_or(true);
-            Provenance::Model {
-                name: name.to_string(),
-                coauthor: coauthor.to_string(),
-                edited,
-            }
+            Provenance::Model { name: name.to_string(), coauthor: coauthor.to_string(), edited }
         }
         _ => Provenance::Human,
     }
@@ -252,10 +292,9 @@ pub fn apply_edit(
     splice_lines(repo, unit.file(), start, unit.raw_lines(), new_lines)
 }
 
-/// Swap `expect` for `replace` at `start0` (0-based), refusing to touch the
-/// file unless it still contains exactly `expect` there. The same primitive
-/// applies an edit and — with the arguments swapped — reverts one that a
-/// failed validation should not leave behind.
+/// Safely apply or undo a reviewed line edit in a working-tree file,
+/// refusing to modify the file if its expected contents are no longer present
+/// and returning the resulting line-count delta for tracking later edits.
 pub fn splice_lines(
     repo: &str,
     file_rel: &str,
@@ -264,22 +303,21 @@ pub fn splice_lines(
     replace: &[String],
 ) -> Result<i64, String> {
     let path = Path::new(repo).join(file_rel);
-    let content =
-        std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let content = std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let had_trailing_newline = content.ends_with('\n');
     let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
 
-    let end = start0 + expect.len().saturating_sub(1); // inclusive
-    if expect.is_empty() || end >= lines.len() {
+    let end = start0 + expect.len();
+    if end > lines.len() {
         return Err(format!(
             "line range {}..{} out of bounds for {file_rel} ({} lines) — file changed on disk?",
             start0 + 1,
-            end + 1,
+            end,
             lines.len()
         ));
     }
     // Sanity check: the file should still contain what we think it does.
-    let matches = lines[start0..=end].iter().zip(expect).all(|(a, b)| a == b);
+    let matches = lines[start0..end].iter().zip(expect).all(|(a, b)| a == b);
     if !matches {
         return Err(format!(
             "content mismatch at {file_rel}:{} — file changed on disk since the diff was taken",
@@ -287,13 +325,101 @@ pub fn splice_lines(
         ));
     }
 
-    lines.splice(start0..=end, replace.iter().cloned());
+    lines.splice(start0..end, replace.iter().cloned());
     let mut out = lines.join("\n");
     if had_trailing_newline {
         out.push('\n');
     }
     std::fs::write(&path, out).map_err(|e| format!("write {}: {e}", path.display()))?;
     Ok(replace.len() as i64 - expect.len() as i64)
+}
+/// A unit whose snapshot no longer matches the file: the span that now sits
+/// where the unit's lines used to be, held so the review screen can offer a
+/// reload instead of a dead end.
+#[derive(Clone)]
+pub struct StaleUnit {
+    /// 0-based first line of the span on disk.
+    pub start0: usize,
+    pub lines: Vec<String>,
+}
+
+/// Where a unit whose expected lines failed to match actually sits on disk.
+pub enum Reanchor {
+    /// The exact lines were found at this 0-based start — the file merely
+    /// grew or shrank above the unit, and the edit can land there unchanged.
+    Moved(usize),
+    /// The lines themselves are gone: the unit was changed in place. Carries
+    /// the best guess at what replaced it, for the human to look at.
+    Changed(StaleUnit),
+}
+
+/// After a content mismatch, search the file as it sits on disk for the
+/// unit's expected lines. An exact block match nearest the expected position
+/// means pure drift; failing that, the span is guessed from whichever of the
+/// unit's first and last lines survived, so the caller has something honest
+/// to show.
+pub fn reanchor(
+    repo: &str,
+    file_rel: &str,
+    expect: &[String],
+    hint_start0: usize,
+) -> Result<Reanchor, String> {
+    let path = Path::new(repo).join(file_rel);
+    let content =
+        std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+    if expect.is_empty() {
+        return Err(format!("nothing to anchor in {file_rel}"));
+    }
+
+    let nearest = |it: &mut dyn Iterator<Item = usize>| it.min_by_key(|i| i.abs_diff(hint_start0));
+
+    if lines.len() >= expect.len() {
+        let mut hits = (0..=lines.len() - expect.len())
+            .filter(|&i| lines[i..i + expect.len()].iter().zip(expect).all(|(a, b)| a == b));
+        if let Some(i) = nearest(&mut hits) {
+            return Ok(Reanchor::Moved(i));
+        }
+    }
+
+    // The block is gone. If its first line survived, take from there to the
+    // last line (searched within a bounded horizon, since the span may have
+    // grown) — or to the old length when the last line is gone too.
+    let first = &expect[0];
+    let mut firsts = lines.iter().enumerate().filter(|(_, l)| *l == first).map(|(i, _)| i);
+    if let Some(i) = nearest(&mut firsts) {
+        let horizon = (i + expect.len() + 32).min(lines.len());
+        let last = &expect[expect.len() - 1];
+        let j = (i..horizon)
+            .rev()
+            .find(|&j| &lines[j] == last)
+            .unwrap_or_else(|| (i + expect.len()).min(lines.len()) - 1);
+        return Ok(Reanchor::Changed(StaleUnit { start0: i, lines: lines[i..=j].to_vec() }));
+    }
+
+    // Not even the edges survived: show whatever now occupies the expected
+    // position, old length, clamped to the file.
+    let start0 = hint_start0.min(lines.len().saturating_sub(expect.len()));
+    let end = (start0 + expect.len()).min(lines.len());
+    Ok(Reanchor::Changed(StaleUnit { start0, lines: lines[start0..end].to_vec() }))
+}
+
+/// Render a context excerpt straight from the file on disk — the same
+/// numbered, `>`-marked shape the extractors produce — so a reloaded unit
+/// shows in the UI like any other.
+pub fn disk_context(repo: &str, file_rel: &str, start0: usize, len: usize, surround: usize) -> String {
+    let path = Path::new(repo).join(file_rel);
+    let Ok(content) = std::fs::read_to_string(&path) else { return String::new() };
+    let lines: Vec<&str> = content.lines().collect();
+    let lo = start0.saturating_sub(surround);
+    let hi = (start0 + len + surround).min(lines.len());
+    let mut out = String::new();
+    for (i, l) in lines[lo..hi].iter().enumerate() {
+        let no0 = lo + i;
+        let marker = if no0 >= start0 && no0 < start0 + len { '>' } else { ' ' };
+        out.push_str(&format!("{marker}{:>5}| {l}\n", no0 + 1));
+    }
+    out
 }
 
 /// Run the configured validation command in the repository, whitespace-
@@ -302,9 +428,7 @@ pub fn splice_lines(
 /// where compilers and test runners put the part worth reading.
 pub fn run_check(repo: &str, command: &str, timeout: Duration) -> Result<(), String> {
     let argv: Vec<&str> = command.split_whitespace().collect();
-    let Some(program) = argv.first() else {
-        return Err("empty check command".into());
-    };
+    let Some(program) = argv.first() else { return Err("empty check command".into()) };
     let started = Instant::now();
     let mut child = crate::gitio::hidden_command(program)
         .args(&argv[1..])
@@ -406,11 +530,7 @@ fn subject_scope(kinds: &[UnitKind]) -> &'static str {
     }
 }
 
-fn push_model_trailers(
-    msg: &mut String,
-    provenance: &Provenance,
-    model_info: Option<(&str, &str)>,
-) {
+fn push_model_trailers(msg: &mut String, provenance: &Provenance, model_info: Option<(&str, &str)>) {
     if let Provenance::Model { coauthor, .. } = provenance {
         if !coauthor.trim().is_empty() {
             msg.push_str(&format!("Co-authored-by: {coauthor}\n"));
@@ -431,10 +551,7 @@ fn push_model_trailers(
 /// last decision's message once `Commit and Continue` finally runs `git
 /// commit`. `entries` must be non-empty and share the same `file`.
 pub fn commit_message_batch(entries: &[PendingDecision]) -> String {
-    assert!(
-        !entries.is_empty(),
-        "commit_message_batch needs at least one decision"
-    );
+    assert!(!entries.is_empty(), "commit_message_batch needs at least one decision");
     let kinds: Vec<UnitKind> = entries.iter().map(|e| e.kind).collect();
     if entries.len() == 1 {
         let e = &entries[0];
@@ -460,13 +577,7 @@ pub fn commit_message_batch(entries: &[PendingDecision]) -> String {
             UnitKind::Code => "Change-provenance",
         };
         msg.push_str(&format!("{trailer}: {}\n", e.provenance.source_str()));
-        push_model_trailers(
-            &mut msg,
-            &e.provenance,
-            e.model_info
-                .as_ref()
-                .map(|(m, ef)| (m.as_str(), ef.as_str())),
-        );
+        push_model_trailers(&mut msg, &e.provenance, e.model_info.as_ref().map(|(m, ef)| (m.as_str(), ef.as_str())));
         return msg;
     }
 
@@ -475,17 +586,10 @@ pub fn commit_message_batch(entries: &[PendingDecision]) -> String {
         "review(comments)" => "comment decisions",
         _ => "decisions",
     };
-    let mut msg = format!(
-        "{}: {} {noun} in {file}\n\n",
-        subject_scope(&kinds),
-        entries.len()
-    );
+    let mut msg =
+        format!("{}: {} {noun} in {file}\n\n", subject_scope(&kinds), entries.len());
     for e in entries {
-        msg.push_str(&format!(
-            "- {} {file}:{}",
-            action_verb(e.kind, e.action),
-            e.line
-        ));
+        msg.push_str(&format!("- {} {file}:{}", action_verb(e.kind, e.action), e.line));
         let mut detail: Vec<String> = vec![e.provenance.source_str()];
         if let Some((model, _)) = &e.model_info {
             if !model.trim().is_empty() {
@@ -546,9 +650,7 @@ mod tests {
             end_line: 3,
             raw_lines: vec!["    // a".into(), "    // b".into()],
             indent: "    ".into(),
-            style: CommentStyle::Line {
-                prefix: "//".into(),
-            },
+            style: CommentStyle::Line { prefix: "//".into() },
             context: String::new(),
             hunk_header: String::new(),
             has_added: true,
@@ -577,11 +679,7 @@ mod tests {
         let first_slots: std::collections::HashSet<usize> = (0..60)
             .map(|line| blind_order(unit_seed("src/lib.rs", line), 3)[0])
             .collect();
-        assert_eq!(
-            first_slots.len(),
-            3,
-            "every slot should lead sometimes: {first_slots:?}"
-        );
+        assert_eq!(first_slots.len(), 3, "every slot should lead sometimes: {first_slots:?}");
     }
 
     #[test]
@@ -693,12 +791,7 @@ mod tests {
     fn batch_documents_every_pending_decision() {
         let entries = vec![
             pending("src/lib.rs", 2, Action::Delete, "restates the code"),
-            pending(
-                "src/lib.rs",
-                9,
-                Action::Rewrite,
-                "clarifies the retry limit",
-            ),
+            pending("src/lib.rs", 9, Action::Rewrite, "clarifies the retry limit"),
         ];
         let msg = commit_message_batch(&entries);
         assert!(msg.starts_with("review(comments): 2 comment decisions in src/lib.rs"));
@@ -720,12 +813,7 @@ mod tests {
             "fn main() {\n    // a\n    // b\n    x();\n}\n",
         )
         .unwrap();
-        let file = ReviewFile {
-            path: "src/lib.rs".into(),
-            units: vec![],
-            edits: Vec::new(),
-            decided: 0,
-        };
+        let file = ReviewFile::new("src/lib.rs".into(), vec![]);
         let wrapped = ReviewUnit::Comment(unit());
         let delta = apply_edit(
             dir.to_str().unwrap(),
@@ -745,27 +833,83 @@ mod tests {
 
     #[test]
     fn offsets_only_count_edits_above_the_unit() {
-        let mut f = ReviewFile {
-            path: "a".into(),
-            units: vec![],
-            edits: Vec::new(),
-            decided: 0,
-        };
+        let mut f = ReviewFile::new("a".into(), vec![]);
         f.edits.push((50, 3));
-        assert_eq!(
-            f.offset_for(10),
-            0,
-            "an edit below must not shift a unit above it"
-        );
+        assert_eq!(f.offset_for(10), 0, "an edit below must not shift a unit above it");
         assert_eq!(f.offset_for(60), 3);
         f.edits.push((5, -2));
         assert_eq!(f.offset_for(10), -2);
         assert_eq!(f.offset_for(60), 1, "deltas above accumulate");
-        assert_eq!(
-            f.offset_for(5),
-            0,
-            "an edit at the unit's own line is that unit's own"
-        );
+        assert_eq!(f.offset_for(5), 0, "an edit at the unit's own line is that unit's own");
+    }
+
+    #[test]
+    fn reanchor_finds_a_block_that_merely_drifted() {
+        let dir = crate::testkit::TempDir::new("drifted");
+        std::fs::write(dir.path().join("a.rs"), "new\nlines\none\ntwo\nthree\n").unwrap();
+        let repo = dir.path().to_string_lossy().to_string();
+        let expect = vec!["two".to_string(), "three".to_string()];
+        // The block used to start at line 2 (0-based 1); two inserted lines
+        // above pushed it to 0-based 3.
+        match reanchor(&repo, "a.rs", &expect, 1).unwrap() {
+            Reanchor::Moved(start0) => assert_eq!(start0, 3),
+            Reanchor::Changed(_) => panic!("an intact block must re-anchor, not resign"),
+        }
+    }
+
+    #[test]
+    fn reanchor_prefers_the_occurrence_nearest_the_expected_position() {
+        let dir = crate::testkit::TempDir::new("nearest");
+        std::fs::write(dir.path().join("a.rs"), "x\nx\na\na\na\na\nx\nx\nx\n").unwrap();
+        let repo = dir.path().to_string_lossy().to_string();
+        let expect = vec!["a".to_string()];
+        match reanchor(&repo, "a.rs", &expect, 4).unwrap() {
+            Reanchor::Moved(start0) => assert_eq!(start0, 4),
+            Reanchor::Changed(_) => panic!("the block exists"),
+        }
+    }
+
+    #[test]
+    fn reanchor_reports_what_replaced_a_changed_block() {
+        let dir = crate::testkit::TempDir::new("changed");
+        // The middle line of the unit was rewritten in place, and the span
+        // grew by a line; first and last lines survive as edges.
+        std::fs::write(dir.path().join("a.rs"), "one\nfirst\nEDITED\nEXTRA\nlast\nfive\n")
+            .unwrap();
+        let repo = dir.path().to_string_lossy().to_string();
+        let expect =
+            vec!["first".to_string(), "middle".to_string(), "last".to_string()];
+        match reanchor(&repo, "a.rs", &expect, 1).unwrap() {
+            Reanchor::Changed(s) => {
+                assert_eq!(s.start0, 1);
+                assert_eq!(s.lines, vec!["first", "EDITED", "EXTRA", "last"]);
+            }
+            Reanchor::Moved(_) => panic!("the content changed; there is nothing to move to"),
+        }
+    }
+
+    #[test]
+    fn reanchor_falls_back_to_the_expected_window_when_nothing_survives() {
+        let dir = crate::testkit::TempDir::new("gone");
+        std::fs::write(dir.path().join("a.rs"), "a\nb\nc\nd\n").unwrap();
+        let repo = dir.path().to_string_lossy().to_string();
+        let expect = vec!["was".to_string(), "here".to_string()];
+        match reanchor(&repo, "a.rs", &expect, 1).unwrap() {
+            Reanchor::Changed(s) => {
+                assert_eq!(s.start0, 1);
+                assert_eq!(s.lines, vec!["b", "c"]);
+            }
+            Reanchor::Moved(_) => panic!("nothing matches"),
+        }
+    }
+
+    #[test]
+    fn disk_context_marks_the_span_and_numbers_from_one() {
+        let dir = crate::testkit::TempDir::new("diskctx");
+        std::fs::write(dir.path().join("a.rs"), "one\ntwo\nthree\nfour\n").unwrap();
+        let repo = dir.path().to_string_lossy().to_string();
+        let ctx = disk_context(&repo, "a.rs", 1, 2, 1);
+        assert_eq!(ctx, "     1| one\n>    2| two\n>    3| three\n     4| four\n");
     }
 
     #[test]
@@ -776,16 +920,10 @@ mod tests {
         let old = vec!["two".to_string()];
         let new = vec!["2a".to_string(), "2b".to_string()];
         assert_eq!(splice_lines(&repo, "a.rs", 1, &old, &new).unwrap(), 1);
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join("a.rs")).unwrap(),
-            "one\n2a\n2b\nthree\n"
-        );
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.rs")).unwrap(), "one\n2a\n2b\nthree\n");
         // The exact inverse call restores the file byte for byte.
         assert_eq!(splice_lines(&repo, "a.rs", 1, &new, &old).unwrap(), -1);
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join("a.rs")).unwrap(),
-            "one\ntwo\nthree\n"
-        );
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.rs")).unwrap(), "one\ntwo\nthree\n");
     }
 
     #[test]
@@ -793,10 +931,7 @@ mod tests {
         let mut e = pending("src/lib.rs", 42, Action::Rewrite, "off by one");
         e.kind = UnitKind::Code;
         let msg = commit_message_batch(&[e]);
-        assert!(
-            msg.starts_with("review(code): revise code in src/lib.rs:42"),
-            "{msg}"
-        );
+        assert!(msg.starts_with("review(code): revise code in src/lib.rs:42"), "{msg}");
         assert!(msg.contains("Change-provenance: claude"), "{msg}");
         assert!(!msg.contains("Comment-provenance"), "{msg}");
     }
@@ -809,10 +944,7 @@ mod tests {
             pending("src/lib.rs", 2, Action::Delete, "restates the code"),
             code,
         ]);
-        assert!(
-            msg.starts_with("review: 2 decisions in src/lib.rs"),
-            "{msg}"
-        );
+        assert!(msg.starts_with("review: 2 decisions in src/lib.rs"), "{msg}");
         assert!(msg.contains("delete src/lib.rs:2"), "{msg}");
         assert!(msg.contains("revise src/lib.rs:9"), "{msg}");
     }
@@ -824,38 +956,23 @@ mod tests {
         let repo = dir.path().to_string_lossy().to_string();
         let timeout = Duration::from_secs(10);
 
-        let ok = FakeCli::new(
-            &dir,
-            "check-ok",
-            FakeCliSpec {
-                reply: "all good",
-                ..Default::default()
-            },
-        );
+        let ok = FakeCli::new(&dir, "check-ok", FakeCliSpec { reply: "all good", ..Default::default() });
         assert!(run_check(&repo, &ok.command(), timeout).is_ok());
 
         let bad = FakeCli::new(
             &dir,
             "check-bad",
-            FakeCliSpec {
-                reply: "error[E0308]: mismatched types",
-                exit_code: 2,
-                ..Default::default()
-            },
+            FakeCliSpec { reply: "error[E0308]: mismatched types", exit_code: 2, ..Default::default() },
         );
         let err = run_check(&repo, &bad.command(), timeout).unwrap_err();
         // The command's own output is the error the reviewer sees.
         assert!(err.contains("mismatched types"), "{err}");
         assert!(err.contains("failed"), "{err}");
 
-        assert!(
-            run_check(&repo, "definitely-not-a-real-binary-xyz", timeout)
-                .unwrap_err()
-                .contains("spawn")
-        );
-        assert!(run_check(&repo, "   ", timeout)
+        assert!(run_check(&repo, "definitely-not-a-real-binary-xyz", timeout)
             .unwrap_err()
-            .contains("empty"));
+            .contains("spawn"));
+        assert!(run_check(&repo, "   ", timeout).unwrap_err().contains("empty"));
     }
 
     #[test]
