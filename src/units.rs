@@ -1,5 +1,7 @@
 //! One reviewable unit — a comment run or a code change — and the plan
-//! assembly that merges the two extractors into a single ordered walk.
+//! assembly that merges the two extractors into a single ordered review.
+
+use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
@@ -10,7 +12,7 @@ use crate::models::Action;
 
 /// UI label for a verdict, phrased for what was reviewed: a code unit's Keep
 /// is an "approve" and its Rewrite a "revise" — the words the code prompt
-/// itself uses. Found by this app's own branch pass: the badges said KEEP
+/// itself uses. Found by this app's own whole-branch review: the badges said KEEP
 /// next to previews saying "approve — sound as written".
 pub fn action_label(action: Action, kind: UnitKind) -> &'static str {
     match (kind, action) {
@@ -153,10 +155,10 @@ impl ReviewUnit {
     }
 }
 
-/// Everything reviewable in the diff, per file, in walk order. Comment units
+/// Everything reviewable in the diff, per file, in review order. Comment units
 /// that fall inside a code unit's region are absorbed by it — the units in a
 /// file must stay disjoint and ordered or the line-offset bookkeeping that
-/// lets sequential edits land correctly falls apart, and the code verdict
+/// lets sequential edits apply correctly falls apart, and the code verdict
 /// covers the comments it encloses anyway.
 pub fn assemble(
     repo: &str,
@@ -164,6 +166,7 @@ pub fn assemble(
     context_lines: usize,
     include_comments: bool,
     include_code: bool,
+    new_side: crate::gitio::NewSide,
 ) -> Vec<(String, Vec<ReviewUnit>)> {
     let comment_files = if include_comments {
         crate::comments::extract_units(files, context_lines)
@@ -171,7 +174,7 @@ pub fn assemble(
         Vec::new()
     };
     let code_files = if include_code {
-        crate::codeunits::extract(repo, files, context_lines)
+        crate::codeunits::extract(repo, files, context_lines, new_side)
     } else {
         Vec::new()
     };
@@ -201,6 +204,35 @@ pub fn assemble(
         }
     }
     out
+}
+
+/// How a decided unit is recognised across sessions: by its file and its
+/// exact text. Line numbers are useless as identity — every edit above a unit
+/// moves it — and the unit itself is what a verdict was about.
+pub fn decided_key(unit: &ReviewUnit) -> (String, String) {
+    (unit.file().to_string(), unit.raw_lines().join("\n"))
+}
+
+/// Drop units already judged in this repository, and any file left with
+/// nothing to review. Returns how many were dropped.
+///
+/// A verdict is a verdict whatever it was: keep, rewrite, delete and flag all
+/// count, because all four are the human having looked. Skipping a unit
+/// during a review records nothing, so a skip still comes back — that is the
+/// difference between "not now" and "decided".
+pub fn drop_decided(
+    files: &mut Vec<(String, Vec<ReviewUnit>)>,
+    decided: &HashSet<(String, String)>,
+) -> usize {
+    if decided.is_empty() {
+        return 0;
+    }
+    let before: usize = files.iter().map(|(_, u)| u.len()).sum();
+    for (_, units) in files.iter_mut() {
+        units.retain(|u| !decided.contains(&decided_key(u)));
+    }
+    files.retain(|(_, units)| !units.is_empty());
+    before - files.iter().map(|(_, u)| u.len()).sum::<usize>()
 }
 
 #[cfg(test)]
@@ -245,7 +277,7 @@ diff --git a/src/main.rs b/src/main.rs
     fn comments_inside_a_code_region_are_absorbed_and_standalone_ones_kept() {
         let dir = repo_with_file();
         let files = crate::diffparse::parse(DIFF);
-        let out = assemble(&dir.path().to_string_lossy(), &files, 12, true, true);
+        let out = assemble(&dir.path().to_string_lossy(), &files, 12, true, true, crate::gitio::NewSide::WorkTree);
         assert_eq!(out.len(), 1);
         let units = &out[0].1;
         // The comment inside the changed code is the code unit's to judge; the
@@ -263,12 +295,70 @@ diff --git a/src/main.rs b/src/main.rs
     fn toggles_select_which_units_exist() {
         let dir = repo_with_file();
         let files = crate::diffparse::parse(DIFF);
-        let comments_only = assemble(&dir.path().to_string_lossy(), &files, 12, true, false);
+        let comments_only = assemble(&dir.path().to_string_lossy(), &files, 12, true, false, crate::gitio::NewSide::WorkTree);
         assert!(comments_only[0].1.iter().all(|u| !u.is_code()));
         assert_eq!(comments_only[0].1.len(), 2, "both comment runs, nothing absorbs them");
-        let code_only = assemble(&dir.path().to_string_lossy(), &files, 12, false, true);
+        let code_only = assemble(&dir.path().to_string_lossy(), &files, 12, false, true, crate::gitio::NewSide::WorkTree);
         assert!(code_only[0].1.iter().all(|u| u.is_code()));
         assert_eq!(code_only[0].1.len(), 1);
+    }
+
+    #[test]
+    fn units_already_decided_leave_the_plan_and_take_emptied_files_with_them() {
+        let dir = repo_with_file();
+        let files = crate::diffparse::parse(DIFF);
+        let mut extracted = assemble(&dir.path().to_string_lossy(), &files, 12, true, true, crate::gitio::NewSide::WorkTree);
+        assert_eq!(extracted[0].1.len(), 2);
+
+        // Nothing decided yet: the plan is untouched and the review is free.
+        let mut none: Vec<_> = extracted.clone_for_test();
+        assert_eq!(drop_decided(&mut none, &HashSet::new()), 0);
+        assert_eq!(none[0].1.len(), 2);
+
+        let decided: HashSet<(String, String)> =
+            [decided_key(&extracted[0].1[0])].into_iter().collect();
+        assert_eq!(drop_decided(&mut extracted, &decided), 1);
+        assert_eq!(extracted[0].1.len(), 1, "only the judged unit goes");
+        assert!(!extracted[0].1[0].is_code());
+
+        // The last unit in a file takes the file with it, or the picker would
+        // list a file with nothing behind it.
+        let decided: HashSet<(String, String)> =
+            [decided_key(&extracted[0].1[0])].into_iter().collect();
+        assert_eq!(drop_decided(&mut extracted, &decided), 1);
+        assert!(extracted.is_empty());
+    }
+
+    #[test]
+    fn a_unit_is_recognised_by_its_text_not_its_line_number() {
+        let dir = repo_with_file();
+        let files = crate::diffparse::parse(DIFF);
+        let extracted = assemble(&dir.path().to_string_lossy(), &files, 12, true, true, crate::gitio::NewSide::WorkTree);
+        let mut moved = extracted.clone_for_test();
+        // An edit above pushes the unit down the file. Same unit, same verdict.
+        if let ReviewUnit::Comment(c) = &mut moved[0].1[1] {
+            c.start_line += 40;
+            c.end_line += 40;
+        }
+        assert_eq!(decided_key(&extracted[0].1[1]), decided_key(&moved[0].1[1]));
+        // Different text in the same file is a different unit.
+        let mut edited = extracted.clone_for_test();
+        if let ReviewUnit::Comment(c) = &mut edited[0].1[1] {
+            c.raw_lines = vec!["// something else entirely".into()];
+        }
+        assert_ne!(decided_key(&extracted[0].1[1]), decided_key(&edited[0].1[1]));
+    }
+
+    /// `Vec<(String, Vec<ReviewUnit>)>` is not `Clone` on its own here only
+    /// because the tuple is built inline; this keeps the tests readable.
+    trait CloneForTest {
+        fn clone_for_test(&self) -> Vec<(String, Vec<ReviewUnit>)>;
+    }
+
+    impl CloneForTest for Vec<(String, Vec<ReviewUnit>)> {
+        fn clone_for_test(&self) -> Vec<(String, Vec<ReviewUnit>)> {
+            self.iter().map(|(p, u)| (p.clone(), u.clone())).collect()
+        }
     }
 
     #[test]
@@ -298,7 +388,7 @@ diff --git a/src/main.rs b/src/main.rs
     fn both_kinds_round_trip_through_json() {
         let dir = repo_with_file();
         let files = crate::diffparse::parse(DIFF);
-        let out = assemble(&dir.path().to_string_lossy(), &files, 12, true, true);
+        let out = assemble(&dir.path().to_string_lossy(), &files, 12, true, true, crate::gitio::NewSide::WorkTree);
         for unit in &out[0].1 {
             let json = serde_json::to_string(unit).unwrap();
             let back: ReviewUnit = serde_json::from_str(&json).unwrap();
@@ -312,7 +402,7 @@ diff --git a/src/main.rs b/src/main.rs
     fn code_edits_round_trip_verbatim_and_comment_edits_reindent() {
         let dir = repo_with_file();
         let files = crate::diffparse::parse(DIFF);
-        let out = assemble(&dir.path().to_string_lossy(), &files, 12, true, true);
+        let out = assemble(&dir.path().to_string_lossy(), &files, 12, true, true, crate::gitio::NewSide::WorkTree);
         let code = &out[0].1[0];
         assert_eq!(code.display_text(), code.raw_lines().join("\n"), "code shows as-is");
         assert_eq!(

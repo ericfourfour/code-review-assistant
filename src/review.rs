@@ -13,6 +13,9 @@ pub enum RefKind {
     Branch,
     Pr(u64),
     WorkingTree,
+    /// Only what `git add` has staged — the commit being prepared, reviewed
+    /// without the unstaged noise around it.
+    Staged,
     /// Re-judging comments already decided once, to measure how consistent the
     /// reviewer is with their own earlier self. Nothing is written to disk.
     Recheck,
@@ -24,6 +27,7 @@ impl RefKind {
             RefKind::Branch => "branch".into(),
             RefKind::Pr(n) => format!("PR #{n}"),
             RefKind::WorkingTree => "working tree".into(),
+            RefKind::Staged => "staged".into(),
             RefKind::Recheck => "re-check".into(),
         }
     }
@@ -34,14 +38,14 @@ pub struct ReviewFile {
     pub units: Vec<ReviewUnit>,
     /// Every edit applied to this file so far, as (original start line,
     /// line-count delta). Kept per edit rather than as one running total so
-    /// the walk may visit units in any order — riskiest first included — and
-    /// still land each edit exactly where it belongs: only edits *above* a
+    /// the review may visit units in any order — riskiest first included — and
+    /// still apply each edit exactly where it belongs: only edits *above* a
     /// unit shift it.
     pub edits: Vec<(u32, i64)>,
     pub decided: usize,
     /// What the diff did to this file, as `(added, removed)` lines. Both zero
     /// for a plan with no diff behind it, which is what a re-check is.
-    pub churn: (usize, usize),
+    pub line_changes: (usize, usize),
     /// Lines in the file as it sits on disk, or 0 when it could not be read.
     /// Only a scale for the rest — the picker says how much of a file is up
     /// for review, and "38 lines" means something different in a 60-line file
@@ -54,7 +58,7 @@ impl ReviewFile {
     /// whoever has the diff and the working tree to hand; everywhere else
     /// (a re-check, the tests) they stay zero and simply go unshown.
     pub fn new(path: String, units: Vec<ReviewUnit>) -> Self {
-        ReviewFile { path, units, edits: Vec::new(), decided: 0, churn: (0, 0), total_lines: 0 }
+        ReviewFile { path, units, edits: Vec::new(), decided: 0, line_changes: (0, 0), total_lines: 0 }
     }
 
     /// How far the given (original) line has drifted on disk: the sum of the
@@ -105,6 +109,15 @@ impl ReviewPlan {
         self.ref_kind == RefKind::Recheck
     }
 
+    /// Whether the lines under review are themselves uncommitted — a
+    /// working-tree or staged review. A keep there approves lines no commit
+    /// holds yet, so committing the decision must commit the file; in a
+    /// branch or PR review the kept lines are already in a commit and a keep
+    /// has nothing to add.
+    pub fn reviews_uncommitted(&self) -> bool {
+        matches!(self.ref_kind, RefKind::WorkingTree | RefKind::Staged)
+    }
+
     pub fn total_units(&self) -> usize {
         self.files.iter().map(|f| f.units.len()).sum()
     }
@@ -115,7 +128,7 @@ impl ReviewPlan {
         Some((f, u))
     }
 
-    /// The unit the walk will offer after the current one, without moving —
+    /// The unit the review will offer after the current one, without moving —
     /// what a prefetch queries while the current unit is still being decided.
     pub fn peek_next(&self) -> Option<&ReviewUnit> {
         let f = self.files.get(self.file_idx)?;
@@ -128,7 +141,7 @@ impl ReviewPlan {
             .find_map(|f| f.units.first())
     }
 
-    /// Push the current unit to the end of its file, so the walk offers it
+    /// Push the current unit to the end of its file, so the review offers it
     /// after everything else there. Returns false when nothing follows it in
     /// the file — last place is where it already is.
     pub fn defer_current(&mut self) -> bool {
@@ -187,7 +200,7 @@ impl ReviewPlan {
     }
 }
 
-/// The order to show candidates in, as display position -> slot index.
+/// The order to show candidates in, as display position -> model index.
 ///
 /// Deterministic in `seed` so the cards do not reshuffle on every repaint, and
 /// so re-reviewing the same comment presents it the same way. A plain
@@ -217,7 +230,7 @@ pub fn unit_seed(file: &str, start_line: u32) -> u64 {
 /// What the human picked (before free-form edits are considered).
 #[derive(Clone, PartialEq, Debug)]
 pub enum Choice {
-    /// Candidate from model slot i (index into the session's model list).
+    /// Candidate from model model i (index into the session's model list).
     Candidate(usize),
     /// Explicit "keep the original text".
     KeepOriginal,
@@ -340,9 +353,9 @@ pub struct StaleUnit {
 }
 
 /// Where a unit whose expected lines failed to match actually sits on disk.
-pub enum Reanchor {
+pub enum CurrentUnitLocation {
     /// The exact lines were found at this 0-based start — the file merely
-    /// grew or shrank above the unit, and the edit can land there unchanged.
+    /// grew or shrank above the unit, and the edit can be applied there unchanged.
     Moved(usize),
     /// The lines themselves are gone: the unit was changed in place. Carries
     /// the best guess at what replaced it, for the human to look at.
@@ -351,21 +364,21 @@ pub enum Reanchor {
 
 /// After a content mismatch, search the file as it sits on disk for the
 /// unit's expected lines. An exact block match nearest the expected position
-/// means pure drift; failing that, the span is guessed from whichever of the
+/// means only its line number changed; failing that, the span is guessed from whichever of the
 /// unit's first and last lines survived, so the caller has something honest
 /// to show.
-pub fn reanchor(
+pub fn find_unit_on_disk(
     repo: &str,
     file_rel: &str,
     expect: &[String],
     hint_start0: usize,
-) -> Result<Reanchor, String> {
+) -> Result<CurrentUnitLocation, String> {
     let path = Path::new(repo).join(file_rel);
     let content =
         std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
     if expect.is_empty() {
-        return Err(format!("nothing to anchor in {file_rel}"));
+        return Err(format!("no expected lines for {file_rel}"));
     }
 
     let nearest = |it: &mut dyn Iterator<Item = usize>| it.min_by_key(|i| i.abs_diff(hint_start0));
@@ -374,30 +387,30 @@ pub fn reanchor(
         let mut hits = (0..=lines.len() - expect.len())
             .filter(|&i| lines[i..i + expect.len()].iter().zip(expect).all(|(a, b)| a == b));
         if let Some(i) = nearest(&mut hits) {
-            return Ok(Reanchor::Moved(i));
+            return Ok(CurrentUnitLocation::Moved(i));
         }
     }
 
     // The block is gone. If its first line survived, take from there to the
-    // last line (searched within a bounded horizon, since the span may have
+    // last line (searched within a bounded range, since the span may have
     // grown) — or to the old length when the last line is gone too.
     let first = &expect[0];
     let mut firsts = lines.iter().enumerate().filter(|(_, l)| *l == first).map(|(i, _)| i);
     if let Some(i) = nearest(&mut firsts) {
-        let horizon = (i + expect.len() + 32).min(lines.len());
+        let search_end = (i + expect.len() + 32).min(lines.len());
         let last = &expect[expect.len() - 1];
-        let j = (i..horizon)
+        let j = (i..search_end)
             .rev()
             .find(|&j| &lines[j] == last)
             .unwrap_or_else(|| (i + expect.len()).min(lines.len()) - 1);
-        return Ok(Reanchor::Changed(StaleUnit { start0: i, lines: lines[i..=j].to_vec() }));
+        return Ok(CurrentUnitLocation::Changed(StaleUnit { start0: i, lines: lines[i..=j].to_vec() }));
     }
 
     // Not even the edges survived: show whatever now occupies the expected
     // position, old length, clamped to the file.
     let start0 = hint_start0.min(lines.len().saturating_sub(expect.len()));
     let end = (start0 + expect.len()).min(lines.len());
-    Ok(Reanchor::Changed(StaleUnit { start0, lines: lines[start0..end].to_vec() }))
+    Ok(CurrentUnitLocation::Changed(StaleUnit { start0, lines: lines[start0..end].to_vec() }))
 }
 
 /// Render a context excerpt straight from the file on disk — the same
@@ -480,7 +493,7 @@ pub struct PendingDecision {
     pub action: Action,
     pub provenance: Provenance,
     pub justification: Option<String>,
-    /// `(model variant, effort)` from the chosen candidate's slot, when the
+    /// `(model variant, effort)` from the chosen candidate's model, when the
     /// decision came from a model. Either half may be empty — the CLI default.
     pub model_info: Option<(String, String)>,
 }
@@ -639,7 +652,7 @@ mod tests {
             let order = blind_order(unit_seed("src/lib.rs", 12), n);
             let mut sorted = order.clone();
             sorted.sort_unstable();
-            // Every slot appears exactly once, or a candidate would be shown
+            // Every model appears exactly once, or a candidate would be shown
             // twice or not at all.
             assert_eq!(sorted, (0..n).collect::<Vec<_>>(), "n={n}");
             // Stable, so the cards do not reshuffle on every repaint.
@@ -649,13 +662,13 @@ mod tests {
 
     #[test]
     fn blind_order_varies_between_comments() {
-        // Three slots have six orderings; over many comments a fixed order
+        // Three models have six orderings; over many comments a fixed order
         // would put the same model first every time and reintroduce the bias
         // blinding exists to remove.
-        let first_slots: std::collections::HashSet<usize> = (0..60)
+        let first_models: std::collections::HashSet<usize> = (0..60)
             .map(|line| blind_order(unit_seed("src/lib.rs", line), 3)[0])
             .collect();
-        assert_eq!(first_slots.len(), 3, "every slot should lead sometimes: {first_slots:?}");
+        assert_eq!(first_models.len(), 3, "every model should lead sometimes: {first_models:?}");
     }
 
     #[test]
@@ -799,33 +812,33 @@ mod tests {
     }
 
     #[test]
-    fn reanchor_finds_a_block_that_merely_drifted() {
+    fn find_unit_on_disk_finds_a_block_whose_line_number_changed() {
         let dir = crate::testkit::TempDir::new("drifted");
         std::fs::write(dir.path().join("a.rs"), "new\nlines\none\ntwo\nthree\n").unwrap();
         let repo = dir.path().to_string_lossy().to_string();
         let expect = vec!["two".to_string(), "three".to_string()];
         // The block used to start at line 2 (0-based 1); two inserted lines
         // above pushed it to 0-based 3.
-        match reanchor(&repo, "a.rs", &expect, 1).unwrap() {
-            Reanchor::Moved(start0) => assert_eq!(start0, 3),
-            Reanchor::Changed(_) => panic!("an intact block must re-anchor, not resign"),
+        match find_unit_on_disk(&repo, "a.rs", &expect, 1).unwrap() {
+            CurrentUnitLocation::Moved(start0) => assert_eq!(start0, 3),
+            CurrentUnitLocation::Changed(_) => panic!("an intact block must relocate, not resign"),
         }
     }
 
     #[test]
-    fn reanchor_prefers_the_occurrence_nearest_the_expected_position() {
+    fn find_unit_on_disk_prefers_the_occurrence_nearest_the_expected_position() {
         let dir = crate::testkit::TempDir::new("nearest");
         std::fs::write(dir.path().join("a.rs"), "x\nx\na\na\na\na\nx\nx\nx\n").unwrap();
         let repo = dir.path().to_string_lossy().to_string();
         let expect = vec!["a".to_string()];
-        match reanchor(&repo, "a.rs", &expect, 4).unwrap() {
-            Reanchor::Moved(start0) => assert_eq!(start0, 4),
-            Reanchor::Changed(_) => panic!("the block exists"),
+        match find_unit_on_disk(&repo, "a.rs", &expect, 4).unwrap() {
+            CurrentUnitLocation::Moved(start0) => assert_eq!(start0, 4),
+            CurrentUnitLocation::Changed(_) => panic!("the block exists"),
         }
     }
 
     #[test]
-    fn reanchor_reports_what_replaced_a_changed_block() {
+    fn find_unit_on_disk_reports_what_replaced_a_changed_block() {
         let dir = crate::testkit::TempDir::new("changed");
         // The middle line of the unit was rewritten in place, and the span
         // grew by a line; first and last lines survive as edges.
@@ -834,27 +847,27 @@ mod tests {
         let repo = dir.path().to_string_lossy().to_string();
         let expect =
             vec!["first".to_string(), "middle".to_string(), "last".to_string()];
-        match reanchor(&repo, "a.rs", &expect, 1).unwrap() {
-            Reanchor::Changed(s) => {
+        match find_unit_on_disk(&repo, "a.rs", &expect, 1).unwrap() {
+            CurrentUnitLocation::Changed(s) => {
                 assert_eq!(s.start0, 1);
                 assert_eq!(s.lines, vec!["first", "EDITED", "EXTRA", "last"]);
             }
-            Reanchor::Moved(_) => panic!("the content changed; there is nothing to move to"),
+            CurrentUnitLocation::Moved(_) => panic!("the content changed; there is nothing to move to"),
         }
     }
 
     #[test]
-    fn reanchor_falls_back_to_the_expected_window_when_nothing_survives() {
+    fn find_unit_on_disk_uses_the_expected_range_when_nothing_matches() {
         let dir = crate::testkit::TempDir::new("gone");
         std::fs::write(dir.path().join("a.rs"), "a\nb\nc\nd\n").unwrap();
         let repo = dir.path().to_string_lossy().to_string();
         let expect = vec!["was".to_string(), "here".to_string()];
-        match reanchor(&repo, "a.rs", &expect, 1).unwrap() {
-            Reanchor::Changed(s) => {
+        match find_unit_on_disk(&repo, "a.rs", &expect, 1).unwrap() {
+            CurrentUnitLocation::Changed(s) => {
                 assert_eq!(s.start0, 1);
                 assert_eq!(s.lines, vec!["b", "c"]);
             }
-            Reanchor::Moved(_) => panic!("nothing matches"),
+            CurrentUnitLocation::Moved(_) => panic!("nothing matches"),
         }
     }
 
