@@ -50,6 +50,26 @@ fn grammar_for(path: &str) -> Option<(Grammar, tree_sitter::Language)> {
     })
 }
 
+/// The grammar for a path together with its bundled highlight query — the
+/// same parsers, reused for colour. A language with no grammar here simply
+/// shows as plain monospace, exactly as it does for scope detection.
+pub fn highlight_grammar(path: &str) -> Option<(tree_sitter::Language, &'static str)> {
+    let (grammar, language) = grammar_for(path)?;
+    let query = match grammar {
+        Grammar::Rust => tree_sitter_rust::HIGHLIGHTS_QUERY,
+        Grammar::Python => tree_sitter_python::HIGHLIGHTS_QUERY,
+        Grammar::Js => tree_sitter_javascript::HIGHLIGHT_QUERY,
+        Grammar::Ts => tree_sitter_typescript::HIGHLIGHTS_QUERY,
+        Grammar::Go => tree_sitter_go::HIGHLIGHTS_QUERY,
+        Grammar::Java => tree_sitter_java::HIGHLIGHTS_QUERY,
+        Grammar::C => tree_sitter_c::HIGHLIGHT_QUERY,
+        Grammar::Cpp => tree_sitter_cpp::HIGHLIGHT_QUERY,
+        Grammar::CSharp => tree_sitter_c_sharp::HIGHLIGHTS_QUERY,
+        Grammar::Php => tree_sitter_php::HIGHLIGHTS_QUERY,
+    };
+    Some((language, query))
+}
+
 pub struct Scope {
     /// 0-based inclusive rows, attached attributes/doc comments included.
     pub start0: usize,
@@ -82,7 +102,7 @@ impl ParsedFile {
     /// scope. Errors in the source degrade to smaller answers, never wrong
     /// ones — tree-sitter always produces a tree.
     pub fn scope_for(&self, target0: usize) -> Option<Scope> {
-        // Anchor past the indentation: at column 0 an indented `def` line
+    // Start matching past the indentation: at column 0 an indented `def` line
         // resolves to the *enclosing* block, not the definition on the line.
         let column = self
             .lines
@@ -110,10 +130,35 @@ impl ParsedFile {
         })
     }
 
+    /// When a definition's own first line is `row0`, the row where its
+    /// attached doc comments, attributes, and decorators begin — `None` when
+    /// no definition starts on that row or nothing is attached above it. This
+    /// is how a region that begins exactly at a definition can claim the doc
+    /// run above it; a body line, or the comment itself, claims nothing.
+    pub fn attachment_above(&self, row0: usize) -> Option<usize> {
+        let column = self
+            .lines
+            .get(row0)
+            .map(|l| l.len() - l.trim_start().len())
+            .unwrap_or(0);
+        let point = Point { row: row0, column };
+        let mut node = self.tree.root_node().descendant_for_point_range(point, point)?;
+        loop {
+            if self.is_definition(&node) && node.start_position().row == row0 {
+                let start = self.attached_start(&node);
+                return (start < row0).then_some(start);
+            }
+            node = node.parent()?;
+        }
+    }
+
     /// Definition spans intersecting [lo0, hi0] (0-based rows, inclusive),
     /// in source order. A definition still longer than `max_len` rows is
     /// replaced by the definitions inside it when at least two exist — an
-    /// `impl` block yields its methods, a class its defs.
+    /// `impl` block yields its methods, a class its defs. The container's
+    /// preamble (its declaration line, attributes, `use`s — everything above
+    /// its first child) is returned as a span of its own, so it can never be
+    /// mistaken for the tail of whatever definition precedes the container.
     pub fn definition_spans(&self, lo0: usize, hi0: usize, max_len: usize) -> Vec<(usize, usize)> {
         let mut out = Vec::new();
         self.collect_spans(self.tree.root_node(), lo0, hi0, max_len, 0, &mut out);
@@ -141,6 +186,10 @@ impl ParsedFile {
                     let mut inner = Vec::new();
                     self.collect_spans(child, lo0, hi0, max_len, depth + 1, &mut inner);
                     if inner.len() >= 2 {
+                        let first_inner = inner[0].0;
+                        if first_inner > start && start <= hi0 && first_inner - 1 >= lo0 {
+                            out.push((start, first_inner - 1));
+                        }
                         out.extend(inner);
                         continue;
                     }
@@ -373,13 +422,26 @@ mod tests {
         }
         src.push_str("}\n");
         let p = parsed("a.rs", &src);
-        // Cap below the impl's size: it must hand back its methods.
+        // Cap below the impl's size: it must hand back its methods, with its
+        // own `impl S {` line as a span of its own rather than loose change.
         let spans = p.definition_spans(0, 60, 20);
-        assert_eq!(spans.len(), 4, "{spans:?}");
-        assert_eq!(spans[0].0, 1);
+        assert_eq!(spans.len(), 5, "{spans:?}");
+        assert_eq!(spans[0], (0, 0), "the impl header stands alone");
+        assert_eq!(spans[1].0, 1);
         // Cap above its size: the impl stays whole.
         let spans = p.definition_spans(0, 60, 500);
         assert_eq!(spans.len(), 1);
+    }
+
+    #[test]
+    fn attachment_above_answers_only_for_a_definitions_own_first_line() {
+        let src = "use x;\n\n/// Doc one.\n/// Doc two.\nstruct S {\n    a: u32,\n}\n\nfn bare() {\n    work();\n}\n";
+        let p = parsed("a.rs", src);
+        assert_eq!(p.attachment_above(4), Some(2), "the struct's doc run starts two rows up");
+        assert_eq!(p.attachment_above(8), None, "fn bare has nothing attached");
+        assert_eq!(p.attachment_above(5), None, "a body line is not a definition top");
+        assert_eq!(p.attachment_above(2), None, "the comment itself claims nothing");
+        assert_eq!(p.attachment_above(0), None, "a use is not a definition");
     }
 
     #[test]
