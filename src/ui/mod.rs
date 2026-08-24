@@ -1,5 +1,6 @@
 pub mod chrome;
 pub mod code;
+pub mod procs_panel;
 pub mod theme;
 
 mod eval_screen;

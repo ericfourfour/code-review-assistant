@@ -44,6 +44,10 @@ pub fn top_bar(app: &mut CraApp, ctx: &egui::Context) {
                     Screen::Settings => "SETTINGS",
                 };
                 ui.label(RichText::new(name).small().strong().color(theme::ACCENT));
+                ui.separator();
+                // What is running, on every screen: a process nobody can see
+                // is a process nobody can stop.
+                crate::ui::procs_panel::top_bar_badge(app, ui);
                 if let Some(p) = &app.plan {
                     ui.separator();
                     ui.label(theme::dim(&format!(
@@ -121,6 +125,7 @@ pub fn hotkey_bar(app: &mut CraApp, ctx: &egui::Context) {
                 }
             }
             k(ui, "Ctrl+E", "evaluation");
+            k(ui, "Ctrl+P", "processes");
             k(ui, "Ctrl+,", "settings");
             k(ui, "Ctrl+Q", "quit");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -229,6 +234,10 @@ pub fn side_panel(app: &mut CraApp, ctx: &egui::Context) {
                             }
                             Some(CandidateState::Failed(_)) => {
                                 theme::badge(ui, "FAIL", theme::BAD);
+                            }
+                            Some(CandidateState::Paused(p)) => {
+                                theme::badge(ui, "PAUSED", theme::WARN);
+                                ui.label(theme::dim(&format!("{}s", p.ran_for.as_secs())));
                             }
                             Some(CandidateState::Disabled) | None => {
                                 ui.label(theme::dim("off"));

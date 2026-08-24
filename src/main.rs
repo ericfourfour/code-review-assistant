@@ -13,6 +13,7 @@ mod gitio;
 mod highlight;
 mod models;
 mod notes;
+mod procs;
 mod profile;
 mod review;
 mod scopes;

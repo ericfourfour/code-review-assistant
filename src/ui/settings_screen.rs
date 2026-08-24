@@ -292,6 +292,26 @@ hidden; one that only exists on GitHub is cloned into the clone directory when o
             ui.label(theme::dim("context lines"));
             ui.add(egui::DragValue::new(&mut self.settings.context_lines).range(2..=60));
             ui.end_row();
+            ui.label(theme::dim("spend limit ($)"));
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::DragValue::new(&mut self.settings.usage_limit_usd)
+                        .speed(0.5)
+                        .range(0.0..=10_000.0),
+                );
+                ui.label(theme::dim("per run of the app · 0 = no limit"));
+            });
+            ui.end_row();
+            ui.label(theme::dim("token limit"));
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::DragValue::new(&mut self.settings.usage_limit_tokens)
+                        .speed(1000.0)
+                        .range(0..=1_000_000_000i64),
+                );
+                ui.label(theme::dim("input + output, per run · 0 = no limit"));
+            });
+            ui.end_row();
             ui.label(theme::dim("blind review"));
             ui.checkbox(&mut self.settings.blind_review, "hide model names until you choose");
             ui.end_row();

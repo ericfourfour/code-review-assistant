@@ -9,12 +9,13 @@ use crate::findings::{self, WholeBranchReviewMsg, Finding};
 use crate::gitio::{self, BranchInfo, PrInfo};
 use crate::models::{self, Action, CandidateMsg, Evidence, Suggestion, Turn};
 use crate::notes::Note;
+use crate::procs::{Owner, ProcHandle, ProcTable, StopReceipt};
 use crate::review::{self, Choice, RefKind, ReviewFile, ReviewPlan};
 use crate::settings::Settings;
 use crate::triage;
 use crate::units::{self, ReviewUnit};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Screen {
     RepoPicker,
     RefPicker,
@@ -24,6 +25,133 @@ pub enum Screen {
     Followup,
     Eval,
     Settings,
+}
+
+impl Screen {
+    pub fn label(self) -> &'static str {
+        match self {
+            Screen::RepoPicker => "repository picker",
+            Screen::RefPicker => "branch picker",
+            Screen::FilePicker => "file picker",
+            Screen::Review => "review screen",
+            Screen::Summary => "summary screen",
+            Screen::Followup => "follow-up screen",
+            Screen::Eval => "evaluation page",
+            Screen::Settings => "settings",
+        }
+    }
+
+    /// The CLI work this screen owns, if it drives any. Leaving a screen ends
+    /// what it owns, so this mapping is what makes "navigating away stops the
+    /// models" a rule rather than a habit each screen has to remember.
+    pub fn owns(self) -> Option<Owner> {
+        match self {
+            Screen::Review => Some(Owner::Review),
+            Screen::Summary => Some(Owner::Branch),
+            Screen::Followup => Some(Owner::Fix),
+            _ => None,
+        }
+    }
+}
+
+/// A call that was stopped before it finished, kept so the reviewer can pick
+/// it up again rather than start over.
+///
+/// The session id is the whole question. A model whose id this app generates
+/// (`{session}` in its command) has one from the moment it launches, so an
+/// interrupted call can be resumed into the same conversation. A model that
+/// only reports its id in its reply leaves none behind when it is killed
+/// mid-answer — there is nothing to resume, and the card says so instead of
+/// offering a button that would quietly start a new conversation.
+#[derive(Clone)]
+pub struct PausedCall {
+    pub model_index: usize,
+    pub model: String,
+    /// What the call was doing when it was stopped.
+    pub what: String,
+    /// The process that was killed. Kept so the claim is checkable: this is
+    /// the number that was in Task Manager.
+    pub pid: Option<u32>,
+    pub session: Option<String>,
+    pub ran_for: std::time::Duration,
+    pub usage: models::Usage,
+    /// The prompt the stopped call was answering, so resuming asks the same
+    /// question again rather than a remembered summary of it.
+    pub prompt: String,
+    /// Why it stopped, in the words the reviewer will read.
+    pub reason: String,
+}
+
+impl PausedCall {
+    /// Whether the same conversation can be continued: there is a session id,
+    /// and the CLI holding it knows how to resume one.
+    pub fn resumable(&self, settings: &Settings) -> bool {
+        self.session.is_some()
+            && settings
+                .models
+                .get(self.model_index)
+                .is_some_and(|m| !m.resume_command.trim().is_empty())
+    }
+
+    /// The one-line state a paused card shows.
+    pub fn line(&self) -> String {
+        let pid = match self.pid {
+            Some(pid) => format!("pid {pid} terminated"),
+            None => "no process was running".to_string(),
+        };
+        format!("paused after {}s · {pid}", self.ran_for.as_secs())
+    }
+
+    /// The session as a human reads it — short enough for a card, whole
+    /// enough to match against what the CLI itself lists.
+    pub fn session_line(&self) -> String {
+        match &self.session {
+            Some(id) => format!("session {id}"),
+            None => "no session id — the CLI reports one only when it finishes".to_string(),
+        }
+    }
+}
+
+/// What leaving a screen did, shown on the screen the reviewer lands on until
+/// they dismiss it.
+///
+/// This exists because a stop the reviewer cannot see is indistinguishable
+/// from a leak. The receipts are live handles, not a rendered string, so the
+/// banner goes from "terminating…" to "terminated" as each process actually
+/// confirms it — the confirmation is of the kill, not of the request.
+pub struct NavNotice {
+    pub left: Screen,
+    pub receipts: Vec<StopReceipt>,
+    /// Sessions that can be picked up again, of those stopped.
+    pub resumable: usize,
+}
+
+impl NavNotice {
+    /// Whether every process named in the notice has confirmed it is gone.
+    pub fn all_confirmed(&self) -> bool {
+        self.receipts.iter().all(|r| r.confirmed())
+    }
+
+    pub fn headline(&self) -> String {
+        let n = self.receipts.len();
+        let confirmed = self.receipts.iter().filter(|r| r.confirmed()).count();
+        let verb = if self.all_confirmed() { "terminated" } else { "terminating" };
+        format!(
+            "left the {} — {confirmed}/{n} process(es) {verb}, {} session(s) paused",
+            self.left.label(),
+            self.resumable
+        )
+    }
+}
+
+/// What identifies the unit under review: where it is and what it says. The
+/// text is part of it because a unit reloaded from disk is a different
+/// question even at the same line, and its old answers do not apply to it.
+pub type UnitKey = (String, u32, String);
+
+/// The key for a unit, matching the identity a prefetch is claimed by.
+pub fn unit_key(unit: &ReviewUnit) -> UnitKey {
+    (unit.file().to_string(), unit.start_line(), unit.raw_lines().join("\n"))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -41,7 +169,10 @@ pub struct RepoCtx {
 pub enum CandidateState {
     Disabled,
     /// Running; the handle is the live view updated by the worker thread.
-    Pending(models::LiveHandle),
+    Pending(ProcHandle),
+    /// Stopped before it answered, because the reviewer left the page. What
+    /// is left of the call is here so the same session can be picked back up.
+    Paused(PausedCall),
     Ready(Suggestion),
     Failed(String),
 }
@@ -80,7 +211,7 @@ pub struct Prefetch {
     /// Parallel to the settings models: the live view of each spawned call,
     /// adopted along with the prefetch so the elapsed clock reads from when
     /// the call actually started rather than from when the review arrived.
-    pub lives: Vec<Option<models::LiveHandle>>,
+    pub lives: Vec<Option<ProcHandle>>,
     /// Set once the unit has been pushed to the back of its file, so a
     /// unanimous keep is deferred at most once and the review terminates.
     pub deferred: bool,
@@ -139,7 +270,9 @@ pub enum RepoSource {
 pub enum WholeBranchReviewState {
     Idle,
     /// Running; the handle is the live view updated by the worker thread.
-    Pending(models::LiveHandle),
+    Pending(ProcHandle),
+    /// Stopped before it reported, because the reviewer left the summary.
+    Paused(PausedCall),
     Done { n: usize, latency_ms: i64 },
     Failed(String),
 }
@@ -165,6 +298,26 @@ pub struct CraApp {
     pub settings: Settings,
     pub screen: Screen,
     pub prev_screen: Screen,
+
+    /// Every model CLI this run of the app has started, running or finished.
+    /// One ledger rather than a flag per page: what makes a process lost is
+    /// nobody being able to name it, and every launch site registers here.
+    pub procs: ProcTable,
+    /// What leaving the last screen stopped, shown until dismissed. The
+    /// positive confirmation the reviewer is owed lives here.
+    pub nav_notice: Option<NavNotice>,
+    /// Whether the process ledger window is open.
+    pub show_procs: bool,
+    /// Set while the window is being held open to finish killing the model
+    /// CLIs. Closing is asynchronous for exactly one reason: the threads that
+    /// do the killing die with the process, so exiting the instant the close
+    /// is asked for would leave the children running with nothing left to
+    /// report them.
+    pub closing: bool,
+    /// The unit the review screen's state belongs to. Coming back to a unit
+    /// that already has answers or paused calls must not re-ask the models —
+    /// this is what tells a return from an advance.
+    pub reviewing: Option<UnitKey>,
 
     pub log_lines: VecDeque<(String, String)>,
     pub status: String,
@@ -287,7 +440,10 @@ pub struct CraApp {
     pub fix_seq: u64,
     pub fix_running: bool,
     /// Live view of the running fix-session turn; `None` between turns.
-    pub fix_live: Option<models::LiveHandle>,
+    pub fix_proc: Option<ProcHandle>,
+    /// A fix-session turn that was stopped before it finished, so the same
+    /// session can be picked back up rather than restarted from the notes.
+    pub fix_paused: Option<PausedCall>,
     pub fix_error: Option<String>,
     pub fix_convo: Vec<Turn>,
     pub fix_session: Option<String>,
@@ -325,6 +481,11 @@ impl CraApp {
             settings,
             screen: Screen::RepoPicker,
             prev_screen: Screen::RepoPicker,
+            procs: ProcTable::new(),
+            nav_notice: None,
+            show_procs: false,
+            closing: false,
+            reviewing: None,
             log_lines: VecDeque::new(),
             status: "pick a repository".into(),
             repo_input: String::new(),
@@ -385,7 +546,8 @@ impl CraApp {
             eval_filter: crate::eval::Filter::default(),
             eval_repos: Vec::new(),
             fix_running: false,
-            fix_live: None,
+            fix_proc: None,
+            fix_paused: None,
             fix_error: None,
             fix_convo: Vec::new(),
             fix_session: None,
@@ -580,7 +742,7 @@ impl CraApp {
         self.load_refs();
         self.ref_sel = 0;
         self.ref_tab = RefTab::Branches;
-        self.screen = Screen::RefPicker;
+        self.goto(Screen::RefPicker);
     }
 
     pub fn load_refs(&mut self) {
@@ -789,7 +951,7 @@ impl CraApp {
         self.prefetches.clear();
         self.ref_error = None;
         self.file_sel = 0;
-        self.screen = Screen::FilePicker;
+        self.goto(Screen::FilePicker);
     }
 
     // -- review -------------------------------------------------------------
@@ -799,11 +961,11 @@ impl CraApp {
             plan.jump_to_file(file_idx);
             // Skip empty files (shouldn't happen; files always have units).
             if plan.current().is_none() {
-                self.screen = Screen::Summary;
+                self.goto(Screen::Summary);
                 return;
             }
         }
-        self.screen = Screen::Review;
+        self.goto(Screen::Review);
         self.enter_unit(ctx);
     }
 
@@ -877,7 +1039,40 @@ impl CraApp {
 
     /// Prepare state for the current unit and start the model CLIs — or, when
     /// a prefetch already asked them, install the answers that are in.
+    /// Show the unit the review is on, querying the models about it.
+    ///
+    /// Arriving back at a unit whose calls were paused is the exception: those
+    /// sessions are still open, and quietly replacing them with a second set
+    /// would be both the loss this tracking exists to prevent and a second
+    /// bill for the same verdict. The paused cards say what each model was in
+    /// the middle of, and picking it back up — or asking again — is the
+    /// reviewer's call. Every other arrival queries as it always did, R
+    /// included: asking again is what that key is for.
     pub fn enter_unit(&mut self, ctx: &egui::Context) {
+        let same_unit = self
+            .plan
+            .as_ref()
+            .and_then(|p| p.current().map(|(_, u)| unit_key(u)))
+            .is_some_and(|k| self.reviewing.as_ref() == Some(&k));
+        let paused = self
+            .candidates
+            .iter()
+            .filter(|c| matches!(c, CandidateState::Paused(_)))
+            .count();
+        if same_unit && paused > 0 {
+            self.review_error = None;
+            self.note(
+                "review",
+                &format!("back on the same unit — {paused} paused session(s), nothing restarted"),
+            );
+            return;
+        }
+        self.requery_unit(ctx);
+    }
+
+    /// Query the models about the current unit, whatever state it is in —
+    /// the review screen's R, and what every fresh arrival does.
+    pub fn requery_unit(&mut self, ctx: &egui::Context) {
         self.defer_unanimous_keeps();
         self.chosen = None;
         self.candidate_baseline = None;
@@ -888,7 +1083,8 @@ impl CraApp {
             p.current().map(|(_, u)| (u.clone(), u.file().to_string(), u.start_line()))
         }) else {
             self.prefetches.clear();
-            self.screen = Screen::Summary;
+            self.reviewing = None;
+            self.goto(Screen::Summary);
             return;
         };
         self.original_text = unit.raw_lines().join("\n");
@@ -912,6 +1108,7 @@ impl CraApp {
         self.note_input.clear();
         self.show_prompt = None;
         self.show_evidence = None;
+        self.reviewing = Some(unit_key(&unit));
 
         if let Some(pos) = self.prefetches.iter().position(|p| p.is_for(&unit)) {
             let pf = self.prefetches.remove(pos);
@@ -926,7 +1123,13 @@ impl CraApp {
     /// Start every enabled model for a unit under a fresh sequence id, which
     /// becomes the current `review_seq`.
     fn spawn_unit_models(&mut self, ctx: &egui::Context, unit: &ReviewUnit) {
+        if let Some(why) = self.usage_block() {
+            self.review_error = Some(why.clone());
+            self.note("usage", &why);
+            return;
+        }
         self.review_seq = self.next_seq();
+        let what = format!("{}:{} · verdict", unit.file(), unit.start_line());
         let prompt = self.unit_prompt(unit);
         // The CLIs are started here so the paths in the prompt resolve and the
         // rest of the codebase is within reach.
@@ -939,8 +1142,12 @@ impl CraApp {
                 self.sessions[idx] = session;
             }
             self.convos[idx].push(Turn { prompt: prompt.clone(), reply: String::new() });
-            let live = models::LiveHandle::new();
-            self.candidates[idx] = CandidateState::Pending(live.clone());
+            let proc = self.procs.register(Owner::Review, idx, &model.name, &what);
+            // A session id the app generated is known before the process is:
+            // recording it now is what lets a call killed seconds later still
+            // be resumed into the same conversation.
+            proc.set_session(self.sessions[idx].clone());
+            self.candidates[idx] = CandidateState::Pending(proc.clone());
             let tx = self.tx.clone();
             models::spawn_model(
                 self.review_seq,
@@ -951,7 +1158,7 @@ impl CraApp {
                 repo_path.clone(),
                 cli_home.clone(),
                 timeout,
-                live,
+                proc,
                 move |m| {
                     let _ = tx.send(Msg::Cand(m));
                 },
@@ -1024,9 +1231,11 @@ impl CraApp {
             if let Some(convo) = self.convos.get_mut(idx) {
                 convo.push(Turn { prompt: pf.prompt.clone(), reply: String::new() });
             }
-            let live = models::LiveHandle::new();
+            let what = format!("{file}:{line} · verdict");
+            let proc = self.procs.register(Owner::Review, idx, &model.name, &what);
+            proc.set_session(self.sessions.get(idx).cloned().flatten());
             if let Some(c) = self.candidates.get_mut(idx) {
-                *c = CandidateState::Pending(live.clone());
+                *c = CandidateState::Pending(proc.clone());
             }
             let tx = self.tx.clone();
             models::spawn_model(
@@ -1038,7 +1247,7 @@ impl CraApp {
                 repo_path.clone(),
                 cli_home.clone(),
                 timeout,
-                live,
+                proc,
                 move |m| {
                     let _ = tx.send(Msg::Cand(m));
                 },
@@ -1061,8 +1270,12 @@ impl CraApp {
         if self.prefetches.iter().any(|p| !p.complete()) {
             return;
         }
+        if self.usage_block().is_some() {
+            return;
+        }
         let session_id = self.plan.as_ref().map(|p| p.session_id).unwrap_or(0);
         let seq = self.next_seq();
+        let what = format!("{}:{} · prefetch", next.file(), next.start_line());
         let prompt = self.unit_prompt(&next);
         let repo_path = self.repo.as_ref().map(|r| r.path.clone()).unwrap_or_default();
         let cli_home = self.cli_home(&repo_path);
@@ -1070,14 +1283,15 @@ impl CraApp {
         let n = self.settings.models.len();
         let mut sessions = vec![None; n];
         let mut spawned = Vec::new();
-        let mut lives: Vec<Option<models::LiveHandle>> = vec![None; n];
+        let mut lives: Vec<Option<ProcHandle>> = vec![None; n];
         for (idx, model) in self.settings.enabled_models() {
             let (command, session) = opening_command(&model);
             if session.is_some() {
                 sessions[idx] = session;
             }
-            let live = models::LiveHandle::new();
-            lives[idx] = Some(live.clone());
+            let proc = self.procs.register(Owner::Review, idx, &model.name, &what);
+            proc.set_session(sessions[idx].clone());
+            lives[idx] = Some(proc.clone());
             let tx = self.tx.clone();
             models::spawn_model(
                 seq,
@@ -1088,7 +1302,7 @@ impl CraApp {
                 repo_path.clone(),
                 cli_home.clone(),
                 timeout,
-                live,
+                proc,
                 move |m| {
                     let _ = tx.send(Msg::Cand(m));
                 },
@@ -1235,8 +1449,10 @@ impl CraApp {
             let command = model_config.resume_command.replace("{session}", &session);
             let prompt = models::followup_prompt(&message, is_code);
             self.convos[idx].push(Turn { prompt: prompt.clone(), reply: String::new() });
-            let live = models::LiveHandle::new();
-            self.candidates[idx] = CandidateState::Pending(live.clone());
+            let what = format!("{file}:{start} · follow-up {}", self.unit_round);
+            let proc = self.procs.register(Owner::Review, idx, &model_config.name, &what);
+            proc.set_session(Some(session.clone()));
+            self.candidates[idx] = CandidateState::Pending(proc.clone());
             if let Some(p) = self.pending_follow_up.get_mut(idx) {
                 *p = Some((follow_up_id, self.unit_round));
             }
@@ -1250,7 +1466,7 @@ impl CraApp {
                 repo_path.clone(),
                 cli_home.clone(),
                 timeout,
-                live,
+                proc,
                 move |m| {
                     let _ = tx.send(Msg::Cand(m));
                 },
@@ -1667,7 +1883,7 @@ impl CraApp {
             if plan.advance() {
                 self.enter_unit(ctx);
             } else {
-                self.screen = Screen::Summary;
+                self.goto(Screen::Summary);
                 self.note("session", "review complete");
             }
         }
@@ -1686,7 +1902,7 @@ impl CraApp {
         if let Some(progress) = progress {
             self.note("session", &format!("ended early — {progress}"));
         }
-        self.screen = Screen::Summary;
+        self.goto(Screen::Summary);
     }
 
     pub fn skip_unit(&mut self, ctx: &egui::Context) {
@@ -1697,7 +1913,7 @@ impl CraApp {
             if plan.advance() {
                 self.enter_unit(ctx);
             } else {
-                self.screen = Screen::Summary;
+                self.goto(Screen::Summary);
             }
         }
     }
@@ -1794,6 +2010,11 @@ impl CraApp {
             plan.total_units(),
             &diff,
         );
+        if let Some(why) = self.usage_block() {
+            self.note("usage", &why);
+            return;
+        }
+        let what = format!("{} vs {} · whole branch", plan.ref_name, plan.base_ref);
         self.whole_branch_review_seq += 1;
         self.findings.clear();
         self.whole_branch_review =
@@ -1803,11 +2024,14 @@ impl CraApp {
         let timeout = self.settings.model_timeout_secs.saturating_mul(2);
         let mut launched = 0;
         for (idx, model) in self.settings.enabled_models() {
-            // One-shot: no follow-ups, so a `{session}` model just gets a
-            // fresh id, exactly as the evaluation replay does.
-            let command = model.command.replace("{session}", &uuid::Uuid::new_v4().to_string());
-            let live = models::LiveHandle::new();
-            self.whole_branch_review[idx] = WholeBranchReviewState::Pending(live.clone());
+            // A `{session}` model takes an id of our choosing, exactly as a
+            // review turn does. The pass asks nothing further of it, but a
+            // reviewer who walks away mid-pass can only pick it up again if
+            // the app knows which conversation it was.
+            let (command, session) = opening_command(&model);
+            let proc = self.procs.register(Owner::Branch, idx, &model.name, &what);
+            proc.set_session(session);
+            self.whole_branch_review[idx] = WholeBranchReviewState::Pending(proc.clone());
             let tx = self.tx.clone();
             findings::spawn_whole_branch_review(
                 self.whole_branch_review_seq,
@@ -1818,7 +2042,7 @@ impl CraApp {
                 repo.clone(),
                 cli_home.clone(),
                 timeout,
-                live,
+                proc,
                 move |m| {
                     let _ = tx.send(Msg::WholeBranchReview(m));
                 },
@@ -1834,11 +2058,97 @@ impl CraApp {
         self.note("branch", &format!("whole-branch review started — {launched} model(s) reading the branch"));
     }
 
+    /// Put one model back on the whole-branch review: `resume` continues the
+    /// conversation it was holding when it was stopped, and otherwise it is
+    /// asked again from a new one.
+    ///
+    /// Only this model's slice is restarted. The others' findings are already
+    /// in and re-running them would charge for answers the screen is showing.
+    pub fn rerun_branch_model(&mut self, ctx: &egui::Context, idx: usize, resume: bool) {
+        let paused = match self.whole_branch_review.get(idx) {
+            Some(WholeBranchReviewState::Paused(p)) => Some(p.clone()),
+            _ => None,
+        };
+        let Some(model_config) = self.settings.models.get(idx).cloned() else { return };
+        let Some((prompt, repo, what)) = self.branch_prompt() else { return };
+        if let Some(why) = self.usage_block() {
+            self.note("usage", &why);
+            return;
+        }
+        let session = paused.as_ref().and_then(|p| p.session.clone());
+        let (command, session) = match (resume, session) {
+            (true, Some(id)) => (model_config.resume_command.replace("{session}", &id), Some(id)),
+            _ => opening_command(&model_config),
+        };
+        let cli_home = self.cli_home(&repo);
+        let timeout = self.settings.model_timeout_secs.saturating_mul(2);
+        let proc = self.procs.register(Owner::Branch, idx, &model_config.name, &what);
+        proc.set_session(session);
+        self.whole_branch_review[idx] = WholeBranchReviewState::Pending(proc.clone());
+        let tx = self.tx.clone();
+        findings::spawn_whole_branch_review(
+            self.whole_branch_review_seq,
+            idx,
+            model_config.clone(),
+            command,
+            prompt,
+            repo,
+            cli_home,
+            timeout,
+            proc,
+            move |m| {
+                let _ = tx.send(Msg::WholeBranchReview(m));
+            },
+            ctx.clone(),
+        );
+        self.note(
+            "branch",
+            &format!(
+                "{} {} the branch pass",
+                model_config.name,
+                if resume { "resumed" } else { "restarted" }
+            ),
+        );
+    }
+
+    /// The whole-branch prompt, the repository to run it in, and a label for
+    /// the ledger. `None` when the plan cannot support one.
+    fn branch_prompt(&mut self) -> Option<(String, String, String)> {
+        let plan = self.plan.as_ref()?;
+        if plan.is_recheck() {
+            return None;
+        }
+        let repo = self.repo.as_ref().map(|r| r.path.clone())?;
+        let base = gitio::base_from_label(&plan.base_ref);
+        let diff = match gitio::review_diff(&repo, &base, self.settings.context_lines) {
+            Ok(d) => d,
+            Err(e) => {
+                self.note("error", &format!("whole-branch review diff: {e}"));
+                return None;
+            }
+        };
+        let plan = self.plan.as_ref()?;
+        let what = format!("{} vs {} · whole branch", plan.ref_name, plan.base_ref);
+        let prompt = findings::build_prompt(
+            &plan.ref_name,
+            &plan.base_ref,
+            plan.files.len(),
+            plan.total_units(),
+            &diff,
+        );
+        Some((prompt, repo, what))
+    }
+
     pub fn whole_branch_review_running(&self) -> bool {
         self.whole_branch_review.iter().any(|s| matches!(s, WholeBranchReviewState::Pending(_)))
     }
 
     fn handle_whole_branch_review(&mut self, m: WholeBranchReviewMsg) {
+        if m.cancelled {
+            // Stopped by us; the card is already paused and says so.
+            self.note("branch", &format!("{} stopped part-way through the branch", m.model));
+            return;
+        }
         if m.seq != self.whole_branch_review_seq {
             self.db.log("stale", &format!("discarded late whole-branch review from {}", m.model));
             return;
@@ -1970,7 +2280,7 @@ impl CraApp {
         self.fix_error = None;
         if self.screen != Screen::Followup {
             self.followup_from = self.screen;
-            self.screen = Screen::Followup;
+            self.goto(Screen::Followup);
         }
         self.note("follow-up", &format!("{} open note(s)", self.notes.len()));
     }
@@ -2004,6 +2314,11 @@ impl CraApp {
             return;
         }
         let Some(repo) = self.repo.as_ref().map(|r| r.path.clone()) else { return };
+        if let Some(why) = self.usage_block() {
+            self.fix_error = Some(why.clone());
+            self.note("usage", &why);
+            return;
+        }
         let prompt = crate::notes::build_fix_prompt(&self.fix_prompt, &picked);
         self.fix_seq += 1;
         self.active_fix_model_index = self.selected_fix_model_index;
@@ -2026,8 +2341,11 @@ impl CraApp {
         // Resolving a backlog of larger issues is a different order of work
         // from judging one unit; give the session room to do it.
         let timeout = self.settings.model_timeout_secs.saturating_mul(4);
-        let live = models::LiveHandle::new();
-        self.fix_live = Some(live.clone());
+        let what = format!("{} note(s)", picked.len());
+        let proc = self.procs.register(Owner::Fix, self.active_fix_model_index, &model_config.name, &what);
+        proc.set_session(self.fix_session.clone());
+        self.fix_proc = Some(proc.clone());
+        self.fix_paused = None;
         let tx = self.tx.clone();
         models::spawn_freeform(
             self.fix_seq,
@@ -2038,7 +2356,7 @@ impl CraApp {
             repo,
             cli_home,
             timeout,
-            live,
+            proc,
             move |m| {
                 let _ = tx.send(Msg::Fix(m));
             },
@@ -2076,6 +2394,11 @@ impl CraApp {
         if message.is_empty() || !self.fix_can_resume() {
             return;
         }
+        if let Some(why) = self.usage_block() {
+            self.fix_error = Some(why.clone());
+            self.note("usage", &why);
+            return;
+        }
         let Some(model_config) = self.settings.models.get(self.active_fix_model_index).cloned() else { return };
         let Some(session) = self.fix_session.clone() else { return };
         let Some(repo) = self.repo.as_ref().map(|r| r.path.clone()) else { return };
@@ -2085,8 +2408,11 @@ impl CraApp {
         self.fix_running = true;
         let cli_home = self.cli_home(&repo);
         let timeout = self.settings.model_timeout_secs.saturating_mul(4);
-        let live = models::LiveHandle::new();
-        self.fix_live = Some(live.clone());
+        let proc =
+            self.procs.register(Owner::Fix, self.active_fix_model_index, &model_config.name, "follow-up");
+        proc.set_session(Some(session));
+        self.fix_proc = Some(proc.clone());
+        self.fix_paused = None;
         let tx = self.tx.clone();
         models::spawn_freeform(
             self.fix_seq,
@@ -2097,7 +2423,7 @@ impl CraApp {
             repo,
             cli_home,
             timeout,
-            live,
+            proc,
             move |m| {
                 let _ = tx.send(Msg::Fix(m));
             },
@@ -2112,13 +2438,31 @@ impl CraApp {
             return;
         }
         self.fix_running = false;
-        self.fix_live = None;
+        self.fix_proc = None;
         // The reply is read with the launching model's session key, so a moved
-        // model picker cannot misread it.
+        // model picker cannot misread it. This happens before the cancelled
+        // check below: a turn killed part-way may still have printed the id of
+        // the conversation it was holding, and that id is the only thing that
+        // makes resuming it possible.
         if let Some(key) = self.settings.models.get(m.model_index).map(|s| s.session_key.clone()) {
             if let Some(id) = models::extract_session_id(&m.raw, &key) {
-                self.fix_session = Some(id);
+                self.fix_session = Some(id.clone());
+                if let Some(p) = self.fix_paused.as_mut().filter(|p| p.session.is_none()) {
+                    p.session = Some(id);
+                }
             }
+        }
+        if m.cancelled {
+            // What the stopped turn managed to say is what a resume continues
+            // from, so it belongs in the transcript like any other reply.
+            if let Some(turn) = self.fix_convo.last_mut().filter(|t| t.reply.is_empty()) {
+                turn.reply = match m.raw.trim().is_empty() {
+                    true => "(stopped before it said anything)".to_string(),
+                    false => models::transcript_excerpt(&m.raw),
+                };
+            }
+            self.note("follow-up", &format!("{} stopped part-way through its turn", m.model));
+            return;
         }
         if let Some(turn) = self.fix_convo.last_mut() {
             turn.reply = if m.raw.trim().is_empty() {
@@ -2165,6 +2509,13 @@ impl CraApp {
     }
 
     fn handle_candidate(&mut self, c: CandidateMsg) {
+        if c.cancelled {
+            // This app stopped the call. The card already shows it as paused,
+            // and overwriting that with the "failure" our own kill produced
+            // would erase the session the reviewer is being offered.
+            self.record_stopped_call(&c);
+            return;
+        }
         if c.seq != self.review_seq {
             if let Some(pos) = self.prefetches.iter().position(|p| p.seq == c.seq) {
                 self.handle_prefetch_reply(pos, c);
@@ -2231,6 +2582,7 @@ impl CraApp {
                     cost,
                     follow_up_id,
                     round,
+                    stopped: false,
                 });
                 let label = self.model_display(c.model_index);
                 if self.names_hidden() {
@@ -2270,6 +2622,7 @@ impl CraApp {
                     cost,
                     follow_up_id,
                     round,
+                    stopped: false,
                 });
                 let label = self.model_display(c.model_index);
                 self.note("model", &format!("{label} failed: {}", truncate(&e, 120)));
@@ -2317,6 +2670,7 @@ impl CraApp {
                     cost,
                     follow_up_id: None,
                     round: 1,
+                    stopped: false,
                 });
                 self.note("model", &format!("early answer in for {file}:{start}"));
             }
@@ -2337,6 +2691,7 @@ impl CraApp {
                     cost,
                     follow_up_id: None,
                     round: 1,
+                    stopped: false,
                 });
                 self.note(
                     "model",
@@ -2349,17 +2704,482 @@ impl CraApp {
         }
     }
 
+
+    // -- processes, sessions and navigation ---------------------------------
+
+    /// Move to another screen, stopping whatever the screen being left had
+    /// running.
+    ///
+    /// Every navigation goes through here, which is the point: a CLI call
+    /// outlives the page that started it only because some path forgot to end
+    /// it, and there is no reliable way to remember at eight call sites. What
+    /// was stopped is recorded in [`CraApp::nav_notice`] so the reviewer sees
+    /// it happen rather than having to trust that it did.
+    pub fn goto(&mut self, to: Screen) {
+        if self.screen == to {
+            return;
+        }
+        self.leave_screen();
+        self.screen = to;
+    }
+
+    /// Stop the current screen's model calls and turn them into paused ones.
+    fn leave_screen(&mut self) {
+        let from = self.screen;
+        let Some(owner) = from.owns() else { return };
+        let reason = format!("left the {}", from.label());
+        let receipts = self.procs.stop(owner, &reason);
+        let (paused, resumable) = match owner {
+            Owner::Review => self.pause_review(&reason),
+            Owner::Branch => self.pause_branch(&reason),
+            Owner::Fix => self.pause_fix(&reason),
+        };
+        if receipts.is_empty() && paused == 0 {
+            // Nothing was running. Saying so would be noise, and a stale
+            // banner about an earlier departure would be worse than noise.
+            self.nav_notice = None;
+            return;
+        }
+        self.note(
+            "procs",
+            &format!(
+                "{reason} — {} process(es) being terminated, {paused} session(s) paused ({resumable} resumable)"
+            ,   receipts.len()),
+        );
+        self.nav_notice = Some(NavNotice { left: from, receipts, resumable });
+    }
+
+    /// Turn every running per-unit call into a paused one.
+    ///
+    /// Returns how many were paused and how many of those can be continued on
+    /// the same session. The two differ whenever a CLI reports its session id
+    /// only in its reply: killed before it answered, it leaves nothing to
+    /// resume, and the card has to offer a fresh ask instead of pretending.
+    fn pause_review(&mut self, reason: &str) -> (usize, usize) {
+        let mut paused = 0;
+        let mut resumable = 0;
+        for idx in 0..self.candidates.len() {
+            let handle = match &self.candidates[idx] {
+                CandidateState::Pending(h) => h.clone(),
+                _ => continue,
+            };
+            let call = self.paused_call(idx, handle, reason, self.convo_prompt(idx));
+            if call.resumable(&self.settings) {
+                resumable += 1;
+            }
+            paused += 1;
+            self.candidates[idx] = CandidateState::Paused(call);
+        }
+        // The prefetch is the review's work too, and the only work with no
+        // card of its own — which makes it the easiest call to lose. Its
+        // processes have just been stopped, so an unfinished one is dropped
+        // rather than left looking answerable; a complete one cost nothing
+        // more to keep and its answers are already paid for.
+        self.prefetches.retain(|p| p.complete());
+        (paused, resumable)
+    }
+
+    fn pause_branch(&mut self, reason: &str) -> (usize, usize) {
+        let mut paused = 0;
+        let mut resumable = 0;
+        for idx in 0..self.whole_branch_review.len() {
+            let handle = match &self.whole_branch_review[idx] {
+                WholeBranchReviewState::Pending(h) => h.clone(),
+                _ => continue,
+            };
+            let call = self.paused_call(idx, handle, reason, String::new());
+            if call.resumable(&self.settings) {
+                resumable += 1;
+            }
+            paused += 1;
+            self.whole_branch_review[idx] = WholeBranchReviewState::Paused(call);
+        }
+        (paused, resumable)
+    }
+
+    fn pause_fix(&mut self, reason: &str) -> (usize, usize) {
+        let Some(handle) = self.fix_proc.take() else { return (0, 0) };
+        let idx = self.active_fix_model_index;
+        let prompt = self.fix_convo.last().map(|t| t.prompt.clone()).unwrap_or_default();
+        let call = self.paused_call(idx, handle, reason, prompt);
+        let resumable = usize::from(call.resumable(&self.settings));
+        // The session id the app holds is the fix screen's own record of the
+        // conversation, and it outlasts any one turn.
+        self.fix_session = call.session.clone().or_else(|| self.fix_session.clone());
+        self.fix_running = false;
+        self.fix_paused = Some(call);
+        (1, resumable)
+    }
+
+    /// One stopped call, as the screen that owned it will show it.
+    fn paused_call(
+        &self,
+        model_index: usize,
+        handle: ProcHandle,
+        reason: &str,
+        prompt: String,
+    ) -> PausedCall {
+        let snap = handle.snapshot();
+        let model = self
+            .settings
+            .models
+            .get(model_index)
+            .map(|m| m.name.clone())
+            .unwrap_or_else(|| "model".to_string());
+        // Prefer what the process itself reported; fall back to the id the app
+        // generated for it, which for a `{session}` model is the same id and
+        // is known even when the call was killed before it printed anything.
+        let session = snap
+            .session
+            .clone()
+            .or_else(|| self.sessions.get(model_index).cloned().flatten());
+        // By handle rather than by pid: a call stopped before it started has
+        // no pid, and matching on `None` would pick some other row's label.
+        let what = self.procs.row_for(&handle).map(|r| r.what.clone()).unwrap_or_default();
+        PausedCall {
+            model_index,
+            model,
+            what,
+            pid: snap.pid,
+            session,
+            ran_for: snap.elapsed,
+            usage: snap.usage,
+            prompt,
+            reason: reason.to_string(),
+        }
+    }
+
+    /// The prompt a model was last sent for the current unit.
+    fn convo_prompt(&self, model_index: usize) -> String {
+        self.convos
+            .get(model_index)
+            .and_then(|c| c.last())
+            .map(|t| t.prompt.clone())
+            .unwrap_or_default()
+    }
+
+    /// Stop everything, everywhere — the quit path, and the "stop all" button
+    /// on the process ledger.
+    pub fn stop_all_models(&mut self, reason: &str) -> usize {
+        let receipts = self.procs.stop_all(reason);
+        let n = receipts.len();
+        for owner in Owner::ALL {
+            match owner {
+                Owner::Review => self.pause_review(reason),
+                Owner::Branch => self.pause_branch(reason),
+                Owner::Fix => self.pause_fix(reason),
+            };
+        }
+        if n > 0 {
+            self.note("procs", &format!("{reason} — stopping {n} process(es)"));
+            self.nav_notice = Some(NavNotice { left: self.screen, receipts, resumable: 0 });
+        }
+        n
+    }
+
+    /// Continue a paused per-unit call on the session it was holding.
+    pub fn resume_candidate(&mut self, ctx: &egui::Context, idx: usize) {
+        let CandidateState::Paused(call) = &self.candidates[idx] else { return };
+        let call = call.clone();
+        let Some(model_config) = self.settings.models.get(idx).cloned() else { return };
+        let Some(session) = call.session.clone() else {
+            self.review_error =
+                Some(format!("{} left no session id behind — ask it again instead", call.model));
+            return;
+        };
+        if let Some(why) = self.usage_block() {
+            self.review_error = Some(why);
+            return;
+        }
+        let command = model_config.resume_command.replace("{session}", &session);
+        let prompt = match call.prompt.trim().is_empty() {
+            true => match self.current_unit() {
+                Some(u) => self.unit_prompt(&u),
+                None => return,
+            },
+            false => call.prompt.clone(),
+        };
+        self.sessions[idx] = Some(session.clone());
+        self.spawn_one(ctx, idx, model_config, command, prompt, Some(session.clone()), &call.what);
+        self.note("procs", &format!("resumed {} on session {session}", call.model));
+    }
+
+    /// Ask a model the current unit again from a new session — what is on
+    /// offer when a killed call left no session id to continue.
+    pub fn restart_candidate(&mut self, ctx: &egui::Context, idx: usize) {
+        let Some(model_config) = self.settings.models.get(idx).cloned() else { return };
+        let Some(unit) = self.current_unit() else { return };
+        if let Some(why) = self.usage_block() {
+            self.review_error = Some(why);
+            return;
+        }
+        let (command, session) = opening_command(&model_config);
+        self.sessions[idx] = session.clone();
+        let prompt = self.unit_prompt(&unit);
+        let what = format!("{}:{} · verdict", unit.file(), unit.start_line());
+        let name = model_config.name.clone();
+        self.spawn_one(ctx, idx, model_config, command, prompt, session, &what);
+        self.note("procs", &format!("restarted {name} on a new session"));
+    }
+
+    /// Start one model on the current unit, replacing whatever card it had.
+    /// Shared by resuming and restarting, which differ only in the command
+    /// they build and the session they carry.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_one(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+        model_config: crate::settings::ModelConfig,
+        command: String,
+        prompt: String,
+        session: Option<String>,
+        what: &str,
+    ) {
+        let repo_path = self.repo.as_ref().map(|r| r.path.clone()).unwrap_or_default();
+        let cli_home = self.cli_home(&repo_path);
+        let timeout = self.settings.model_timeout_secs;
+        if let Some(convo) = self.convos.get_mut(idx) {
+            convo.push(Turn { prompt: prompt.clone(), reply: String::new() });
+        }
+        let proc = self.procs.register(Owner::Review, idx, &model_config.name, what);
+        proc.set_session(session);
+        self.candidates[idx] = CandidateState::Pending(proc.clone());
+        self.review_error = None;
+        let tx = self.tx.clone();
+        models::spawn_model(
+            self.review_seq,
+            idx,
+            model_config,
+            command,
+            prompt,
+            repo_path,
+            cli_home,
+            timeout,
+            proc,
+            move |m| {
+                let _ = tx.send(Msg::Cand(m));
+            },
+            ctx.clone(),
+        );
+    }
+
+    /// Continue a paused fix-session turn on the session it was holding.
+    pub fn resume_fix(&mut self, ctx: &egui::Context) {
+        let Some(call) = self.fix_paused.clone() else { return };
+        let Some(model_config) = self.settings.models.get(call.model_index).cloned() else { return };
+        let Some(session) = call.session.clone().or_else(|| self.fix_session.clone()) else {
+            self.fix_error =
+                Some("that turn left no session id behind — start a new session instead".into());
+            return;
+        };
+        let Some(repo) = self.repo.as_ref().map(|r| r.path.clone()) else { return };
+        if let Some(why) = self.usage_block() {
+            self.fix_error = Some(why);
+            return;
+        }
+        let command = model_config.resume_command.replace("{session}", &session);
+        // The same instructions again, on the conversation that already has
+        // them: the model picks up where the kill interrupted it rather than
+        // being handed a summary of what it was doing.
+        let prompt = match call.prompt.trim().is_empty() {
+            true => "Continue the work you were part-way through.".to_string(),
+            false => call.prompt.clone(),
+        };
+        self.fix_seq += 1;
+        self.fix_running = true;
+        self.fix_error = None;
+        self.fix_session = Some(session.clone());
+        self.active_fix_model_index = call.model_index;
+        let cli_home = self.cli_home(&repo);
+        let timeout = self.settings.model_timeout_secs.saturating_mul(4);
+        let proc =
+            self.procs.register(Owner::Fix, call.model_index, &model_config.name, "resumed turn");
+        proc.set_session(Some(session.clone()));
+        self.fix_proc = Some(proc.clone());
+        self.fix_paused = None;
+        let tx = self.tx.clone();
+        models::spawn_freeform(
+            self.fix_seq,
+            call.model_index,
+            model_config,
+            command,
+            prompt,
+            repo,
+            cli_home,
+            timeout,
+            proc,
+            move |m| {
+                let _ = tx.send(Msg::Fix(m));
+            },
+            ctx.clone(),
+        );
+        self.note("procs", &format!("resumed the fix session on {session}"));
+    }
+
+    /// The unit the review screen still holds, if any — what a "back to the
+    /// review" affordance offers to return to. Returning is not the same as
+    /// picking a file: it puts the reviewer back on the unit they left, with
+    /// its answers and its paused calls where they were.
+    pub fn review_in_progress(&self) -> Option<String> {
+        let (file, line, _) = self.reviewing.as_ref()?;
+        self.plan.as_ref()?;
+        Some(format!("{file}:{line}"))
+    }
+
+    /// Whether anything on the current screen is waiting to be picked up.
+    pub fn paused_here(&self) -> usize {
+        match self.screen {
+            Screen::Review => {
+                self.candidates.iter().filter(|c| matches!(c, CandidateState::Paused(_))).count()
+            }
+            Screen::Summary => self
+                .whole_branch_review
+                .iter()
+                .filter(|s| matches!(s, WholeBranchReviewState::Paused(_)))
+                .count(),
+            Screen::Followup => usize::from(self.fix_paused.is_some()),
+            _ => 0,
+        }
+    }
+
+    /// Why no new model call may start, if anything says so.
+    ///
+    /// The ceiling is measured over this run of the app, against what the CLIs
+    /// themselves reported spending. A model whose CLI reports nothing cannot
+    /// be counted, and is deliberately not guessed at: a limit that stopped
+    /// work on an estimate would stop it for the wrong reason.
+    pub fn usage_block(&self) -> Option<String> {
+        let spent = self.procs.spent();
+        let limit_usd = self.settings.usage_limit_usd;
+        if limit_usd > 0.0 {
+            if let Some(usd) = spent.cost_usd.filter(|u| *u >= limit_usd) {
+                return Some(format!(
+                    "usage limit reached — ${usd:.2} spent this run of ${limit_usd:.2}. \
+                     Raise or clear the limit in settings to keep going."
+                ));
+            }
+        }
+        let limit_tokens = self.settings.usage_limit_tokens;
+        if limit_tokens > 0 && spent.tokens() >= limit_tokens {
+            return Some(format!(
+                "usage limit reached — {} tokens this run of {limit_tokens}. \
+                 Raise or clear the limit in settings to keep going.",
+                spent.tokens()
+            ));
+        }
+        None
+    }
+
+    /// How close this run is to its limit, as a fraction, when one is set.
+    pub fn usage_fraction(&self) -> Option<f64> {
+        let spent = self.procs.spent();
+        let by_cost = (self.settings.usage_limit_usd > 0.0)
+            .then(|| spent.cost_usd.unwrap_or(0.0) / self.settings.usage_limit_usd);
+        let by_tokens = (self.settings.usage_limit_tokens > 0)
+            .then(|| spent.tokens() as f64 / self.settings.usage_limit_tokens as f64);
+        match (by_cost, by_tokens) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// Write a finished conversation to the database.
+    ///
+    /// The CLI goes on holding the conversation after this app closes — that
+    /// is what a session is — so the id has to outlive the run that opened it
+    /// or the conversation becomes unreachable: still there, still costing
+    /// what it cost, and no longer nameable by anything here. A call that
+    /// never reported an id has nothing to write down, and writing a row
+    /// without one would only pretend otherwise.
+    fn record_session(&mut self, done: &crate::procs::Completed) {
+        let Some(session) = done.session.clone() else { return };
+        let repo = self.repo.as_ref().map(|r| r.path.clone()).unwrap_or_default();
+        let review = self.plan.as_ref().map(|p| p.session_id);
+        let state = if done.ended.interrupted() { "paused" } else { "finished" };
+        self.db.record_cli_session(&crate::db::CliSessionRecord {
+            session: &session,
+            review,
+            owner: done.owner.label(),
+            model: &done.model,
+            repo: &repo,
+            what: &done.what,
+            state,
+            pid: done.pid,
+            usage: (!done.usage.is_silent()).then_some(done.usage),
+        });
+    }
+
+    /// Conversations an earlier run of the app left paused in this repository.
+    /// Shown in the ledger: they are still real, and this app is the only
+    /// thing that wrote their ids down.
+    pub fn earlier_paused_sessions(&self) -> Vec<crate::db::PausedSessionRow> {
+        match self.repo.as_ref() {
+            Some(r) => self.db.paused_cli_sessions(&r.path),
+            None => Vec::new(),
+        }
+    }
+
+    /// Record a call this app stopped. Its spend is real and stays on the
+    /// books; its silence is not the model's fault, so the row is marked and
+    /// the evaluation page never scores a model for a call the reviewer cut
+    /// short.
+    fn record_stopped_call(&mut self, c: &CandidateMsg) {
+        // The locus only when it is known: the reply of a prefetch dropped on
+        // the way out belongs to a unit the review never reached, and naming
+        // the current one instead would be a wrong claim rather than a missing
+        // one. Nothing reads the locus of a stopped row — its spend counts per
+        // model — so an empty one costs nothing and asserts nothing.
+        let (file, start, end) = match self.prefetches.iter().find(|p| p.seq == c.seq) {
+            Some(pf) => (pf.file.clone(), pf.start_line, pf.end_line),
+            None if c.seq == self.review_seq => self
+                .current_unit()
+                .map(|u| (u.file().to_string(), u.start_line(), u.end_line()))
+                .unwrap_or_default(),
+            None => (String::new(), 0, 0),
+        };
+        let session_id = self.plan.as_ref().map(|p| p.session_id).unwrap_or(0);
+        let usage = models::extract_usage(&c.raw);
+        let usage = (!usage.is_silent()).then_some(usage);
+        let cost = usage
+            .zip(self.settings.models.get(c.model_index))
+            .and_then(|(u, model)| u.priced(model.price_in, model.price_out));
+        let reason = match &c.result {
+            Err(e) => e.clone(),
+            Ok(_) => "stopped".to_string(),
+        };
+        self.db.log_suggestion(&crate::db::SuggestionRecord {
+            session_id,
+            file: &file,
+            line_start: start,
+            line_end: end,
+            model: &c.model,
+            action: None,
+            comment: None,
+            justification: None,
+            latency_ms: 0,
+            error: Some(&reason),
+            evidence: None,
+            usage,
+            cost,
+            follow_up_id: None,
+            round: self.unit_round,
+            stopped: true,
+        });
+        self.note("procs", &format!("{} {reason}", c.model));
+    }
+
     pub fn open_settings(&mut self) {
         if self.screen != Screen::Settings {
             self.prev_screen = self.screen;
-            self.screen = Screen::Settings;
+            self.goto(Screen::Settings);
         }
     }
 
     pub fn close_settings(&mut self) {
         self.settings.save(&self.db);
         self.note("settings", "saved");
-        self.screen = self.prev_screen;
+        self.goto(self.prev_screen);
     }
 }
 
@@ -2400,7 +3220,14 @@ pub fn truncate(s: &str, n: usize) -> String {
 impl eframe::App for CraApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.pump_messages();
-        if self
+        // Fold finished calls into the ledger before anything reads it, so the
+        // running count, the spend and the limit are all one frame's truth.
+        for done in self.procs.sweep() {
+            self.record_session(&done);
+        }
+        self.handle_close(ctx);
+        if self.procs.running_total() > 0
+            || self
             .candidates
             .iter()
             .any(|c| matches!(c, CandidateState::Pending(_)))
@@ -2416,6 +3243,9 @@ impl eframe::App for CraApp {
 
         self.global_hotkeys(ctx);
         crate::ui::chrome::top_bar(self, ctx);
+        // Directly under the breadcrumb, above everything a screen draws: what
+        // leaving the last page stopped is the first thing to read on landing.
+        crate::ui::procs_panel::nav_notice(self, ctx);
         crate::ui::chrome::hotkey_bar(self, ctx);
         if self.screen != Screen::RepoPicker && self.screen != Screen::Settings {
             crate::ui::chrome::side_panel(self, ctx);
@@ -2431,24 +3261,61 @@ impl eframe::App for CraApp {
             Screen::Eval => self.ui_eval(ctx, ui),
             Screen::Settings => self.ui_settings(ctx, ui),
         });
+        crate::ui::procs_panel::window(self, ctx);
     }
 }
 
 impl CraApp {
+    /// Hold the window open until the model CLIs are actually dead.
+    ///
+    /// Closing is leaving every page at once, and the one departure with no
+    /// window left to report an orphan in. A stop is only a request until a
+    /// worker thread acts on it, and those threads go when the process does —
+    /// so the close is cancelled once, the kills are asked for, and the real
+    /// close waits for every child to confirm.
+    pub(crate) fn handle_close(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| i.viewport().close_requested()) && !self.closing {
+            let n = self.stop_all_models("the app is closing");
+            if n > 0 {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.closing = true;
+                self.note("procs", &format!("closing — terminating {n} process(es)"));
+            }
+        }
+        if self.closing {
+            if self.procs.running_total() == 0 {
+                self.note("procs", "closing — every process terminated");
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            }
+        }
+    }
+
     pub(crate) fn global_hotkeys(&mut self, ctx: &egui::Context) {
         use egui::{Key, Modifiers};
         if ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, Key::Q)) {
+            // Asking for the close rather than doing anything about the models
+            // here: the frame loop's close handler is the one place that waits
+            // for them to actually die, and quitting must go through it like
+            // the window's own close button does.
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
-        // Ctrl+E from anywhere: the page is a read-only look at history, so
-        // there is no state it could interrupt, and Esc returns to whatever
-        // was on screen.
+        // Ctrl+E from anywhere, and Esc returns to whatever was on screen. The
+        // page itself reads history and changes nothing — but going to it is
+        // still leaving, so it stops the models the last page had running and
+        // says so, like any other departure. Coming back offers them.
         if ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, Key::E)) {
             if self.screen == Screen::Eval {
-                self.screen = self.prev_screen;
+                self.goto(self.prev_screen);
             } else {
                 self.open_eval();
             }
+        }
+        // The ledger is a window, not a screen: opening it interrupts
+        // nothing, so it needs no navigation and stops no processes.
+        if ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, Key::P)) {
+            self.show_procs = !self.show_procs;
         }
         if ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, Key::Comma)) {
             if self.screen == Screen::Settings {
@@ -2461,11 +3328,11 @@ impl CraApp {
         if !typing && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
             match self.screen {
                 Screen::Settings => self.close_settings(),
-                Screen::Review => self.screen = Screen::FilePicker,
-                Screen::FilePicker => self.screen = Screen::RefPicker,
-                Screen::RefPicker | Screen::Summary => self.screen = Screen::RepoPicker,
-                Screen::Followup => self.screen = self.followup_from,
-                Screen::Eval => self.screen = self.prev_screen,
+                Screen::Review => self.goto(Screen::FilePicker),
+                Screen::FilePicker => self.goto(Screen::RefPicker),
+                Screen::RefPicker | Screen::Summary => self.goto(Screen::RepoPicker),
+                Screen::Followup => self.goto(self.followup_from),
+                Screen::Eval => self.goto(self.prev_screen),
                 Screen::RepoPicker => {}
             }
         }
@@ -2585,6 +3452,328 @@ mod state_tests {
         }
     }
 
+    /// A helper for the lifecycle tests: a model whose CLI takes long enough
+    /// to still be running when the reviewer walks away, and whose session id
+    /// this app generates — so an interrupted call has something to resume.
+    fn slow_resumable(dir: &TempDir, tag: &str) -> (FakeCli, crate::settings::ModelConfig) {
+        let cli = FakeCli::new(
+            dir,
+            tag,
+            FakeCliSpec { reply: VERDICT, delay_secs: 30, ..Default::default() },
+        );
+        let mut model_config = cli.model_config("--session-id {session}");
+        model_config.resume_command = format!("{} --resume {{session}}", cli.command());
+        (cli, model_config)
+    }
+
+    /// Wait until every process the ledger knows about has confirmed it is
+    /// gone. This is what the banner's tick waits for too.
+    fn wait_until_stopped(app: &mut CraApp) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            app.pump_messages();
+            // The same order the frame loop uses: sweeping is what hands a
+            // finished conversation over to be written down, so a test that
+            // swept separately would lose it.
+            for done in app.procs.sweep() {
+                app.record_session(&done);
+            }
+            if app.procs.running_total() == 0 {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "a process never confirmed the kill");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// Wait for the fake CLI to record a command line containing `needle`.
+    /// Reading argv rather than waiting for a reply lets a test assert what a
+    /// long-running call was launched with without sitting out its whole run.
+    fn wait_for_argv(cli: &FakeCli, needle: &str) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let argv = cli.argv_seen();
+            if argv.contains(needle) {
+                return argv;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the CLI was never run with {needle:?}; last saw {argv:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// Wait until a call is actually running, so a test stops a process rather
+    /// than a plan to start one.
+    fn wait_until_running(app: &mut CraApp) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if app.procs.live().any(|r| r.snapshot().pid.is_some()) {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "no process ever started");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// Walking off the review screen has to end the CLIs it started. Before
+    /// this, they ran to completion against a unit nobody would ever see the
+    /// verdict for — spending the whole time, and holding sessions the app had
+    /// stopped tracking.
+    #[test]
+    fn leaving_the_review_screen_terminates_its_processes_and_pauses_the_sessions() {
+        let dir = TempDir::new("leave_review");
+        let (_cli, model_config) = slow_resumable(&dir, "slow");
+        let mut h = Harness::new("leave_review");
+        h.app.settings.prefetch_next = false;
+        h.enter_with(vec![model_config]);
+        wait_until_running(&mut h.app);
+
+        let pid = h.app.procs.live().next().and_then(|r| r.snapshot().pid);
+        assert!(pid.is_some(), "the call should be a real process by now");
+
+        h.app.goto(Screen::FilePicker);
+
+        // The reviewer is told what happened, by pid, and the claim is only
+        // "terminated" once the process itself has confirmed it.
+        let notice = h.app.nav_notice.as_ref().expect("leaving says what it stopped");
+        assert_eq!(notice.left as u8, Screen::Review as u8);
+        assert_eq!(notice.receipts.len(), 1);
+        assert_eq!(notice.receipts[0].pid, pid);
+        assert_eq!(notice.resumable, 1, "the id was generated up front, so it can be continued");
+
+        wait_until_stopped(&mut h.app);
+        let notice = h.app.nav_notice.as_ref().unwrap();
+        assert!(notice.all_confirmed(), "the banner must not claim a kill it has not seen land");
+        assert!(notice.headline().contains("1/1 process(es) terminated"), "{}", notice.headline());
+        assert_eq!(h.app.procs.running_total(), 0);
+
+        // The card is paused, not failed: the kill was ours, and the session
+        // is still there to go back to.
+        match &h.app.candidates[0] {
+            CandidateState::Paused(p) => {
+                assert_eq!(p.pid, pid);
+                assert!(p.session.is_some(), "a generated id survives the kill");
+                assert!(p.resumable(&h.app.settings));
+            }
+            other => panic!("expected a paused candidate, got {}", state_name(other)),
+        }
+    }
+
+    /// Coming back must show what was paused rather than quietly starting a
+    /// second conversation — the whole point of pausing.
+    #[test]
+    fn coming_back_shows_the_paused_session_and_starts_nothing() {
+        let dir = TempDir::new("back_review");
+        let (cli, model_config) = slow_resumable(&dir, "slow");
+        let mut h = Harness::new("back_review");
+        h.app.settings.prefetch_next = false;
+        h.enter_with(vec![model_config]);
+        wait_until_running(&mut h.app);
+        h.app.goto(Screen::FilePicker);
+        wait_until_stopped(&mut h.app);
+        let session = match &h.app.candidates[0] {
+            CandidateState::Paused(p) => p.session.clone().expect("a session to go back to"),
+            other => panic!("expected paused, got {}", state_name(other)),
+        };
+        let argv_before = cli.argv_seen();
+
+        // Back the way the file picker's own button goes: no plan movement,
+        // no re-ask.
+        h.app.goto(Screen::Review);
+        assert_eq!(h.app.screen as u8, Screen::Review as u8);
+        assert_eq!(h.app.procs.running_total(), 0, "returning must not launch anything");
+        assert!(matches!(h.app.candidates[0], CandidateState::Paused(_)));
+        assert_eq!(cli.argv_seen(), argv_before, "the CLI was not run again");
+
+        // And even the file picker's "start review", which does move the plan,
+        // will not throw the paused session away behind the reviewer's back.
+        h.app.start_review(&egui::Context::default(), 0);
+        assert!(matches!(h.app.candidates[0], CandidateState::Paused(_)));
+        assert_eq!(h.app.procs.running_total(), 0);
+
+        // Resuming is the reviewer's decision, and it goes back to the same
+        // conversation rather than opening a new one.
+        h.app.resume_candidate(&egui::Context::default(), 0);
+        let argv = wait_for_argv(&cli, "--resume");
+        assert!(argv.contains(&session), "resumed some other conversation: {argv}");
+        h.app.stop_all_models("end of test");
+        wait_until_stopped(&mut h.app);
+    }
+
+    /// The reply our own kill produces must not land on the card as a model
+    /// failure, and must not be scored as one either.
+    #[test]
+    fn a_stopped_call_is_not_recorded_as_a_model_error() {
+        let dir = TempDir::new("stopped_not_error");
+        let (_cli, model_config) = slow_resumable(&dir, "slow");
+        let mut h = Harness::new("stopped_not_error");
+        h.app.settings.prefetch_next = false;
+        h.enter_with(vec![model_config]);
+        wait_until_running(&mut h.app);
+        h.app.goto(Screen::FilePicker);
+        wait_until_stopped(&mut h.app);
+
+        // The killed call's reply has arrived by now and left the card alone.
+        assert!(
+            matches!(h.app.candidates[0], CandidateState::Paused(_)),
+            "our own kill overwrote the paused card"
+        );
+        // It is on the record — the tokens were spent — but marked, so the
+        // leaderboard never counts walking away as a model that errors.
+        let scored = h.app.db.agreement_rows().len();
+        assert_eq!(scored, 0, "a stopped call must not reach the scoring join");
+        let log = activity(&h);
+        assert!(log.contains("stopped"), "the stop belongs in the activity log:
+{log}");
+    }
+
+    /// Every page that drives a CLI gets the same treatment, and stopping one
+    /// page's work leaves the others alone.
+    #[test]
+    fn each_page_owns_its_processes_and_only_its_own() {
+        let dir = TempDir::new("owners");
+        let (_cli, model_config) = slow_resumable(&dir, "slow");
+        let mut h = Harness::new("owners");
+        h.app.settings.prefetch_next = false;
+        h.enter_with(vec![model_config]);
+        wait_until_running(&mut h.app);
+        assert_eq!(h.app.procs.running(crate::procs::Owner::Review), 1);
+
+        // Leaving for the summary screen ends the review's work and starts
+        // none of its own.
+        h.app.goto(Screen::Summary);
+        wait_until_stopped(&mut h.app);
+        assert_eq!(h.app.procs.running(crate::procs::Owner::Review), 0);
+
+        // The branch pass is the summary's own work, and leaving the summary
+        // is what ends it.
+        h.app.start_whole_branch_review(&egui::Context::default());
+        wait_until_running(&mut h.app);
+        assert_eq!(h.app.procs.running(crate::procs::Owner::Branch), 1);
+        h.app.goto(Screen::RepoPicker);
+        wait_until_stopped(&mut h.app);
+        assert_eq!(h.app.procs.running_total(), 0);
+        match &h.app.whole_branch_review[0] {
+            WholeBranchReviewState::Paused(p) => assert!(p.pid.is_some()),
+            _ => panic!("the branch pass should be paused, not lost"),
+        }
+    }
+
+    /// The spend a killed call had already run up stays on the books, or a
+    /// reviewer who walks away often would never reach a limit they had set.
+    #[test]
+    fn a_usage_limit_stops_new_calls_and_counts_stopped_ones() {
+        let dir = TempDir::new("limit");
+        let reply = concat!(
+            "{\"type\":\"result\",\"total_cost_usd\":2.5,",
+            "\"usage\":{\"input_tokens\":1000,\"output_tokens\":200},",
+            "\"result\":\"{\\\"action\\\":\\\"keep\\\",\\\"comment\\\":\\\"\\\"}\"}"
+        );
+        let cli = FakeCli::new(&dir, "pricey", FakeCliSpec { reply, ..Default::default() });
+        let mut h = Harness::new("limit");
+        h.app.settings.prefetch_next = false;
+        h.app.settings.usage_limit_usd = 2.0;
+        h.enter_with(vec![cli.model_config("")]);
+        h.wait_for_model_replies();
+        h.app.procs.sweep();
+
+        assert_eq!(h.app.procs.spent().cost_usd, Some(2.5));
+        assert_eq!(h.app.procs.spent().tokens(), 1200);
+        let why = h.app.usage_block().expect("$2.50 spent against a $2.00 ceiling");
+        assert!(why.contains("usage limit reached"), "{why}");
+        assert!(why.contains("settings"), "the way out has to be named: {why}");
+
+        // With the ceiling reached, the next unit is not queried at all.
+        h.app.choose_keep();
+        h.app.save_and_continue(&egui::Context::default(), false);
+        assert_eq!(h.app.procs.running_total(), 0, "a limit that still launches calls is not one");
+        assert!(matches!(h.app.candidates[0], CandidateState::Disabled));
+
+        // Raising it lets the work continue rather than needing a restart.
+        h.app.settings.usage_limit_usd = 100.0;
+        assert!(h.app.usage_block().is_none());
+        h.app.requery_unit(&egui::Context::default());
+        h.wait_for_model_replies();
+        assert!(matches!(h.app.candidates[0], CandidateState::Ready(_)));
+    }
+
+    /// Quitting is leaving every page at once, and the one departure with no
+    /// window left to report an orphan in. The close has to be held back until
+    /// the CLIs are actually dead: the threads that kill them die with the
+    /// process, so exiting on the first request would leave them running.
+    #[test]
+    fn closing_waits_for_the_processes_to_actually_die() {
+        let dir = TempDir::new("quit");
+        let (_cli, model_config) = slow_resumable(&dir, "slow");
+        let mut h = Harness::new("quit");
+        h.enter_with(vec![model_config]);
+        wait_until_running(&mut h.app);
+        assert!(h.app.procs.running_total() > 0);
+
+        // One frame in which the window manager asks to close.
+        let ctx = egui::Context::default();
+        let out = ctx.run(close_request(), |ctx| h.app.handle_close(ctx));
+        assert!(h.app.closing, "the close should have been taken up");
+        assert!(
+            out.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::CancelClose),
+            "the window must be held open while the CLIs are still alive"
+        );
+        assert!(
+            !out.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::Close),
+            "closing before the kills land is exactly the orphan case"
+        );
+
+        // Frames keep coming while the kills land; the last one closes.
+        wait_until_stopped(&mut h.app);
+        let out = ctx.run(egui::RawInput::default(), |ctx| h.app.handle_close(ctx));
+        assert!(
+            out.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::Close),
+            "with nothing left running the app should finally close"
+        );
+        assert_eq!(h.app.procs.running_total(), 0);
+    }
+
+    /// A `RawInput` carrying the window manager's close request.
+    fn close_request() -> egui::RawInput {
+        let mut raw = egui::RawInput::default();
+        raw.viewports
+            .entry(egui::ViewportId::ROOT)
+            .or_default()
+            .events
+            .push(egui::ViewportEvent::Close);
+        raw
+    }
+
+    /// A conversation outlives the run of the app that opened it — the CLI
+    /// still holds it — so the id has to be written down or it is unreachable.
+    #[test]
+    fn a_paused_conversation_is_written_down_for_the_next_run() {
+        let dir = TempDir::new("session_ledger");
+        let (_cli, model_config) = slow_resumable(&dir, "slow");
+        let mut h = Harness::new("session_ledger");
+        h.app.settings.prefetch_next = false;
+        h.enter_with(vec![model_config]);
+        wait_until_running(&mut h.app);
+        h.app.goto(Screen::FilePicker);
+        wait_until_stopped(&mut h.app);
+        let rows = h.app.earlier_paused_sessions();
+        assert_eq!(rows.len(), 1, "the paused conversation should be on the record");
+        assert_eq!(rows[0].owner, "review");
+        let live = match &h.app.candidates[0] {
+            CandidateState::Paused(p) => p.session.clone().unwrap(),
+            other => panic!("expected paused, got {}", state_name(other)),
+        };
+        assert_eq!(rows[0].session, live, "the row must name the conversation the card offers");
+    }
+
     #[test]
     fn entering_a_unit_loads_the_comment_dedented() {
         let mut h = Harness::new("enter");
@@ -2645,6 +3834,7 @@ mod state_tests {
         match s {
             CandidateState::Disabled => "disabled",
             CandidateState::Pending(_) => "pending",
+            CandidateState::Paused(_) => "paused",
             CandidateState::Ready(_) => "ready",
             CandidateState::Failed(_) => "failed",
         }
@@ -3846,6 +5036,7 @@ mod state_tests {
             seq: 4,
             model_index: 0,
             model: "fake".into(),
+            cancelled: false,
             result: Ok(vec![Finding {
                 title: "ghost".into(),
                 detail: String::new(),
@@ -3895,6 +5086,7 @@ mod state_tests {
             seq: stale_seq,
             model_index: 0,
             model: "fake".into(),
+            cancelled: false,
             result: Ok(Suggestion {
                 action: Action::Delete,
                 comment: String::new(),

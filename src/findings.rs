@@ -59,6 +59,8 @@ pub struct WholeBranchReviewMsg {
     pub model: String,
     pub result: Result<Vec<Finding>, String>,
     pub latency_ms: i64,
+    /// Whether this app stopped the pass rather than the model failing it.
+    pub cancelled: bool,
 }
 
 /// Trim the diff to the budget, telling the model when (and how much) is
@@ -116,7 +118,7 @@ pub fn spawn_whole_branch_review(
     repo: String,
     cli_home: String,
     timeout_secs: u64,
-    live: models::LiveHandle,
+    proc: crate::procs::ProcHandle,
     send: impl FnOnce(WholeBranchReviewMsg) + Send + 'static,
     ctx: egui::Context,
 ) {
@@ -134,18 +136,26 @@ pub fn spawn_whole_branch_review(
             &cli_home,
             timeout,
             &mut raw,
-            Some(&live),
+            Some(&proc),
         );
         let (result, latency_ms) = match result {
-            Ok((stdout, stderr, latency_ms)) => {
-                let parsed = parse(&stdout)
-                    .or_else(|| parse(&stderr))
-                    .ok_or_else(|| models::cli_error(&model_config.name, &stdout, &stderr));
-                (parsed, latency_ms)
+            Ok(out) => {
+                let parsed = parse(&out.stdout)
+                    .or_else(|| parse(&out.stderr))
+                    .ok_or_else(|| models::cli_error(&model_config.name, &out.stdout, &out.stderr));
+                (parsed, out.latency_ms)
             }
             Err(e) => (Err(e), 0),
         };
-        send(WholeBranchReviewMsg { seq, model_index, model: model_config.name.clone(), result, latency_ms });
+        let cancelled = models::was_cancelled(&proc);
+        send(WholeBranchReviewMsg {
+            seq,
+            model_index,
+            model: model_config.name.clone(),
+            result,
+            latency_ms,
+            cancelled,
+        });
         ctx.request_repaint();
     });
 }

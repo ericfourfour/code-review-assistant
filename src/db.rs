@@ -38,6 +38,41 @@ pub struct SuggestionRecord<'a> {
     /// and so on. Recorded per row because rounds are where verdicts flip,
     /// and mining that flip needs to know which round each answer belongs to.
     pub round: i64,
+    /// Whether this app stopped the call rather than the model failing it.
+    /// Such a row still carries what the call spent — the tokens were real —
+    /// but it is never scored: the reviewer walking away says nothing about
+    /// the model.
+    pub stopped: bool,
+}
+
+/// One CLI conversation as the ledger records it.
+pub struct CliSessionRecord<'a> {
+    /// The CLI's own id for the conversation.
+    pub session: &'a str,
+    /// The review session it belongs to, when there is one.
+    pub review: Option<i64>,
+    /// Which page started it — "review", "branch review", "fix session".
+    pub owner: &'a str,
+    pub model: &'a str,
+    pub repo: &'a str,
+    /// What the conversation was working on.
+    pub what: &'a str,
+    /// "running", "paused", or "finished".
+    pub state: &'a str,
+    pub pid: Option<u32>,
+    /// What this turn added to the conversation's spend.
+    pub usage: Option<crate::models::Usage>,
+}
+
+/// A conversation an earlier run left paused.
+pub struct PausedSessionRow {
+    pub session: String,
+    pub owner: String,
+    pub model: String,
+    pub what: String,
+    pub at: String,
+    pub tokens: i64,
+    pub cost_usd: Option<f64>,
 }
 
 /// One human verdict on one comment.
@@ -266,6 +301,38 @@ impl Db {
         // activity-log lines, which is exactly what these columns fix.
         add_column(&conn, "suggestions", "follow_up_id", "INTEGER");
         add_column(&conn, "suggestions", "round", "INTEGER");
+        // Whether this app stopped the call rather than the model failing it.
+        // The row is kept because the tokens were spent and the cost table has
+        // to show them; it is marked because scoring a model for a call the
+        // reviewer cut short would make walking away look like a model that
+        // errors, and the leaderboard is the one place that must not happen.
+        add_column(&conn, "suggestions", "stopped", "INTEGER NOT NULL DEFAULT 0");
+        // Every CLI conversation the app has started, so a session outlives
+        // the run of the app that opened it. Without this a crash mid-review
+        // loses the ids, and a paused conversation becomes unreachable — the
+        // CLI still holds it, but nothing here can name it any more.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS cli_sessions(
+                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                 started_at  TEXT NOT NULL,
+                 updated_at  TEXT NOT NULL,
+                 session_id  TEXT NOT NULL,
+                 review      INTEGER,
+                 owner       TEXT NOT NULL,
+                 model       TEXT NOT NULL,
+                 repo        TEXT NOT NULL,
+                 what        TEXT NOT NULL,
+                 state       TEXT NOT NULL,
+                 pid         INTEGER,
+                 turns       INTEGER NOT NULL DEFAULT 0,
+                 input_tokens      INTEGER NOT NULL DEFAULT 0,
+                 output_tokens     INTEGER NOT NULL DEFAULT 0,
+                 cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                 cost_usd    REAL,
+                 UNIQUE(session_id, model)
+             );",
+        )
+        .map_err(|e| e.to_string())?;
         Ok(Db { conn })
     }
 
@@ -303,17 +370,79 @@ impl Db {
             "INSERT INTO suggestions(ts, session_id, file, line_start, line_end, model,
                                      action, comment, justification, latency_ms, error, evidence,
                                      input_tokens, output_tokens, cache_read_tokens, cost_usd,
-                                     cost_estimated, follow_up_id, round)
+                                     cost_estimated, follow_up_id, round, stopped)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                     ?18, ?19)",
+                     ?18, ?19, ?20)",
             params![
                 now(), s.session_id, s.file, s.line_start, s.line_end, s.model, s.action,
                 s.comment, s.justification, s.latency_ms, s.error, s.evidence,
                 s.usage.map(|u| u.input_tokens), s.usage.map(|u| u.output_tokens),
                 s.usage.map(|u| u.cache_read_tokens), s.cost.map(|(usd, _)| usd),
-                s.cost.map(|(_, estimated)| estimated as i64), s.follow_up_id, s.round
+                s.cost.map(|(_, estimated)| estimated as i64), s.follow_up_id, s.round,
+                s.stopped as i64
             ],
         );
+    }
+
+    /// Record — or update — one CLI conversation.
+    ///
+    /// Keyed on (session id, model) so a conversation that runs for several
+    /// turns stays one row that gains spend, rather than a row per turn. This
+    /// is the record that survives the app closing: the CLI still holds the
+    /// conversation afterwards, and without the id written down nothing here
+    /// could ever name it again.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_cli_session(&self, r: &CliSessionRecord) {
+        let usage = r.usage.unwrap_or_default();
+        let _ = self.conn.execute(
+            "INSERT INTO cli_sessions(started_at, updated_at, session_id, review, owner, model,
+                                      repo, what, state, pid, turns,
+                                      input_tokens, output_tokens, cache_read_tokens, cost_usd)
+             VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11, ?12, ?13)
+             ON CONFLICT(session_id, model) DO UPDATE SET
+                 updated_at = ?1,
+                 what  = ?7,
+                 state = ?8,
+                 pid   = ?9,
+                 turns = turns + 1,
+                 input_tokens      = input_tokens + ?10,
+                 output_tokens     = output_tokens + ?11,
+                 cache_read_tokens = cache_read_tokens + ?12,
+                 cost_usd = COALESCE(cost_usd, 0) + COALESCE(?13, 0)",
+            params![
+                now(), r.session, r.review, r.owner, r.model, r.repo, r.what, r.state, r.pid,
+                usage.input_tokens, usage.output_tokens, usage.cache_read_tokens,
+                usage.cost_usd
+            ],
+        );
+    }
+
+    /// Conversations left paused in this repository, newest first — what an
+    /// earlier run of the app walked away from and never came back to.
+    pub fn paused_cli_sessions(&self, repo: &str) -> Vec<PausedSessionRow> {
+        let Ok(mut stmt) = self.conn.prepare(
+            "SELECT session_id, owner, model, what, updated_at,
+                    input_tokens + output_tokens, cost_usd
+             FROM cli_sessions
+             WHERE repo = ?1 AND state = 'paused'
+             ORDER BY updated_at DESC
+             LIMIT 50",
+        ) else {
+            return Vec::new();
+        };
+        stmt.query_map(params![repo], |r| {
+            Ok(PausedSessionRow {
+                session: r.get(0)?,
+                owner: r.get(1)?,
+                model: r.get(2)?,
+                what: r.get(3)?,
+                at: r.get(4)?,
+                tokens: r.get::<_, Option<i64>>(5)?.unwrap_or(0),
+                cost_usd: r.get(6)?,
+            })
+        })
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
     }
 
     /// Record one follow-up question, in full, at the moment it is asked.
@@ -462,7 +591,8 @@ impl Db {
              JOIN decisions d
                ON s.session_id = d.session_id
               AND s.file = d.file
-              AND s.line_start = d.line_start",
+              AND s.line_start = d.line_start
+             WHERE COALESCE(s.stopped, 0) = 0",
         ) else {
             return Vec::new();
         };
@@ -500,6 +630,7 @@ impl Db {
               AND s.file = d.file
               AND s.line_start = d.line_start
              LEFT JOIN sessions sess ON sess.id = d.session_id
+             WHERE COALESCE(s.stopped, 0) = 0
              ORDER BY s.id ASC",
         ) else {
             return Vec::new();

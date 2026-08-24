@@ -6,7 +6,7 @@ use egui::{Key, Modifiers, RichText};
 use crate::app::{CandidateState, CraApp};
 use crate::models::Action;
 use crate::review::{self, Choice};
-use crate::ui::{code, theme};
+use crate::ui::{code, procs_panel, theme};
 
 const NUM_KEYS: [Key; 9] = [
     Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5,
@@ -55,7 +55,9 @@ impl CraApp {
                 self.focus_note = true;
             }
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::R)) {
-                self.enter_unit(ctx);
+                // Explicitly asking again, so a paused card is replaced rather
+                // than protected — that is what the key is for.
+                self.requery_unit(ctx);
                 return;
             }
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::N)) {
@@ -190,6 +192,8 @@ impl CraApp {
         theme::section_title(ui, "CANDIDATES");
         let model_count = self.candidates.len().max(1);
         let mut pick: Option<usize> = None;
+        let mut resume: Option<usize> = None;
+        let mut restart: Option<usize> = None;
         let mut ask_one: Option<usize> = None;
         let mut show_prompt: Option<usize> = None;
         let mut evidence_click: Option<crate::models::Evidence> = None;
@@ -250,12 +254,16 @@ impl CraApp {
                                 ui.spinner();
                                 let snap = live.snapshot();
                                 ui.label(theme::dim(&format!(
-                                    "thinking… {}",
-                                    snap.clock(self.settings.model_timeout_secs)
+                                    "thinking… {} · {}",
+                                    snap.clock(self.settings.model_timeout_secs),
+                                    snap.pid_label()
                                 )));
                                 if let Some(a) = snap.activity_line() {
                                     ui.label(theme::dim(&a));
                                 }
+                            }
+                            Some(CandidateState::Paused(_)) => {
+                                theme::badge(ui, "PAUSED", theme::WARN)
                             }
                             Some(CandidateState::Failed(_)) => theme::badge(ui, "ERROR", theme::BAD),
                             _ => {
@@ -369,11 +377,30 @@ impl CraApp {
                                 }
                             });
                         }
+                        Some(CandidateState::Paused(call)) => {
+                            // The card the reviewer comes back to. Nothing has
+                            // been restarted for them, and the two ways forward
+                            // are spelled out rather than guessed at.
+                            match procs_panel::paused_row(ui, call, &self.settings, "↻ Ask again") {
+                                procs_panel::PausedAction::Resume => resume = Some(i),
+                                procs_panel::PausedAction::Restart => restart = Some(i),
+                                procs_panel::PausedAction::None => {}
+                            }
+                            if ui.button("🗎").on_hover_text("show the prompt/transcript").clicked() {
+                                show_prompt = Some(i);
+                            }
+                        }
                         _ => {}
                     }
                 });
             }
         });
+        if let Some(i) = resume {
+            self.resume_candidate(ctx, i);
+        }
+        if let Some(i) = restart {
+            self.restart_candidate(ctx, i);
+        }
         if let Some(i) = pick {
             self.choose_candidate(i);
         }
