@@ -146,20 +146,20 @@ mod tests {
     use crate::comments::{CommentStyle, CommentUnit};
 
     fn comment(file: &str, line: u32, text: &str) -> ReviewUnit {
+        let indent = text[..text.len() - text.trim_start().len()].to_string();
         ReviewUnit::Comment(CommentUnit {
             file: file.into(),
             lang: "Rust".into(),
             start_line: line,
             end_line: line,
             raw_lines: vec![text.to_string()],
-            indent: String::new(),
+            indent,
             style: CommentStyle::Line { prefix: "//".into() },
             context: String::new(),
             hunk_header: String::new(),
             has_added: true,
         })
     }
-
     fn code(file: &str, line: u32, lines: &[&str], scope: Option<&str>, context: &str) -> ReviewUnit {
         ReviewUnit::Code(CodeUnit {
             file: file.into(),
