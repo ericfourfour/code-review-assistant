@@ -42,22 +42,22 @@ jobs:
       - name: Build release executable
         run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Package and upload Unix executable
+      - name: Upload Unix executable
         if: runner.os != 'Windows'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          archive="code-review-assistant-${GITHUB_REF_NAME}-${{ matrix.asset-suffix }}.tar.gz"
-          tar -C "target/${{ matrix.target }}/release" -czf "$archive" code-review-assistant
-          gh release upload "$GITHUB_REF_NAME" "$archive" --clobber
+          asset="code-review-assistant-${{ matrix.asset-suffix }}"
+          cp "target/${{ matrix.target }}/release/code-review-assistant" "$asset"
+          gh release upload "$GITHUB_REF_NAME" "$asset" --clobber
 
-      - name: Package and upload Windows executable
+      - name: Upload Windows executable
         if: runner.os == 'Windows'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $archive = "code-review-assistant-$env:GITHUB_REF_NAME-${{ matrix.asset-suffix }}.zip"
-          Compress-Archive -Path target/${{ matrix.target }}/release/code-review-assistant.exe -DestinationPath $archive
-          gh release upload $env:GITHUB_REF_NAME $archive --clobber
+          $asset = "code-review-assistant-${{ matrix.asset-suffix }}.exe"
+          Copy-Item target/${{ matrix.target }}/release/code-review-assistant.exe $asset
+          gh release upload $env:GITHUB_REF_NAME $asset --clobber

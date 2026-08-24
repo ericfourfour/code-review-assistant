@@ -4,21 +4,25 @@ A local assistant for reviewing code changes.
 
 ## Installation
 
-Download the archive for your system from the [latest release](https://github.com/ericfourfour/code-review-assistant/releases/latest):
+Each command installs the latest release as `code-review-assistant` and makes it available on `PATH`.
 
-| System | Release asset |
-| --- | --- |
-| Linux x86_64 | `code-review-assistant-TAG-linux-x86_64.tar.gz` |
-| Windows x86_64 | `code-review-assistant-TAG-windows-x86_64.zip` |
-| macOS Apple Silicon | `code-review-assistant-TAG-macos-arm64.tar.gz` |
+### Linux x86_64
 
-Extract the archive, then run `code-review-assistant.exe` on Windows or `code-review-assistant` on Linux and macOS. On Linux and macOS, you can run it from a terminal with:
-
-```console
-./code-review-assistant
+```sh
+tmp="$(mktemp)" && curl -fsSL https://github.com/ericfourfour/code-review-assistant/releases/latest/download/code-review-assistant-linux-x86_64 -o "$tmp" && sudo mkdir -p /usr/local/bin && sudo install -m 0755 "$tmp" /usr/local/bin/code-review-assistant && rm -f "$tmp"
 ```
 
-The macOS executable is not code-signed, so its first launch may require approval in **System Settings → Privacy & Security**.
+### macOS Apple Silicon
+
+```sh
+tmp="$(mktemp)" && curl -fsSL https://github.com/ericfourfour/code-review-assistant/releases/latest/download/code-review-assistant-macos-arm64 -o "$tmp" && sudo mkdir -p /usr/local/bin && sudo install -m 0755 "$tmp" /usr/local/bin/code-review-assistant && rm -f "$tmp"
+```
+
+### Windows x86_64 (PowerShell)
+
+```powershell
+$ErrorActionPreference = 'Stop'; $dir = Join-Path $env:LOCALAPPDATA 'Programs\code-review-assistant'; New-Item -ItemType Directory -Force $dir | Out-Null; Invoke-WebRequest 'https://github.com/ericfourfour/code-review-assistant/releases/latest/download/code-review-assistant-windows-x86_64.exe' -OutFile (Join-Path $dir 'code-review-assistant.exe'); $userPath = [Environment]::GetEnvironmentVariable('Path', 'User'); if (($userPath -split ';') -notcontains $dir) { [Environment]::SetEnvironmentVariable('Path', ("$userPath;$dir").Trim(';'), 'User') }; if (($env:Path -split ';') -notcontains $dir) { $env:Path = "$env:Path;$dir" }
+```
 
 ## Development
 
