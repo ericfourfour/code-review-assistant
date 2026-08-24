@@ -31,6 +31,8 @@ right is where their fate is read.",
         let mut reset_prompt = false;
         let mut start = false;
         let mut send = false;
+        let mut resume_paused = false;
+        let mut restart_paused = false;
         let can_resume = self.fix_can_resume();
         let model_options: Vec<(usize, String)> = self
             .settings
@@ -195,9 +197,13 @@ right is where their fate is read.",
                         ui.spinner();
                         // The fix session runs on a quadrupled deadline.
                         let deadline = self.settings.model_timeout_secs.saturating_mul(4);
-                        match self.fix_live.as_ref().map(|l| l.snapshot()) {
+                        match self.fix_proc.as_ref().map(|l| l.snapshot()) {
                             Some(snap) => {
-                                ui.label(theme::dim(&format!("working… {}", snap.clock(deadline))));
+                                ui.label(theme::dim(&format!(
+                                    "working… {} · {}",
+                                    snap.clock(deadline),
+                                    snap.pid_label()
+                                )));
                                 if let Some(a) = snap.activity_line() {
                                     ui.label(theme::dim(&a));
                                 }
@@ -216,6 +222,20 @@ right is where their fate is read.",
                 ui.add_space(4.0);
 
                 theme::section_title(ui, "SESSION");
+                // The turn that was cut short when the reviewer left this
+                // page. Nothing has been restarted for them.
+                if let Some(call) = &self.fix_paused {
+                    match crate::ui::procs_panel::paused_row(
+                        ui,
+                        call,
+                        &self.settings,
+                        "↻ Start a new session",
+                    ) {
+                        crate::ui::procs_panel::PausedAction::Resume => resume_paused = true,
+                        crate::ui::procs_panel::PausedAction::Restart => restart_paused = true,
+                        crate::ui::procs_panel::PausedAction::None => {}
+                    }
+                }
                 if self.fix_convo.is_empty() {
                     ui.label(theme::dim("no session yet — check a note and begin"));
                 } else {
@@ -237,7 +257,7 @@ right is where their fate is read.",
                                 if t.reply.is_empty() {
                                     ui.horizontal(|ui| {
                                         ui.spinner();
-                                        match self.fix_live.as_ref().map(|l| l.snapshot()) {
+                                        match self.fix_proc.as_ref().map(|l| l.snapshot()) {
                                             Some(snap) => {
                                                 let deadline = self
                                                     .settings
@@ -291,6 +311,21 @@ right is where their fate is read.",
         }
         if let Some(id) = dismiss {
             self.dismiss_note(id);
+        }
+        if resume_paused {
+            self.resume_fix(ctx);
+        }
+        if restart_paused {
+            // A new session starts from the notes again, so the stopped one is
+            // let go of rather than left offering a resume that no longer
+            // matches what is on screen.
+            self.fix_paused = None;
+            self.fix_convo.clear();
+            self.fix_session = None;
+            self.note(
+                "follow-up",
+                "dropped the paused session — check notes and begin again",
+            );
         }
         if start {
             self.start_fix_session(ctx);

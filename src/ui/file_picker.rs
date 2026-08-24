@@ -31,7 +31,31 @@ impl CraApp {
         }
 
         ui.heading("Pick file — or start the full review");
+        let mut back_to_review = false;
         ui.horizontal(|ui| {
+            // Picking a file restarts the review at that file's first unit,
+            // which is a different thing from going back to where you were.
+            // Both are offered because both are wanted, and only one of them
+            // costs another round of model calls.
+            if let Some(at) = self.review_in_progress() {
+                let paused = self
+                    .candidates
+                    .iter()
+                    .filter(|c| matches!(c, crate::app::CandidateState::Paused(_)))
+                    .count();
+                let label = match paused {
+                    0 => format!("◀ Back to {at}"),
+                    n => format!("◀ Back to {at} ({n} paused)"),
+                };
+                if ui
+                    .button(label)
+                    .on_hover_text("returns to the unit you left — nothing is re-asked")
+                    .clicked()
+                {
+                    back_to_review = true;
+                }
+                ui.separator();
+            }
             if ui.button("▶ Start full review [S]").clicked() {
                 start_at = Some(0);
             }
@@ -126,6 +150,9 @@ impl CraApp {
             ui.label(theme::dim("no plan — pick a branch or PR first"));
         }
 
+        if back_to_review {
+            self.goto(crate::app::Screen::Review);
+        }
         if let Some(idx) = start_at {
             self.start_review(ctx, idx);
         }

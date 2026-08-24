@@ -217,6 +217,22 @@ pub struct Settings {
     /// Bumped when a one-shot migration must repair shipped defaults.
     #[serde(default)]
     pub schema_version: u32,
+    /// Stop launching model calls once this run of the app has spent this many
+    /// USD. Zero means no ceiling.
+    ///
+    /// Measured against what the CLIs themselves reported, never against an
+    /// estimate: a model whose CLI is silent about spend cannot be counted,
+    /// and stopping the work on a guess would stop it for the wrong reason.
+    /// The ceiling is per run rather than per day because that is the window
+    /// this app can actually account for — it sees its own calls and nothing
+    /// else the same CLIs may be doing elsewhere on the machine.
+    #[serde(default)]
+    pub usage_limit_usd: f64,
+    /// Stop launching model calls once this run has spent this many tokens
+    /// (input plus output). Zero means no ceiling. Useful for the CLIs that
+    /// count tokens but never price them.
+    #[serde(default)]
+    pub usage_limit_tokens: i64,
 }
 
 const SCHEMA_VERSION: u32 = 3;
@@ -311,6 +327,10 @@ impl Default for Settings {
             prefetch_next: true,
             defer_unanimous_keeps: true,
             schema_version: SCHEMA_VERSION,
+            // No ceiling by default: a limit the reviewer did not ask for
+            // would stop a review part-way with no warning.
+            usage_limit_usd: 0.0,
+            usage_limit_tokens: 0,
         }
     }
 }
