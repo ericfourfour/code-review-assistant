@@ -1,15 +1,15 @@
-//! Test-only scaffolding: a throwaway directory, a scriptable fake model CLI,
+//! Test helpers: a throwaway directory, a scriptable fake model CLI,
 //! and a throwaway git repository.
 //!
 //! The point is to exercise the code that touches the outside world — process
 //! spawning, stdin piping, git — without reaching the network or the user's
-//! real database. Everything lands in a uniquely named temp directory that is
+//! real database. Everything is created in a uniquely named temp directory that is
 //! deleted when its guard drops, so tests still run in parallel.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use crate::settings::ModelSlot;
+use crate::settings::ModelConfig;
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -161,15 +161,17 @@ impl FakeCli {
         self.program.to_string_lossy().to_string()
     }
 
-    /// A slot wired to this fake. `extra` is appended to the command template,
+    /// A model configuration for this fake. `extra` is appended to the command template,
     /// so a test can add `{prompt}` or `{session}` as needed.
-    pub fn slot(&self, extra: &str) -> ModelSlot {
+    pub fn model_config(&self, extra: &str) -> ModelConfig {
         let command = if extra.is_empty() {
             self.command()
         } else {
             format!("{} {extra}", self.command())
         };
-        ModelSlot {
+        ModelConfig {
+            price_in: 0.0,
+            price_out: 0.0,
             name: "fake".into(),
             command,
             coauthor: "Fake <fake@example.com>".into(),
@@ -211,7 +213,7 @@ struct Logs<'a> {
     reply: &'a Path,
 }
 
-/// A real git repository in a temp directory, so the git plumbing can be
+/// A real git repository in a temp directory, so the git command code can be
 /// tested against the binary it actually shells out to.
 pub struct TempRepo {
     dir: TempDir,

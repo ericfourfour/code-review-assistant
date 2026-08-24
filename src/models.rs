@@ -2,11 +2,12 @@
 //! on background threads and parse their JSON verdicts.
 
 use serde::{Deserialize, Serialize};
-use std::io::{Read, Write};
+use std::io::{BufRead, Write};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::settings::ModelSlot;
+use crate::settings::ModelConfig;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Action {
@@ -14,7 +15,7 @@ pub enum Action {
     Rewrite,
     Delete,
     /// Code only: something is wrong that a rewrite of the unit's own lines
-    /// cannot fix. The justification is the payload; nothing is edited.
+    /// cannot fix. The justification describes the finding; nothing is edited.
     Flag,
 }
 
@@ -125,7 +126,7 @@ pub fn followup_prompt(message: &str, code: bool) -> String {
 struct RawSuggestion {
     action: String,
     /// The proposed replacement. Comment prompts call it "comment", code
-    /// prompts "replacement"; either key lands here.
+    /// prompts "replacement"; either key is read into this field.
     #[serde(default, alias = "replacement")]
     comment: String,
     #[serde(default)]
@@ -139,11 +140,170 @@ pub struct CandidateMsg {
     /// Monotonic id of the review position the request was made for; stale
     /// replies (user already moved on) are logged but not displayed.
     pub seq: u64,
-    pub slot_idx: usize,
+    pub model_index: usize,
     pub model: String,
     pub result: Result<Suggestion, String>,
     /// Everything the CLI printed, kept verbatim for the transcript.
     pub raw: String,
+}
+
+/// Shared view into a CLI call still running: when it started, how much it
+/// has printed, and the last recognisable thing it was seen doing. The worker
+/// thread feeds it as output arrives; the UI reads a snapshot each frame.
+/// Cheap to clone — both ends hold the same allocation.
+#[derive(Clone)]
+pub struct LiveHandle(Arc<Mutex<LiveInner>>);
+
+struct LiveInner {
+    started: Instant,
+    lines: u64,
+    activity: String,
+}
+
+/// One frame's view of a running call.
+pub struct LiveSnapshot {
+    pub elapsed: Duration,
+    /// Non-empty output lines seen so far — proof of life even when none of
+    /// them parsed into anything recognisable.
+    pub lines: u64,
+    /// The most recent recognisable step (a tool call, a shell command), or
+    /// empty when the stream has shown none yet.
+    pub activity: String,
+}
+
+impl LiveSnapshot {
+    /// Elapsed against the call's deadline: "47s / 240s".
+    pub fn clock(&self, timeout_secs: u64) -> String {
+        format!("{}s / {timeout_secs}s", self.elapsed.as_secs())
+    }
+
+    /// The activity worth a label: the last recognisable step, else how much
+    /// the CLI has printed, else nothing (it has been silent so far).
+    pub fn activity_line(&self) -> Option<String> {
+        if !self.activity.is_empty() {
+            return Some(self.activity.clone());
+        }
+        (self.lines > 0).then(|| format!("{} line(s) of output", self.lines))
+    }
+}
+
+impl LiveHandle {
+    pub fn new() -> LiveHandle {
+        LiveHandle(Arc::new(Mutex::new(LiveInner {
+            started: Instant::now(),
+            lines: 0,
+            activity: String::new(),
+        })))
+    }
+
+    pub fn snapshot(&self) -> LiveSnapshot {
+        let g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        LiveSnapshot { elapsed: g.started.elapsed(), lines: g.lines, activity: g.activity.clone() }
+    }
+
+    fn on_line(&self, line: &str) {
+        let line = line.trim();
+        if line.is_empty() {
+            return;
+        }
+        // Parse outside the lock; the UI reads snapshots while this runs.
+        let activity = live_activity(line);
+        let mut g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        g.lines += 1;
+        if let Some(a) = activity {
+            g.activity = a;
+        }
+    }
+}
+
+impl Default for LiveHandle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// What one streamed event says the model is doing, if it says anything a
+/// human would recognise. The streaming CLIs (`claude --output-format
+/// stream-json`, `codex --json`) emit one JSON event per line; a tool call is
+/// the reportable step in either stream. Everything else — text deltas,
+/// lifecycle events, non-JSON noise — is counted but not shown.
+fn live_activity(line: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    if let Some(s) = tool_use_activity(&v) {
+        return Some(s);
+    }
+    // codex spells a shell step as a `command` field on the item rather than
+    // as a tool_use block.
+    find_command(&v).map(|c| format!("$ {}", clip_head(&c, 56)))
+}
+
+/// The first `tool_use` block anywhere in the event: the tool's name plus the
+/// most target-like thing in its input.
+fn tool_use_activity(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::Object(o) => {
+            if o.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                if let Some(name) = o.get("name").and_then(|n| n.as_str()) {
+                    let target = o.get("input").and_then(|input| {
+                        ["file_path", "path", "pattern", "command", "url", "query"]
+                            .iter()
+                            .find_map(|k| input.get(*k).and_then(|s| s.as_str()))
+                    });
+                    return Some(match target {
+                        Some(t) => format!("{name} {}", clip_tail(t, 48)),
+                        None => name.to_string(),
+                    });
+                }
+            }
+            o.values().find_map(tool_use_activity)
+        }
+        serde_json::Value::Array(a) => a.iter().find_map(tool_use_activity),
+        _ => None,
+    }
+}
+
+/// The first `command` value anywhere in the event — a string, or an argv
+/// array joined back into one.
+fn find_command(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::Object(o) => {
+            match o.get("command") {
+                Some(serde_json::Value::String(s)) if !s.trim().is_empty() => {
+                    return Some(s.clone())
+                }
+                Some(serde_json::Value::Array(a)) => {
+                    let parts: Vec<&str> = a.iter().filter_map(|x| x.as_str()).collect();
+                    if !parts.is_empty() {
+                        return Some(parts.join(" "));
+                    }
+                }
+                _ => {}
+            }
+            o.values().find_map(find_command)
+        }
+        serde_json::Value::Array(a) => a.iter().find_map(find_command),
+        _ => None,
+    }
+}
+
+/// Keep the start of a string — a command's program and first arguments are
+/// its informative end.
+fn clip_head(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(n - 1).collect();
+    format!("{head}…")
+}
+
+/// Keep the end of a string — a path's file name is its informative end.
+fn clip_tail(s: &str, n: usize) -> String {
+    let total = s.chars().count();
+    if total <= n {
+        return s.to_string();
+    }
+    let tail: String = s.chars().skip(total - (n - 1)).collect();
+    format!("…{tail}")
 }
 
 /// Split the command template into argv, substituting `{prompt}` and `{repo}`
@@ -165,17 +325,13 @@ fn build_argv(
     prompt: &str,
     repo: &str,
     cli_home: &str,
-    slot: &ModelSlot,
+    model_config: &ModelConfig,
 ) -> (Vec<String>, bool) {
     let mut argv: Vec<String> = Vec::new();
     let mut used_placeholder = false;
     // No repository (a replay whose checkout has gone) leaves the CLI pointed
     // at wherever it was started, which is what it would default to anyway.
-    let repo = if repo.trim().is_empty() {
-        "."
-    } else {
-        repo.trim()
-    };
+    let repo = if repo.trim().is_empty() { "." } else { repo.trim() };
     for tok in template.split_whitespace() {
         if tok == "{prompt}" {
             argv.push(prompt.to_string());
@@ -184,26 +340,19 @@ fn build_argv(
             argv.push(tok.replace("{repo}", repo).replace("{cli_home}", cli_home));
         }
     }
-    // Append rather than splice: inserting ahead of the prompt would land
+    // Append rather than splice: inserting ahead of the prompt would place
     // between a flag and its value for templates like `agy -p {prompt}`, where
     // the prompt *is* `-p`'s argument. All three shipped CLIs accept these
     // trailing. A CLI that needs them elsewhere can spell them out in the
     // command template and leave these fields empty.
     for (value, flag, fallback) in [
-        (&slot.model, &slot.model_flag, "--model"),
-        (&slot.effort, &slot.effort_flag, "--effort"),
+        (&model_config.model, &model_config.model_flag, "--model"),
+        (&model_config.effort, &model_config.effort_flag, "--effort"),
     ] {
         if value.trim().is_empty() {
             continue;
         }
-        argv.push(
-            if flag.trim().is_empty() {
-                fallback
-            } else {
-                flag.trim()
-            }
-            .to_string(),
-        );
+        argv.push(if flag.trim().is_empty() { fallback } else { flag.trim() }.to_string());
         argv.push(value.trim().to_string());
     }
     (argv, !used_placeholder)
@@ -244,23 +393,21 @@ fn find_string_key(v: &serde_json::Value, key: &str) -> Option<String> {
 }
 
 /// The session id the CLI reported, looked up by key anywhere in its output.
-/// Returns None when the slot names no key — those CLIs take an id we choose.
+/// Returns None when the model configuration names no key — those CLIs take an id we choose.
 pub fn extract_session_id(output: &str, key: &str) -> Option<String> {
     let key = key.trim();
     if key.is_empty() {
         return None;
     }
-    json_documents(output)
-        .iter()
-        .find_map(|v| find_string_key(v, key))
+    json_documents(output).iter().find_map(|v| find_string_key(v, key))
 }
 
-/// Pull a typed payload out of whatever the CLI printed. Asking a CLI for
+/// Pull a typed reply out of whatever the CLI printed. Asking a CLI for
 /// machine-readable output (needed to recover the session id) wraps the
-/// model's answer in the CLI's own envelope, so the payload arrives as an
+/// model's answer in the CLI's own wrapper, so the reply arrives as an
 /// escaped string inside it rather than as bare text — first scan the output
 /// itself, then every string embedded in its JSON documents.
-pub(crate) fn extract_payload<T: serde::de::DeserializeOwned>(output: &str) -> Option<T> {
+pub(crate) fn extract_reply<T: serde::de::DeserializeOwned>(output: &str) -> Option<T> {
     if let Some(v) = scan_json::<T>(output) {
         return Some(v);
     }
@@ -272,7 +419,7 @@ pub(crate) fn extract_payload<T: serde::de::DeserializeOwned>(output: &str) -> O
 }
 
 fn extract_verdict(output: &str) -> Option<RawSuggestion> {
-    extract_payload(output)
+    extract_reply(output)
 }
 
 #[cfg(test)]
@@ -319,16 +466,130 @@ fn scan_json<T: serde::de::DeserializeOwned>(output: &str) -> Option<T> {
     None
 }
 
+/// What one CLI call spent, as the CLI itself accounted for it.
+///
+/// Nothing here is inferred from the prompt: every field is a number the CLI
+/// printed, and a CLI that prints none leaves this zeroed. That distinction is
+/// the whole point — a model whose CLI is silent about tokens must show as
+/// *unmeasured* on the evaluation page rather than as cheap.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Usage {
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    /// Cached input, for the CLIs that report it apart from `input_tokens`.
+    /// Whether it is *also* counted inside `input_tokens` is up to the CLI, so
+    /// this is shown to the reviewer but never added into an estimate.
+    pub cache_read_tokens: i64,
+    /// USD, and only when the CLI priced the call itself. `None` is not zero:
+    /// it means nobody said.
+    pub cost_usd: Option<f64>,
+}
+
+impl Usage {
+    pub fn tokens(&self) -> i64 {
+        self.input_tokens + self.output_tokens
+    }
+
+    /// True when the CLI said nothing at all about what the call spent.
+    pub fn is_silent(&self) -> bool {
+        self.cost_usd.is_none() && self.tokens() == 0 && self.cache_read_tokens == 0
+    }
+
+    /// What the call cost, and whether that is the CLI's own number (`false`)
+    /// or priced from the model's configured rates (`true`).
+    ///
+    /// Rates are USD per million tokens; zero means "not configured", and with
+    /// both unset an unpriced call stays unpriced rather than becoming a free
+    /// one. Cached input is deliberately not in the arithmetic: only the CLI
+    /// knows whether it already sits inside `input_tokens`, so an estimate is
+    /// approximate in whichever direction that CLI leans, and the reported
+    /// figure always wins when there is one.
+    pub fn priced(&self, price_in: f64, price_out: f64) -> Option<(f64, bool)> {
+        if let Some(usd) = self.cost_usd {
+            return Some((usd, false));
+        }
+        if price_in <= 0.0 && price_out <= 0.0 {
+            return None;
+        }
+        if self.tokens() == 0 {
+            return None;
+        }
+        let per_tok = |rate: f64, n: i64| rate * n as f64 / 1_000_000.0;
+        Some((per_tok(price_in, self.input_tokens) + per_tok(price_out, self.output_tokens), true))
+    }
+}
+
+/// Key names the CLIs use for each figure. Three vendors, three spellings, and
+/// no standard to appeal to — so this is a list of what has actually been seen
+/// rather than a schema.
+const INPUT_KEYS: &[&str] = &["input_tokens", "inputTokens", "prompt_tokens", "promptTokens"];
+const OUTPUT_KEYS: &[&str] =
+    &["output_tokens", "outputTokens", "completion_tokens", "completionTokens"];
+const CACHE_KEYS: &[&str] = &[
+    "cache_read_input_tokens",
+    "cacheReadInputTokens",
+    "cached_input_tokens",
+    "cachedInputTokens",
+];
+const COST_KEYS: &[&str] = &["total_cost_usd", "cost_usd", "totalCostUsd", "costUsd"];
+
+/// The largest value any of `keys` takes anywhere in the document.
+///
+/// Largest, because the shape of the output differs per CLI and both shapes
+/// break under a sum. One prints a single result envelope, sometimes with the
+/// same figures repeated in a per-model breakdown beside it; another streams an
+/// event per turn carrying a running total. Adding would double-count both;
+/// taking the maximum reads the envelope in the first case and the final
+/// running total in the second.
+fn max_by_key(v: &serde_json::Value, keys: &[&str], out: &mut Option<f64>) {
+    match v {
+        serde_json::Value::Object(o) => {
+            for (k, val) in o {
+                if keys.contains(&k.as_str()) {
+                    if let Some(n) = val.as_f64() {
+                        if out.is_none_or(|cur| n > cur) {
+                            *out = Some(n);
+                        }
+                    }
+                }
+                max_by_key(val, keys, out);
+            }
+        }
+        serde_json::Value::Array(a) => a.iter().for_each(|x| max_by_key(x, keys, out)),
+        _ => {}
+    }
+}
+
+/// What the CLI said the call spent. Read from the whole output, before the
+/// transcript is trimmed — the accounting is usually in the last event, which
+/// is exactly the part an excerpt would keep, but the head is trimmed too and
+/// some CLIs put it in the envelope up front.
+pub fn extract_usage(output: &str) -> Usage {
+    let docs = json_documents(output);
+    let find = |keys: &[&str]| -> Option<f64> {
+        let mut out = None;
+        for doc in &docs {
+            max_by_key(doc, keys, &mut out);
+        }
+        out
+    };
+    let count = |keys: &[&str]| find(keys).filter(|n| n.is_finite() && *n >= 0.0).unwrap_or(0.0) as i64;
+    Usage {
+        input_tokens: count(INPUT_KEYS),
+        output_tokens: count(OUTPUT_KEYS),
+        cache_read_tokens: count(CACHE_KEYS),
+        cost_usd: find(COST_KEYS).filter(|n| n.is_finite() && *n >= 0.0),
+    }
+}
+
 /// The most useful error available when the output carried no verdict.
 ///
 /// A CLI that refuses one of its own tools reports it in its envelope and
-/// still exits 0, so without this the slot shows a wall of JSON with the one
+    /// still exits 0, so without this the model shows unreadable JSON output with the one
 /// line that explains it buried inside.
 pub(crate) fn cli_error(name: &str, stdout: &str, stderr: &str) -> String {
     for out in [stdout, stderr] {
-        let reported = json_documents(out)
-            .iter()
-            .find_map(|v| find_string_key(v, "error"));
+        let reported = json_documents(out).iter().find_map(|v| find_string_key(v, "error"));
         if let Some(msg) = reported.filter(|m| !m.trim().is_empty()) {
             return refused_tool(name, &msg).unwrap_or(msg);
         }
@@ -346,16 +607,12 @@ fn refused_tool(name: &str, msg: &str) -> Option<String> {
     }
     // The command is quoted in the refusal; fall back to the whole message
     // rather than guessing if this CLI words it differently.
-    let wanted = msg
-        .split('"')
-        .nth(1)
-        .map(str::trim)
-        .filter(|c| !c.is_empty());
+    let wanted = msg.split('"').nth(1).map(str::trim).filter(|c| !c.is_empty());
     Some(match wanted {
         Some(cmd) => format!(
             "{name} refused a tool it wanted: `{cmd}`. Nothing ran, and retrying will not \
              help until that command is allowed in the CLI's own permission settings. \
-             Reviewing needs only file reads, so a slot that keeps hitting this is reaching \
+             Reviewing needs only file reads, so a model_config that keeps hitting this is reaching \
              for shell commands it does not need."
         ),
         None => format!("{name} refused a tool it wanted: {}", msg.trim()),
@@ -364,114 +621,106 @@ fn refused_tool(name: &str, msg: &str) -> Option<String> {
 
 /// Run one model CLI. Returns the parsed verdict and everything the process
 /// printed (kept for the transcript and the prompt inspector).
-/// `command` is the already-resolved template — the slot's opening command
+/// `command` is the already-resolved template — the model configuration's opening command
 /// or its resume command with the session id substituted in.
 ///
 /// `repo` is the directory the CLI runs in, which is what makes the rest of
 /// the codebase reachable: the prompt names files by their path relative to
 /// the repository root, so the model can only open them if that is where it
 /// started. Empty means "inherit ours", which is what the unit tests use.
+#[allow(clippy::too_many_arguments)]
 fn run_model(
-    slot: &ModelSlot,
+    model_config: &ModelConfig,
     command: &str,
     prompt: &str,
     repo: &str,
     cli_home: &str,
     timeout: Duration,
+    live: Option<&LiveHandle>,
 ) -> (Result<Suggestion, String>, String) {
     let mut raw_output = String::new();
-    let result = run_inner(
-        slot,
-        command,
-        prompt,
-        repo,
-        cli_home,
-        timeout,
-        &mut raw_output,
-    );
+    let result = run_inner(model_config, command, prompt, repo, cli_home, timeout, &mut raw_output, live);
     (result, raw_output)
 }
 
 /// Run a model CLI to completion and collect what it printed: everything up
 /// to — but not including — parsing a verdict out of the output. Shared by
-/// the per-unit review and the branch pass, which want different payloads
-/// from the same plumbing. Returns (stdout, stderr, latency_ms) and appends
+/// the per-unit review and the whole-branch review, which parse different replies
+/// from the same process runner. Returns (stdout, stderr, latency_ms) and appends
 /// the transcript-worthy text to `raw_output`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn capture_cli(
-    slot: &ModelSlot,
+    model_config: &ModelConfig,
     command: &str,
     prompt: &str,
     repo: &str,
     cli_home: &str,
     timeout: Duration,
     raw_output: &mut String,
+    live: Option<&LiveHandle>,
 ) -> Result<(String, String, i64), String> {
-    let (argv, via_stdin) = build_argv(command, prompt, repo, cli_home, slot);
+    let (argv, via_stdin) = build_argv(command, prompt, repo, cli_home, model_config);
     if argv.is_empty() {
         return Err("empty command template".into());
     }
     let started = Instant::now();
     let mut cmd = crate::gitio::hidden_command(&argv[0]);
     cmd.args(&argv[1..])
-        .stdin(if via_stdin {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
+        .stdin(if via_stdin { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if !repo.trim().is_empty() {
         cmd.current_dir(repo);
     }
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("spawn `{}`: {e}", argv[0]))?;
+    let mut child = cmd.spawn().map_err(|e| format!("spawn `{}`: {e}", argv[0]))?;
     if via_stdin {
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(prompt.as_bytes());
         }
     }
 
-    // Drain both pipes while the child runs. Waiting first can deadlock once a
-    // verbose CLI fills either OS pipe buffer and blocks before it can exit.
-    let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
-    let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
-    let stdout_thread = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = stdout_pipe.read_to_end(&mut bytes);
-        bytes
-    });
-    let stderr_thread = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = stderr_pipe.read_to_end(&mut bytes);
-        bytes
-    });
+    // Read both pipes as they fill rather than at exit: that keeps the child
+    // from ever blocking on a full pipe, and it is what feeds the live view
+    // the reviewer watches while the call runs. Results come back over
+    // channels rather than joins — a killed child's pipes can be inherited by
+    // a grandchild that outlives it, and a join would wait that process out.
+    let (out_rx, err_rx) = {
+        let (out_tx, out_rx) = std::sync::mpsc::channel();
+        let (err_tx, err_rx) = std::sync::mpsc::channel();
+        let (pipe, live_output) = (child.stdout.take(), live.cloned());
+        std::thread::spawn(move || { let _ = out_tx.send(read_pipe(pipe, live_output)); });
+        let (pipe, live_output) = (child.stderr.take(), live.cloned());
+        std::thread::spawn(move || { let _ = err_tx.send(read_pipe(pipe, live_output)); });
+        (out_rx, err_rx)
+    };
 
-    // Poll with a deadline; kill on timeout so a hung CLI can't wedge a slot.
+    // Poll with a deadline; kill on timeout so a hung CLI cannot stop the review.
     let deadline = started + timeout;
-    let status = loop {
+    let mut timed_out = false;
+    loop {
         match child.try_wait() {
-            Ok(Some(status)) => break status,
+            Ok(Some(_)) => break,
             Ok(None) => {
                 if Instant::now() > deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(format!("timed out after {}s", timeout.as_secs()));
+                    timed_out = true;
+                    break;
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
             Err(e) => return Err(format!("wait: {e}")),
         }
+    }
+    // On the normal path the child has exited and EOF is imminent, so block.
+    // After a kill, wait only briefly: whatever partial output made it out is
+    // a bonus, and whoever inherited the pipe is not ours to wait for.
+    let grace = Duration::from_millis(300);
+    let recv = |rx: std::sync::mpsc::Receiver<String>| {
+        if timed_out { rx.recv_timeout(grace).unwrap_or_default() } else { rx.recv().unwrap_or_default() }
     };
-    let stdout_bytes = stdout_thread
-        .join()
-        .map_err(|_| "stdout reader panicked".to_string())?;
-    let stderr_bytes = stderr_thread
-        .join()
-        .map_err(|_| "stderr reader panicked".to_string())?;
-    let stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
-    let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
+    let stdout = recv(out_rx);
+    let stderr = recv(err_rx);
     let latency_ms = started.elapsed().as_millis() as i64;
     raw_output.push_str(stdout.trim());
     if !stderr.trim().is_empty() {
@@ -481,28 +730,56 @@ pub(crate) fn capture_cli(
         raw_output.push_str("[stderr] ");
         raw_output.push_str(stderr.trim());
     }
-    if !status.success() && stdout.trim().is_empty() && stderr.trim().is_empty() {
-        return Err(format!("model exited with {status}"));
+    // The partial transcript stays in `raw_output` either way: what a killed
+    // call was doing when the deadline hit is exactly what explains it.
+    if timed_out {
+        return Err(format!("timed out after {}s", timeout.as_secs()));
     }
     Ok((stdout, stderr, latency_ms))
 }
 
+/// Read one pipe to EOF, feeding each line to the live view as it arrives.
+/// Lossy per line rather than per stream; a UTF-8 character never spans a
+/// newline, so the boundaries are safe to convert at.
+fn read_pipe<R: std::io::Read>(pipe: Option<R>, live: Option<LiveHandle>) -> String {
+    let Some(pipe) = pipe else { return String::new() };
+    let mut reader = std::io::BufReader::new(pipe);
+    let mut all = String::new();
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) => break,
+            Ok(_) => {
+                let line = String::from_utf8_lossy(&buf);
+                if let Some(h) = &live {
+                    h.on_line(&line);
+                }
+                all.push_str(&line);
+            }
+            Err(_) => break,
+        }
+    }
+    all
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_inner(
-    slot: &ModelSlot,
+    model_config: &ModelConfig,
     command: &str,
     prompt: &str,
     repo: &str,
     cli_home: &str,
     timeout: Duration,
     raw_output: &mut String,
+    live: Option<&LiveHandle>,
 ) -> Result<Suggestion, String> {
     let (stdout, stderr, latency_ms) =
-        capture_cli(slot, command, prompt, repo, cli_home, timeout, raw_output)?;
+        capture_cli(model_config, command, prompt, repo, cli_home, timeout, raw_output, live)?;
 
     let raw = extract_verdict(&stdout)
         .or_else(|| extract_verdict(&stderr))
-        .ok_or_else(|| cli_error(&slot.name, &stdout, &stderr))?;
+        .ok_or_else(|| cli_error(&model_config.name, &stdout, &stderr))?;
     let action = match raw.action.trim().to_ascii_lowercase().as_str() {
         "keep" | "approve" => Action::Keep,
         "rewrite" | "revise" => Action::Rewrite,
@@ -522,45 +799,90 @@ fn run_inner(
 /// Run a model outside the review loop — the evaluation replay uses this so a
 /// measurement goes through exactly the same path as a real review.
 pub fn run_for_eval(
-    slot: &ModelSlot,
+    model_config: &ModelConfig,
     command: &str,
     prompt: &str,
     repo: &str,
     cli_home: &str,
     timeout: Duration,
 ) -> (Result<Suggestion, String>, String) {
-    run_model(slot, command, prompt, repo, cli_home, timeout)
+    run_model(model_config, command, prompt, repo, cli_home, timeout, None)
 }
 
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_model(
     seq: u64,
-    slot_idx: usize,
-    slot: ModelSlot,
+    model_index: usize,
+    model_config: ModelConfig,
     command: String,
     prompt: String,
     repo: String,
     cli_home: String,
     timeout_secs: u64,
+    live: LiveHandle,
     send: impl FnOnce(CandidateMsg) + Send + 'static,
     ctx: egui::Context,
 ) {
     std::thread::spawn(move || {
         let (result, raw) = run_model(
-            &slot,
+            &model_config,
             &command,
             &prompt,
             &repo,
             &cli_home,
             Duration::from_secs(timeout_secs.max(5)),
+            Some(&live),
         );
-        send(CandidateMsg {
-            seq,
-            slot_idx,
-            model: slot.name.clone(),
-            result,
-            raw,
-        });
+        send(CandidateMsg { seq, model_index, model: model_config.name.clone(), result, raw });
+        ctx.request_repaint();
+    });
+}
+
+/// Message sent back when a fix-session turn finishes. There is no verdict to
+/// parse — the model is doing work on the tree, not judging a unit — so the
+    /// result contains the transcript and whether the process ran at all.
+pub struct FixMsg {
+    pub seq: u64,
+    /// Which configured model was driving the session when it launched, so the
+    /// reply is read with that model's session key even if the picker has
+    /// moved since.
+    pub model_index: usize,
+    pub model: String,
+    /// Latency on success; the CLI's own account of the work is in `raw`.
+    pub result: Result<i64, String>,
+    pub raw: String,
+}
+
+/// Run a CLI turn whose output is for a human, not a parser: the follow-up
+/// fix session, where the model edits the repository and reports in prose.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_freeform(
+    seq: u64,
+    model_index: usize,
+    model_config: ModelConfig,
+    command: String,
+    prompt: String,
+    repo: String,
+    cli_home: String,
+    timeout_secs: u64,
+    live: LiveHandle,
+    send: impl FnOnce(FixMsg) + Send + 'static,
+    ctx: egui::Context,
+) {
+    std::thread::spawn(move || {
+        let mut raw = String::new();
+        let result = capture_cli(
+            &model_config,
+            &command,
+            &prompt,
+            &repo,
+            &cli_home,
+            Duration::from_secs(timeout_secs.max(5)),
+            &mut raw,
+            Some(&live),
+        )
+        .map(|(_, _, latency_ms)| latency_ms);
+        send(FixMsg { seq, model_index, model: model_config.name.clone(), result, raw });
         ctx.request_repaint();
     });
 }
@@ -568,6 +890,83 @@ pub fn spawn_model(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A CLI that wraps the verdict in a result envelope reports what the call
+    /// spent in that same envelope. Losing it would leave the evaluation page
+    /// unable to tell an expensive model from a cheap one.
+    #[test]
+    fn usage_comes_out_of_a_result_envelope() {
+        let out = r#"{"type":"result","subtype":"success","total_cost_usd":0.0123,
+            "usage":{"input_tokens":812,"output_tokens":96,"cache_read_input_tokens":14200},
+            "modelUsage":{"m":{"inputTokens":812,"outputTokens":96}}}"#;
+        let u = extract_usage(out);
+        assert_eq!(u.input_tokens, 812);
+        assert_eq!(u.output_tokens, 96);
+        assert_eq!(u.cache_read_tokens, 14200);
+        assert_eq!(u.cost_usd, Some(0.0123));
+        // The same figures repeated in a per-model breakdown are the same
+        // spend, not twice the spend.
+        assert_eq!(u.tokens(), 908);
+    }
+
+    /// A CLI that streams events carries a running total, so the last event is
+    /// the whole call. Summing the stream would multiply the bill by the number
+    /// of turns the model took.
+    #[test]
+    fn a_running_total_is_read_once_not_summed() {
+        let out = concat!(
+            "{\"type\":\"token_count\",\"info\":{\"total_token_usage\":",
+            "{\"input_tokens\":100,\"cached_input_tokens\":0,\"output_tokens\":20}}}\n",
+            "{\"type\":\"token_count\",\"info\":{\"total_token_usage\":",
+            "{\"input_tokens\":460,\"cached_input_tokens\":320,\"output_tokens\":75},",
+            "\"last_token_usage\":{\"input_tokens\":360,\"output_tokens\":55}}}\n",
+        );
+        let u = extract_usage(out);
+        assert_eq!(u.input_tokens, 460, "the final running total, not the sum of the stream");
+        assert_eq!(u.output_tokens, 75);
+        assert_eq!(u.cache_read_tokens, 320);
+        assert_eq!(u.cost_usd, None, "this CLI prices nothing, and silence is not zero");
+    }
+
+    /// A CLI that says nothing about tokens must be *unmeasured*, never free:
+    /// a zero here would put it at the top of the cost table.
+    #[test]
+    fn silence_about_spend_is_not_a_zero_bill() {
+        let u = extract_usage("{\"action\":\"keep\",\"comment\":\"\"}");
+        assert!(u.is_silent());
+        assert_eq!(u.priced(3.0, 15.0), None, "no tokens to price");
+
+        let counted = Usage { input_tokens: 1_000_000, output_tokens: 100_000, ..Usage::default() };
+        assert!(!counted.is_silent());
+        // Rates are per million tokens: 1M in at $3 plus 0.1M out at $15.
+        let (usd, estimated) = counted.priced(3.0, 15.0).expect("rates are set");
+        assert!((usd - 4.5).abs() < 1e-9, "{usd}");
+        assert!(estimated, "priced from the model's configured rates, not by the CLI");
+        assert_eq!(counted.priced(0.0, 0.0), None, "unrated stays unpriced rather than free");
+    }
+
+    /// The CLI's own figure wins over the configured rates: it knows about
+    /// cache discounts and tier pricing that a flat $/Mtok pair cannot express.
+    #[test]
+    fn a_reported_cost_beats_an_estimate() {
+        let u = Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cost_usd: Some(0.25),
+        };
+        assert_eq!(u.priced(99.0, 99.0), Some((0.25, false)));
+    }
+
+    /// Garbage in the output must not become a negative bill or a NaN that
+    /// poisons every total on the page.
+    #[test]
+    fn nonsense_numbers_are_ignored() {
+        let u = extract_usage("{\"usage\":{\"input_tokens\":-5,\"output_tokens\":\"lots\"}}");
+        assert_eq!(u.input_tokens, 0);
+        assert_eq!(u.output_tokens, 0);
+        assert!(u.is_silent());
+    }
 
     #[test]
     fn extracts_json_from_noisy_output() {
@@ -584,10 +983,7 @@ mod tests {
 \"evidence\":[{\"file\":\"src/retry.rs\",\"lines\":\"10-30\",\"note\":\"caller counts from 1\"}]}";
         let raw = extract_json(out).unwrap();
         assert_eq!(raw.action, "revise");
-        assert_eq!(
-            raw.comment, "    retry(n - 1);",
-            "\"replacement\" must land in comment"
-        );
+        assert_eq!(raw.comment, "    retry(n - 1);", "\"replacement\" must map to comment");
         assert_eq!(raw.evidence.len(), 1);
         assert_eq!(raw.evidence[0].file, "src/retry.rs");
         assert_eq!(raw.evidence[0].lines, "10-30");
@@ -622,8 +1018,15 @@ mod tests {
         assert!(raw.justification.contains("{braces}"));
     }
 
-    fn slot(model: &str, model_flag: &str, effort: &str, effort_flag: &str) -> ModelSlot {
-        ModelSlot {
+    fn model_config(
+        model: &str,
+        model_flag: &str,
+        effort: &str,
+        effort_flag: &str,
+    ) -> ModelConfig {
+        ModelConfig {
+            price_in: 0.0,
+            price_out: 0.0,
             name: "t".into(),
             command: String::new(),
             coauthor: String::new(),
@@ -639,7 +1042,7 @@ mod tests {
 
     #[test]
     fn argv_placeholder_vs_stdin() {
-        let bare = slot("", "--model", "", "--effort");
+        let bare = model_config("", "--model", "", "--effort");
         let (argv, stdin) = build_argv("claude -p {prompt}", "hello", "", "", &bare);
         assert_eq!(argv, vec!["claude", "-p", "hello"]);
         assert!(!stdin);
@@ -650,68 +1053,34 @@ mod tests {
 
     #[test]
     fn model_and_effort_trail_so_they_never_split_a_flag_from_its_value() {
-        let (argv, _) = build_argv(
-            "claude -p",
-            "hi",
-            "",
-            "",
-            &slot("haiku", "--model", "low", "--effort"),
-        );
-        assert_eq!(
-            argv,
-            vec!["claude", "-p", "--model", "haiku", "--effort", "low"]
-        );
+        let (argv, _) =
+            build_argv("claude -p", "hi", "", "", &model_config("haiku", "--model", "low", "--effort"));
+        assert_eq!(argv, vec!["claude", "-p", "--model", "haiku", "--effort", "low"]);
         // `agy -p {prompt}` passes the prompt as -p's value, so the flags must
-        // land after it — inserting ahead would make -p consume "--model".
-        let (argv, _) = build_argv(
-            "agy -p {prompt}",
-            "hi",
-            "",
-            "",
-            &slot("gemini-3.7-flash-low", "--model", "", ""),
-        );
-        assert_eq!(
-            argv,
-            vec!["agy", "-p", "hi", "--model", "gemini-3.7-flash-low"]
-        );
+        // follow it — inserting ahead would make -p consume "--model".
+        let (argv, _) =
+            build_argv("agy -p {prompt}", "hi", "", "", &model_config("gemini-3.7-flash-low", "--model", "", ""));
+        assert_eq!(argv, vec!["agy", "-p", "hi", "--model", "gemini-3.7-flash-low"]);
         // codex routes effort through a config override rather than a flag
         let (argv, _) = build_argv(
             "codex exec",
             "hi",
             "",
             "",
-            &slot(
-                "gpt-5.6-luna",
-                "--model",
-                "model_reasoning_effort=low",
-                "-c",
-            ),
+            &model_config("gpt-5.6-luna", "--model", "model_reasoning_effort=low", "-c"),
         );
         assert_eq!(
             argv,
-            vec![
-                "codex",
-                "exec",
-                "--model",
-                "gpt-5.6-luna",
-                "-c",
-                "model_reasoning_effort=low"
-            ]
+            vec!["codex", "exec", "--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=low"]
         );
         // empty values leave argv untouched
-        let (argv, _) = build_argv(
-            "claude -p",
-            "hi",
-            "",
-            "",
-            &slot("  ", "--model", " ", "--effort"),
-        );
+        let (argv, _) = build_argv("claude -p", "hi", "", "", &model_config("  ", "--model", " ", "--effort"));
         assert_eq!(argv, vec!["claude", "-p"]);
     }
 
     #[test]
     fn the_cli_home_token_points_a_cli_at_the_config_this_app_owns() {
-        let bare = slot("", "--model", "", "--effort");
+        let bare = model_config("", "--model", "", "--effort");
         let (argv, _) = build_argv(
             "agy --gemini_dir={cli_home} -p {prompt} --add-dir {repo}",
             "hi",
@@ -723,31 +1092,19 @@ mod tests {
         // happen inside the token — and a space in the path must not split it.
         assert_eq!(
             argv,
-            vec![
-                "agy",
-                "--gemini_dir=C:/data/agy home",
-                "-p",
-                "hi",
-                "--add-dir",
-                "C:/code/app"
-            ]
+            vec!["agy", "--gemini_dir=C:/data/agy home", "-p", "hi", "--add-dir", "C:/code/app"]
         );
     }
 
     #[test]
     fn the_repo_token_names_the_directory_and_survives_spaces_in_it() {
-        let bare = slot("", "--model", "", "--effort");
-        let (argv, _) = build_argv(
-            "agy -p {prompt} --add-dir {repo}",
-            "hi",
-            "C:/code/app",
-            "",
-            &bare,
-        );
+        let bare = model_config("", "--model", "", "--effort");
+        let (argv, _) = build_argv("agy -p {prompt} --add-dir {repo}", "hi", "C:/code/app", "", &bare);
         assert_eq!(argv, vec!["agy", "-p", "hi", "--add-dir", "C:/code/app"]);
         // The template is tokenized on whitespace, so a path with a space in
         // it has to come back out as one argument rather than two.
-        let (argv, _) = build_argv("agy --add-dir {repo}", "hi", "C:/my code/app", "", &bare);
+        let (argv, _) =
+            build_argv("agy --add-dir {repo}", "hi", "C:/my code/app", "", &bare);
         assert_eq!(argv, vec!["agy", "--add-dir", "C:/my code/app"]);
         // A replay whose checkout is gone still has to produce a valid argv.
         let (argv, _) = build_argv("agy --add-dir {repo}", "hi", "", "", &bare);
@@ -759,17 +1116,11 @@ mod tests {
         // codex --json emits an event stream
         let codex = "{\"type\":\"thread.started\",\"thread_id\":\"abc-123\"}\n\
 {\"type\":\"turn.started\"}";
-        assert_eq!(
-            extract_session_id(codex, "thread_id"),
-            Some("abc-123".into())
-        );
+        assert_eq!(extract_session_id(codex, "thread_id"), Some("abc-123".into()));
         // agy emits one object
         let agy = "{\"conversation_id\":\"xyz-789\",\"response\":\"hi\"}";
-        assert_eq!(
-            extract_session_id(agy, "conversation_id"),
-            Some("xyz-789".into())
-        );
-        // a slot that names no key never reports one — the id is ours to pick
+        assert_eq!(extract_session_id(agy, "conversation_id"), Some("xyz-789".into()));
+        // a model configuration that names no key never reports one — the id is ours to pick
         assert_eq!(extract_session_id(agy, ""), None);
         assert_eq!(extract_session_id("plain text", "thread_id"), None);
     }
@@ -799,7 +1150,7 @@ mod tests {
         // What agy returns once it has a rule to bounce off rather than an
         // unanswerable confirmation: it routes around the refused command,
         // answers from files, and reports both. The verdict is the part that
-        // matters, so a slot must show a candidate and not an error.
+        // matters, so a model must show a candidate and not an error.
         let mixed = "{\"conversation_id\":\"x\",\"status\":\"ERROR\",\"response\":\"\
 {\\\"action\\\":\\\"keep\\\",\\\"comment\\\":\\\"\\\",\\\"justification\\\":\\\"reads fine\\\"}\",\
 \"error\":\"permission check failed for command \\\"git log -1\\\": Matches user-configured \
@@ -811,16 +1162,13 @@ deny rule.\"}";
 
     #[test]
     fn a_refused_tool_is_reported_as_itself_rather_than_as_unparseable_output() {
-        // agy exits 0 and puts the refusal in its envelope, so the slot would
-        // otherwise show a JSON blob whose first 400 characters say nothing.
+        // agy exits 0 and puts the refusal in its envelope, so the model would
+        // otherwise show JSON output whose first 400 characters say nothing.
         let refusal = "{\"conversation_id\":\"x\",\"status\":\"ERROR\",\"response\":\"\",\
 \"error\":\"permission check failed for command \\\"git log -1\\\": user denied permission\"}";
         let err = cli_error("agy", refusal, "");
-        assert!(
-            err.contains("git log -1"),
-            "the command it wanted must survive: {err}"
-        );
-        assert!(err.contains("agy"), "the slot must be named: {err}");
+        assert!(err.contains("git log -1"), "the command it wanted must survive: {err}");
+        assert!(err.contains("agy"), "the model must be named: {err}");
         assert!(!err.contains("no JSON verdict"), "{err}");
 
         // An envelope error that is not about permissions is passed through.
@@ -834,11 +1182,7 @@ deny rule.\"}";
     #[test]
     fn a_long_transcript_keeps_the_envelope_and_the_verdict() {
         let short = "{\"action\":\"keep\"}";
-        assert_eq!(
-            transcript_excerpt(short),
-            short,
-            "a normal reply is untouched"
-        );
+        assert_eq!(transcript_excerpt(short), short, "a normal reply is untouched");
 
         // What a CLI prints when the model reads a few files on its way to an
         // answer: an opening event, a wall of file content, then the verdict.
@@ -847,23 +1191,10 @@ deny rule.\"}";
             "x".repeat(200_000)
         );
         let kept = transcript_excerpt(&long);
-        assert!(
-            kept.chars().count() < 7_000,
-            "still {} chars",
-            kept.chars().count()
-        );
-        assert!(
-            kept.starts_with("{\"type\":\"thread.started\""),
-            "lost the envelope"
-        );
-        assert!(
-            kept.ends_with("{\"action\":\"delete\"}"),
-            "lost the verdict"
-        );
-        assert!(
-            kept.contains("characters elided"),
-            "the cut should be visible: {kept:.200}"
-        );
+        assert!(kept.chars().count() < 7_000, "still {} chars", kept.chars().count());
+        assert!(kept.starts_with("{\"type\":\"thread.started\""), "lost the envelope");
+        assert!(kept.ends_with("{\"action\":\"delete\"}"), "lost the verdict");
+        assert!(kept.contains("characters elided"), "the cut should be visible: {kept:.200}");
     }
 
     #[test]
@@ -872,6 +1203,62 @@ deny rule.\"}";
         assert!(p.starts_with("too wordy — one line?"));
         assert!(p.contains("\"action\""));
         assert!(p.contains("keep|rewrite|delete"));
+    }
+
+    #[test]
+    fn live_activity_reads_a_tool_call_out_of_a_stream_event() {
+        // claude --output-format stream-json: an assistant message event
+        // carrying a tool_use block.
+        let ev = "{\"type\":\"assistant\",\"message\":{\"content\":[\
+{\"type\":\"tool_use\",\"name\":\"Read\",\"input\":{\"file_path\":\"src/config.rs\"}}]}}";
+        assert_eq!(live_activity(ev).unwrap(), "Read src/config.rs");
+        // codex --json: the step is a command on the item, argv-style.
+        let ev = "{\"type\":\"item.started\",\"item\":{\"type\":\"command_execution\",\
+\"command\":[\"bash\",\"-lc\",\"cargo test\"]}}";
+        assert_eq!(live_activity(ev).unwrap(), "$ bash -lc cargo test");
+        // Lifecycle noise and plain text are counted, never shown.
+        assert_eq!(live_activity("{\"type\":\"turn.started\"}"), None);
+        assert_eq!(live_activity("plain text, not an event"), None);
+    }
+
+    #[test]
+    fn a_live_handle_keeps_the_last_step_and_counts_the_stream() {
+        let live = LiveHandle::new();
+        live.on_line("{\"type\":\"system\",\"subtype\":\"init\"}");
+        live.on_line(
+            "{\"type\":\"assistant\",\"message\":{\"content\":[\
+{\"type\":\"tool_use\",\"name\":\"Grep\",\"input\":{\"pattern\":\"RETRY_LIMIT\"}}]}}",
+        );
+        live.on_line("   ");
+        let snap = live.snapshot();
+        assert_eq!(snap.lines, 2, "blank lines are not output");
+        assert_eq!(snap.activity, "Grep RETRY_LIMIT");
+        assert_eq!(snap.activity_line().unwrap(), "Grep RETRY_LIMIT");
+        // Output with no recognisable step in it still shows proof of life.
+        let quiet = LiveHandle::new();
+        quiet.on_line("warming up");
+        assert_eq!(quiet.snapshot().activity_line().unwrap(), "1 line(s) of output");
+    }
+
+    #[test]
+    fn a_stream_json_transcript_still_yields_verdict_and_usage() {
+        // The shape `claude -p --verbose --output-format stream-json` prints:
+        // events as they happen, then a result envelope whose `result` string
+        // carries the model's final text — the verdict escaped inside it.
+        let out = "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-1\"}\n\
+{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\
+\"name\":\"Read\",\"input\":{\"file_path\":\"src/config.rs\"}}]}}\n\
+{\"type\":\"result\",\"subtype\":\"success\",\"total_cost_usd\":0.0042,\
+\"usage\":{\"input_tokens\":900,\"output_tokens\":80},\
+\"result\":\"{\\\"action\\\":\\\"keep\\\",\\\"comment\\\":\\\"\\\",\
+\\\"justification\\\":\\\"matches the constant\\\"}\"}";
+        let v = extract_verdict(out).unwrap();
+        assert_eq!(v.action, "keep");
+        assert_eq!(v.justification, "matches the constant");
+        let u = extract_usage(out);
+        assert_eq!(u.input_tokens, 900);
+        assert_eq!(u.output_tokens, 80);
+        assert_eq!(u.cost_usd, Some(0.0042));
     }
 }
 
@@ -883,83 +1270,49 @@ mod spawn_tests {
     const VERDICT: &str =
         "{\"action\":\"rewrite\",\"comment\":\"Bump it.\",\"justification\":\"clearer\"}";
 
-    fn run(slot: &ModelSlot, prompt: &str) -> (Result<Suggestion, String>, String) {
-        let command = slot.command.clone();
-        run_model(slot, &command, prompt, "", "", Duration::from_secs(30))
+    fn run(model_config: &ModelConfig, prompt: &str) -> (Result<Suggestion, String>, String) {
+        let command = model_config.command.clone();
+        run_model(model_config, &command, prompt, "", "", Duration::from_secs(30), None)
     }
 
     #[test]
     fn prompt_reaches_the_cli_on_stdin() {
         let dir = TempDir::new("stdin");
-        let cli = FakeCli::new(
-            &dir,
-            "fake",
-            FakeCliSpec {
-                reply: VERDICT,
-                ..Default::default()
-            },
-        );
-        let slot = cli.slot("");
+        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let model_config = cli.model_config("");
 
-        let (res, _) = run(&slot, "line one\nline two");
+        let (res, _) = run(&model_config, "line one\nline two");
         let s = res.expect("verdict");
         assert_eq!(s.action, Action::Rewrite);
         assert_eq!(s.comment, "Bump it.");
         // Multi-line prompts are exactly what argument passing rejects for a
         // .cmd shim, so this is the case that has to go over the pipe.
         let seen = cli.stdin_seen();
-        assert!(
-            seen.contains("line one"),
-            "stdin missing first line: {seen:?}"
-        );
-        assert!(
-            seen.contains("line two"),
-            "stdin missing second line: {seen:?}"
-        );
+        assert!(seen.contains("line one"), "stdin missing first line: {seen:?}");
+        assert!(seen.contains("line two"), "stdin missing second line: {seen:?}");
     }
 
     #[test]
     fn prompt_reaches_the_cli_as_an_argument_when_templated() {
         let dir = TempDir::new("argv");
-        let cli = FakeCli::new(
-            &dir,
-            "fake",
-            FakeCliSpec {
-                reply: VERDICT,
-                ..Default::default()
-            },
-        );
-        let slot = cli.slot("{prompt}");
+        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let model_config = cli.model_config("{prompt}");
 
-        let (res, _) = run(&slot, "single-line prompt");
+        let (res, _) = run(&model_config, "single-line prompt");
         assert!(res.is_ok());
-        assert!(
-            cli.argv_seen().contains("single-line prompt"),
-            "{}",
-            cli.argv_seen()
-        );
-        assert!(
-            cli.stdin_seen().trim().is_empty(),
-            "stdin should be closed in argv mode"
-        );
+        assert!(cli.argv_seen().contains("single-line prompt"), "{}", cli.argv_seen());
+        assert!(cli.stdin_seen().trim().is_empty(), "stdin should be closed in argv mode");
     }
 
     #[test]
     fn model_and_effort_reach_the_process_in_order() {
         let dir = TempDir::new("flags");
-        let cli = FakeCli::new(
-            &dir,
-            "fake",
-            FakeCliSpec {
-                reply: VERDICT,
-                ..Default::default()
-            },
-        );
-        let mut slot = cli.slot("--print {prompt}");
-        slot.model = "tiny-model".into();
-        slot.effort = "low".into();
+        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let mut model_config = cli.model_config("--print {prompt}");
+        model_config.model = "tiny-model".into();
+        model_config.effort = "low".into();
 
-        let (res, _) = run(&slot, "hello");
+        let (res, _) = run(&model_config, "hello");
         assert!(res.is_ok());
         let argv = cli.argv_seen();
         let prompt_at = argv.find("hello").expect("prompt in argv");
@@ -967,10 +1320,7 @@ mod spawn_tests {
         let effort_at = argv.find("--effort low").expect("effort flag in argv");
         // Both must trail the prompt, or `--print` would swallow the flag
         // instead of the prompt — the bug agy's -p exposed.
-        assert!(
-            prompt_at < model_at && model_at < effort_at,
-            "wrong order: {argv:?}"
-        );
+        assert!(prompt_at < model_at && model_at < effort_at, "wrong order: {argv:?}");
     }
 
     #[test]
@@ -979,13 +1329,9 @@ mod spawn_tests {
         let cli = FakeCli::new(
             &dir,
             "fake",
-            FakeCliSpec {
-                reply: "command not recognised",
-                exit_code: 1,
-                ..Default::default()
-            },
+            FakeCliSpec { reply: "command not recognised", exit_code: 1, ..Default::default() },
         );
-        let (res, raw) = run(&cli.slot(""), "hi");
+        let (res, raw) = run(&cli.model_config(""), "hi");
         let err = res.unwrap_err();
         assert!(err.contains("no JSON verdict"), "{err}");
         // The raw output is what the prompt inspector shows, so it must survive.
@@ -998,24 +1344,16 @@ mod spawn_tests {
         let cli = FakeCli::new(
             &dir,
             "fake",
-            FakeCliSpec {
-                reply: VERDICT,
-                delay_secs: 30,
-                ..Default::default()
-            },
+            FakeCliSpec { reply: VERDICT, delay_secs: 30, ..Default::default() },
         );
-        let slot = cli.slot("");
+        let model_config = cli.model_config("");
         let started = Instant::now();
-        let (res, _) = run_model(&slot, &slot.command, "hi", "", "", Duration::from_secs(1));
+        let (res, _) = run_model(&model_config, &model_config.command, "hi", "", "", Duration::from_secs(1), None);
         let err = res.unwrap_err();
         assert!(err.contains("timed out"), "{err}");
-        // A slot that never returns would wedge the review; the poll loop has
+        // A model that never returns would stop the review; the poll loop has
         // to give up close to the deadline rather than wait out the child.
-        assert!(
-            started.elapsed() < Duration::from_secs(15),
-            "took {:?}",
-            started.elapsed()
-        );
+        assert!(started.elapsed() < Duration::from_secs(15), "took {:?}", started.elapsed());
     }
 
     #[test]
@@ -1031,71 +1369,48 @@ mod spawn_tests {
                 ..Default::default()
             },
         );
-        let mut slot = first.slot("");
-        slot.session_key = "thread_id".into();
+        let mut model_config = first.model_config("");
+        model_config.session_key = "thread_id".into();
 
-        let (res, raw) = run(&slot, "first turn");
-        assert_eq!(
-            res.unwrap().action,
-            Action::Keep,
-            "verdict must survive the envelope"
-        );
-        let session = extract_session_id(&raw, &slot.session_key).expect("session id");
+        let (res, raw) = run(&model_config, "first turn");
+        assert_eq!(res.unwrap().action, Action::Keep, "verdict must survive the envelope");
+        let session = extract_session_id(&raw, &model_config.session_key).expect("session id");
         assert_eq!(session, "sess-42");
 
-        // Turn 2 resumes: the id has to land on the child's command line.
-        let second = FakeCli::new(
-            &dir,
-            "second",
-            FakeCliSpec {
-                reply: VERDICT,
-                ..Default::default()
-            },
-        );
-        slot.resume_command = format!("{} resume {{session}}", second.command());
-        let resume = slot.resume_command.replace("{session}", &session);
+        // Turn 2 resumes: the id has to appear on the child's command line.
+        let second =
+            FakeCli::new(&dir, "second", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        model_config.resume_command = format!("{} resume {{session}}", second.command());
+        let resume = model_config.resume_command.replace("{session}", &session);
         let (res2, _) = run_model(
-            &slot,
+            &model_config,
             &resume,
             &followup_prompt("why?", false),
             "",
             "",
             Duration::from_secs(30),
+            None,
         );
         assert!(res2.is_ok());
-        assert!(
-            second.argv_seen().contains("resume sess-42"),
-            "{}",
-            second.argv_seen()
-        );
-        assert!(
-            second.stdin_seen().contains("why?"),
-            "{}",
-            second.stdin_seen()
-        );
+        assert!(second.argv_seen().contains("resume sess-42"), "{}", second.argv_seen());
+        assert!(second.stdin_seen().contains("why?"), "{}", second.stdin_seen());
     }
 
     #[test]
     fn the_cli_runs_in_the_repository_it_is_reviewing() {
         let dir = TempDir::new("cwd");
-        let cli = FakeCli::new(
-            &dir,
-            "fake",
-            FakeCliSpec {
-                reply: VERDICT,
-                ..Default::default()
-            },
-        );
+        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
         let repo = TempDir::new("cwd_repo");
-        let slot = cli.slot("");
+        let model_config = cli.model_config("");
 
         let (res, _) = run_model(
-            &slot,
-            &slot.command,
+            &model_config,
+            &model_config.command,
             "hi",
             &repo.path().to_string_lossy(),
             "",
             Duration::from_secs(30),
+            None,
         );
         assert!(res.is_ok());
         // The prompt names files by their path relative to the repository
@@ -1108,13 +1423,27 @@ mod spawn_tests {
     #[test]
     fn a_missing_program_is_reported_rather_than_panicking() {
         let dir = TempDir::new("missing");
-        let mut slot = FakeCli::new(&dir, "fake", FakeCliSpec::default()).slot("");
-        slot.command = "cra-no-such-program-anywhere".into();
-        let (res, _) = run(&slot, "hi");
-        assert!(
-            res.unwrap_err().contains("spawn"),
-            "should name the spawn failure"
-        );
+        let mut model_config = FakeCli::new(&dir, "fake", FakeCliSpec::default()).model_config("");
+        model_config.command = "cra-no-such-program-anywhere".into();
+        let (res, _) = run(&model_config, "hi");
+        assert!(res.unwrap_err().contains("spawn"), "should name the spawn failure");
+    }
+
+    #[test]
+    fn the_live_view_sees_the_call_as_it_streams() {
+        let dir = TempDir::new("live_view");
+        let reply = "{\"type\":\"assistant\",\"message\":{\"content\":[\
+{\"type\":\"tool_use\",\"name\":\"Read\",\"input\":{\"file_path\":\"src/config.rs\"}}]}}\n\
+{\"action\":\"rewrite\",\"comment\":\"Bump it.\",\"justification\":\"clearer\"}";
+        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply, ..Default::default() });
+        let model_config = cli.model_config("");
+        let live = LiveHandle::new();
+        let (res, _) =
+            run_model(&model_config, &model_config.command, "hi", "", "", Duration::from_secs(30), Some(&live));
+        assert!(res.is_ok(), "{res:?}");
+        let snap = live.snapshot();
+        assert!(snap.lines >= 2, "the stream was read line by line, saw {}", snap.lines);
+        assert_eq!(snap.activity, "Read src/config.rs");
     }
 }
 
@@ -1133,10 +1462,7 @@ mod live_tests {
     /// "the configured limit" means lives in a file next door.
     fn browsable_repo() -> TempRepo {
         let repo = TempRepo::new("live_browse");
-        repo.write(
-            "src/config.rs",
-            &format!("pub const RETRY_LIMIT: u32 = {RETRY_LIMIT};\n"),
-        );
+        repo.write("src/config.rs", &format!("pub const RETRY_LIMIT: u32 = {RETRY_LIMIT};\n"));
         repo.write(
             "src/net.rs",
             "use crate::config::RETRY_LIMIT;\n\npub fn connect() {\n    \
@@ -1164,7 +1490,7 @@ Answer with JSON only:\n\
     /// resume command.
     ///
     /// Both turns are answerable only from the repository. Turn 1 asks for a
-    /// constant defined in a file the prompt does not quote, so a slot whose
+    /// constant defined in a file the prompt does not quote, so a model whose
     /// tools are switched off — or one started in the wrong directory — fails
     /// here instead of quietly reviewing on the diff alone. Turn 2 asks for
     /// the same number back, so a lost session shows up as a wrong answer.
@@ -1177,7 +1503,7 @@ Answer with JSON only:\n\
         let timeout = Duration::from_secs(300);
         let repo = browsable_repo();
         let repo_path = repo.path();
-        // A slot whose permissions come from a config file gets the home this
+    // A model whose permissions come from a config file gets the home this
         // app writes; the shipped agy template will not read the repo without
         // it, so the test would be measuring the wrong thing.
         let cli_home = crate::agycli::configure(&repo_path)
@@ -1186,85 +1512,75 @@ Answer with JSON only:\n\
             .to_string();
         let mut failures: Vec<String> = Vec::new();
 
-        for (_, slot) in Settings::default().enabled_models() {
+        for (_, model_config) in Settings::default().enabled_models() {
             // Turn 1 — either we name the session or the CLI reports one.
-            let (command, mut session) = if slot.session_key.trim().is_empty() {
+            let (command, mut session) = if model_config.session_key.trim().is_empty() {
                 let id = uuid::Uuid::new_v4().to_string();
-                (slot.command.replace("{session}", &id), Some(id))
+                (model_config.command.replace("{session}", &id), Some(id))
             } else {
-                (slot.command.clone(), None)
+                (model_config.command.clone(), None)
             };
             let first = verdict_prompt(
                 " This repository defines RETRY_LIMIT somewhere; open the file that \
                  defines it and start your justification with its value.",
             );
-            let (res, raw) = run_model(&slot, &command, &first, &repo_path, &cli_home, timeout);
+            let (res, raw) =
+                run_model(&model_config, &command, &first, &repo_path, &cli_home, timeout, None);
             match &res {
                 Ok(v) => {
-                    println!(
-                        "{:>6} turn 1: {} — {}",
-                        slot.name,
-                        v.action.label(),
-                        v.justification
-                    );
+                    println!("{:>6} turn 1: {} — {}", model_config.name, v.action.label(), v.justification);
                     if !v.justification.contains(RETRY_LIMIT) {
                         failures.push(format!(
                             "{}: did not read the repo — turn 1 said {:?}",
-                            slot.name, v.justification
+                            model_config.name, v.justification
                         ));
                     }
                 }
                 Err(e) => {
-                    println!("{:>6} turn 1: FAILED {e}", slot.name);
-                    failures.push(format!("{} turn 1: {e}", slot.name));
+                    println!("{:>6} turn 1: FAILED {e}", model_config.name);
+                    failures.push(format!("{} turn 1: {e}", model_config.name));
                     continue;
                 }
             }
-            if !slot.session_key.trim().is_empty() {
-                session = extract_session_id(&raw, &slot.session_key);
+            if !model_config.session_key.trim().is_empty() {
+                session = extract_session_id(&raw, &model_config.session_key);
             }
             let Some(session) = session else {
-                println!("{:>6}: no session id in output", slot.name);
-                failures.push(format!("{}: no session id reported", slot.name));
+                println!("{:>6}: no session id in output", model_config.name);
+                failures.push(format!("{}: no session id reported", model_config.name));
                 continue;
             };
-            println!("{:>6} session: {session}", slot.name);
+            println!("{:>6} session: {session}", model_config.name);
 
             // Turn 2 — resume, and ask for something only turn 1 established.
-            let resume = slot.resume_command.replace("{session}", &session);
+            let resume = model_config.resume_command.replace("{session}", &session);
             let second = followup_prompt(
                 "What was the value of RETRY_LIMIT you found? \
                  Put just that number in \"justification\".",
                 false,
             );
-            let (res2, raw2) = run_model(&slot, &resume, &second, &repo_path, &cli_home, timeout);
+            let (res2, raw2) =
+                run_model(&model_config, &resume, &second, &repo_path, &cli_home, timeout, None);
             match res2 {
                 Ok(v) => {
-                    println!(
-                        "{:>6} turn 2: justification = {}",
-                        slot.name, v.justification
-                    );
+                    println!("{:>6} turn 2: justification = {}", model_config.name, v.justification);
                     if !v.justification.contains(RETRY_LIMIT) {
                         failures.push(format!(
                             "{}: session lost — turn 2 said {:?}",
-                            slot.name, v.justification
+                            model_config.name, v.justification
                         ));
                     }
                 }
                 Err(e) => {
                     println!(
                         "{:>6} turn 2: FAILED {e}\n  raw: {}",
-                        slot.name,
+                        model_config.name,
                         raw2.chars().take(300).collect::<String>()
                     );
-                    failures.push(format!("{} turn 2: {e}", slot.name));
+                    failures.push(format!("{} turn 2: {e}", model_config.name));
                 }
             }
         }
-        assert!(
-            failures.is_empty(),
-            "live round-trip failed:\n  {}",
-            failures.join("\n  ")
-        );
+        assert!(failures.is_empty(), "live round-trip failed:\n  {}", failures.join("\n  "));
     }
 }
