@@ -103,6 +103,7 @@ pub fn hotkey_bar(app: &mut CraApp, ctx: &egui::Context) {
                         k(ui, "K", "keep");
                         k(ui, "D", "delete");
                         k(ui, "E", "edit");
+                        k(ui, "F", "follow-up");
                         k(ui, "R", "re-run");
                         k(ui, "P", "prev");
                         k(ui, "N", "skip");
@@ -190,13 +191,32 @@ pub fn side_panel(app: &mut CraApp, ctx: &egui::Context) {
             if app.screen == Screen::Review {
                 ui.add_space(6.0);
                 theme::section_title(ui, "MODELS");
+                // While blinding is on this panel must not pair a name with a
+                // verdict, or the cards on the left are blinded for nothing.
+                // That means the label AND the dot colour: colour is branded
+                // by slot position (see theme::model_color), so leaving it
+                // keyed to the real slot index would leak identity through
+                // the palette even with the name itself hidden.
+                let hidden = app.names_hidden();
+                let order = app.candidate_order();
                 for (i, slot) in app.candidate_models.iter().enumerate() {
+                    let pos = order.iter().position(|&s| s == i).unwrap_or(i);
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("●").color(theme::model_color(i)).monospace());
-                        ui.label(RichText::new(&slot.name).monospace().small());
+                        ui.label(
+                            RichText::new("●")
+                                .color(theme::model_color(if hidden { pos } else { i }))
+                                .monospace(),
+                        );
+                        ui.label(RichText::new(app.slot_label(i, pos)).monospace().small());
+                        if !slot.model.trim().is_empty() && !hidden {
+                            ui.label(theme::dim(slot.model.trim()));
+                        }
                         match app.candidates.get(i) {
                             Some(CandidateState::Pending) => {
                                 ui.spinner();
+                            }
+                            Some(CandidateState::Ready(s)) if hidden => {
+                                ui.label(theme::dim(&format!("answered · {} ms", s.latency_ms)));
                             }
                             Some(CandidateState::Ready(s)) => {
                                 theme::badge(ui, s.action.label(), theme::action_color(s.action));

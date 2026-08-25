@@ -11,6 +11,9 @@ pub enum RefKind {
     Branch,
     Pr(u64),
     WorkingTree,
+    /// Re-judging comments already decided once, to measure how consistent the
+    /// reviewer is with their own earlier self. Nothing is written to disk.
+    Recheck,
 }
 
 impl RefKind {
@@ -19,6 +22,7 @@ impl RefKind {
             RefKind::Branch => "branch".into(),
             RefKind::Pr(n) => format!("PR #{n}"),
             RefKind::WorkingTree => "working tree".into(),
+            RefKind::Recheck => "re-check".into(),
         }
     }
 }
@@ -43,6 +47,13 @@ pub struct ReviewPlan {
 }
 
 impl ReviewPlan {
+    /// A re-check re-judges history, so it must not touch the working tree:
+    /// the files may have moved on, and the point is the judgement, not the
+    /// edit.
+    pub fn is_recheck(&self) -> bool {
+        self.ref_kind == RefKind::Recheck
+    }
+
     pub fn total_units(&self) -> usize {
         self.files.iter().map(|f| f.units.len()).sum()
     }
@@ -99,8 +110,39 @@ impl ReviewPlan {
     }
 }
 
+/// The order to show candidates in, as display position -> slot index.
+///
+/// Deterministic in `seed` so the cards do not reshuffle on every repaint, and
+/// so re-reviewing the same comment presents it the same way. A plain
+/// Fisher-Yates over a small LCG: this only has to be unbiased across
+/// comments, not cryptographic.
+pub fn blind_order(seed: u64, n: usize) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..n).collect();
+    let mut state = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    for i in (1..n).rev() {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let j = (state >> 33) as usize % (i + 1);
+        order.swap(i, j);
+    }
+    order
+}
+
+/// Stable identity for a comment, used to seed its candidate order.
+pub fn unit_seed(file: &str, start_line: u32) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in file.as_bytes().iter().chain(&start_line.to_le_bytes()) {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
 /// What the human picked (before free-form edits are considered).
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 pub enum Choice {
     /// Candidate from model slot i (index into the session's model list).
     Candidate(usize),
@@ -111,6 +153,7 @@ pub enum Choice {
 }
 
 /// Provenance of the final text, derived at save time.
+#[derive(Clone)]
 pub enum Provenance {
     Unchanged,
     Model {
@@ -223,35 +266,136 @@ pub fn apply_edit(
     Ok(new_lines.len() as i64 - old_len as i64)
 }
 
-/// Commit message with app + provenance metadata trailers.
-pub fn commit_message(
-    unit: &CommentUnit,
-    action: Action,
-    provenance: &Provenance,
-    justification: Option<&str>,
-) -> String {
-    let verb = match action {
+/// One decision that has changed the working tree but is not committed yet.
+/// Accumulated across `Save and Continue` calls on the same file, so that a
+/// later `Commit and Continue` can document every one of them instead of just
+/// the last, even though `git commit` only ever sees the file's final state.
+#[derive(Clone)]
+pub struct PendingDecision {
+    pub file: String,
+    pub line: u32,
+    pub action: Action,
+    pub provenance: Provenance,
+    pub justification: Option<String>,
+    /// `(model variant, effort)` from the chosen candidate's slot, when the
+    /// decision came from a model. Either half may be empty — the CLI default.
+    pub model_info: Option<(String, String)>,
+}
+
+fn action_verb(action: Action) -> &'static str {
+    match action {
         Action::Keep => "keep",
         Action::Rewrite => "rewrite",
         Action::Delete => "delete",
-    };
-    let mut msg = format!(
-        "review(comments): {verb} comment in {}:{}\n\n",
-        unit.file, unit.start_line
-    );
-    if let Some(j) = justification {
-        if !j.trim().is_empty() {
-            msg.push_str(&format!("{}\n\n", j.trim()));
-        }
     }
-    msg.push_str("Reviewed-with: code-review-assistant\n");
-    msg.push_str(&format!(
-        "Comment-provenance: {}\n",
-        provenance.source_str()
-    ));
+}
+
+fn push_model_trailers(
+    msg: &mut String,
+    provenance: &Provenance,
+    model_info: Option<(&str, &str)>,
+) {
     if let Provenance::Model { coauthor, .. } = provenance {
         if !coauthor.trim().is_empty() {
             msg.push_str(&format!("Co-authored-by: {coauthor}\n"));
+        }
+    }
+    if let Some((model, effort)) = model_info {
+        if !model.trim().is_empty() {
+            msg.push_str(&format!("Model: {}\n", model.trim()));
+        }
+        if !effort.trim().is_empty() {
+            msg.push_str(&format!("Effort: {}\n", effort.trim()));
+        }
+    }
+}
+
+/// Commit message covering every pending decision on the file being
+/// committed — the fix for a batch of `Save and Continue`s losing all but the
+/// last decision's message once `Commit and Continue` finally runs `git
+/// commit`. `entries` must be non-empty and share the same `file`.
+pub fn commit_message_batch(entries: &[PendingDecision]) -> String {
+    assert!(
+        !entries.is_empty(),
+        "commit_message_batch needs at least one decision"
+    );
+    if entries.len() == 1 {
+        let e = &entries[0];
+        let mut msg = format!(
+            "review(comments): {} comment in {}:{}\n\n",
+            action_verb(e.action),
+            e.file,
+            e.line
+        );
+        if let Some(j) = &e.justification {
+            if !j.trim().is_empty() {
+                msg.push_str(&format!("{}\n\n", j.trim()));
+            }
+        }
+        msg.push_str("Reviewed-with: code-review-assistant\n");
+        msg.push_str(&format!(
+            "Comment-provenance: {}\n",
+            e.provenance.source_str()
+        ));
+        push_model_trailers(
+            &mut msg,
+            &e.provenance,
+            e.model_info
+                .as_ref()
+                .map(|(m, ef)| (m.as_str(), ef.as_str())),
+        );
+        return msg;
+    }
+
+    let file = &entries[0].file;
+    let mut msg = format!(
+        "review(comments): {} comment decisions in {file}\n\n",
+        entries.len()
+    );
+    for e in entries {
+        msg.push_str(&format!("- {} {file}:{}", action_verb(e.action), e.line));
+        let mut detail: Vec<String> = vec![e.provenance.source_str()];
+        if let Some((model, _)) = &e.model_info {
+            if !model.trim().is_empty() {
+                detail.push(model.trim().to_string());
+            }
+        }
+        msg.push_str(&format!(" ({})", detail.join(", ")));
+        if let Some(j) = &e.justification {
+            if !j.trim().is_empty() {
+                msg.push_str(&format!(" — {}", j.trim()));
+            }
+        }
+        msg.push('\n');
+    }
+    msg.push('\n');
+    msg.push_str("Reviewed-with: code-review-assistant\n");
+
+    // Trailers are deduplicated across the batch: several decisions may share
+    // the same model, and repeating its Co-authored-by would just be noise
+    // (and some git hosts collapse it anyway).
+    let mut coauthors: Vec<&str> = Vec::new();
+    let mut model_infos: Vec<(&str, &str)> = Vec::new();
+    for e in entries {
+        if let Provenance::Model { coauthor, .. } = &e.provenance {
+            if !coauthor.trim().is_empty() && !coauthors.contains(&coauthor.as_str()) {
+                coauthors.push(coauthor);
+            }
+        }
+        if let Some((model, effort)) = &e.model_info {
+            let pair = (model.as_str(), effort.as_str());
+            if !model.trim().is_empty() && !model_infos.contains(&pair) {
+                model_infos.push(pair);
+            }
+        }
+    }
+    for coauthor in &coauthors {
+        msg.push_str(&format!("Co-authored-by: {coauthor}\n"));
+    }
+    for (model, effort) in &model_infos {
+        msg.push_str(&format!("Model: {model}\n"));
+        if !effort.trim().is_empty() {
+            msg.push_str(&format!("Effort: {}\n", effort.trim()));
         }
     }
     msg
@@ -280,6 +424,41 @@ mod tests {
     }
 
     #[test]
+    fn blind_order_is_a_permutation_and_stable_per_comment() {
+        for n in 1..=6 {
+            let order = blind_order(unit_seed("src/lib.rs", 12), n);
+            let mut sorted = order.clone();
+            sorted.sort_unstable();
+            // Every slot appears exactly once, or a candidate would be shown
+            // twice or not at all.
+            assert_eq!(sorted, (0..n).collect::<Vec<_>>(), "n={n}");
+            // Stable, so the cards do not reshuffle on every repaint.
+            assert_eq!(order, blind_order(unit_seed("src/lib.rs", 12), n));
+        }
+    }
+
+    #[test]
+    fn blind_order_varies_between_comments() {
+        // Three slots have six orderings; over many comments a fixed order
+        // would put the same model first every time and reintroduce the bias
+        // blinding exists to remove.
+        let first_slots: std::collections::HashSet<usize> = (0..60)
+            .map(|line| blind_order(unit_seed("src/lib.rs", line), 3)[0])
+            .collect();
+        assert_eq!(
+            first_slots.len(),
+            3,
+            "every slot should lead sometimes: {first_slots:?}"
+        );
+    }
+
+    #[test]
+    fn blind_order_handles_a_single_candidate() {
+        assert_eq!(blind_order(unit_seed("a.rs", 1), 1), vec![0]);
+        assert!(blind_order(unit_seed("a.rs", 1), 0).is_empty());
+    }
+
+    #[test]
     fn final_action_cases() {
         assert_eq!(final_action("same", "same"), Action::Keep);
         assert_eq!(final_action("  ", "same"), Action::Delete);
@@ -300,15 +479,33 @@ mod tests {
         assert_eq!(p.source_str(), "original");
     }
 
+    fn pending(file: &str, line: u32, action: Action, justification: &str) -> PendingDecision {
+        PendingDecision {
+            file: file.into(),
+            line,
+            action,
+            provenance: Provenance::Model {
+                name: "claude".into(),
+                coauthor: "Claude <noreply@anthropic.com>".into(),
+                edited: false,
+            },
+            justification: Some(justification.into()),
+            model_info: Some(("claude-sonnet-5".into(), "low".into())),
+        }
+    }
+
     #[test]
-    fn commit_message_has_trailers() {
-        let prov = Provenance::Model {
+    fn a_single_pending_decision_reads_like_the_old_single_commit_message() {
+        let mut e = pending("src/lib.rs", 2, Action::Rewrite, "clearer");
+        e.provenance = Provenance::Model {
             name: "claude".into(),
             coauthor: "Claude <noreply@anthropic.com>".into(),
             edited: true,
         };
-        let msg = commit_message(&unit(), Action::Rewrite, &prov, Some("clearer"));
+        e.model_info = None;
+        let msg = commit_message_batch(&[e]);
         assert!(msg.starts_with("review(comments): rewrite comment in src/lib.rs:2"));
+        assert!(msg.contains("clearer"));
         assert!(msg.contains("Reviewed-with: code-review-assistant"));
         assert!(msg.contains("Comment-provenance: claude+human-edited"));
         assert!(msg.contains("Co-authored-by: Claude <noreply@anthropic.com>"));
@@ -316,14 +513,67 @@ mod tests {
 
     #[test]
     fn commit_message_keeps_provenance_without_an_unset_coauthor() {
-        let prov = Provenance::Model {
-            name: "agy".into(),
-            coauthor: String::new(),
-            edited: false,
+        let entry = PendingDecision {
+            file: "src/lib.rs".into(),
+            line: 2,
+            action: Action::Rewrite,
+            provenance: Provenance::Model {
+                name: "agy".into(),
+                coauthor: String::new(),
+                edited: false,
+            },
+            justification: Some("clearer".into()),
+            model_info: Some(("gemini-3.7-flash-low".into(), String::new())),
         };
-        let msg = commit_message(&unit(), Action::Rewrite, &prov, Some("clearer"));
+        let msg = commit_message_batch(&[entry]);
         assert!(msg.contains("Comment-provenance: agy"), "{msg}");
+        assert!(msg.contains("Model: gemini-3.7-flash-low"), "{msg}");
         assert!(!msg.contains("Co-authored-by:"), "{msg}");
+    }
+
+    #[test]
+    fn commit_message_records_model_and_effort() {
+        let entries = vec![pending("src/lib.rs", 2, Action::Rewrite, "clearer")];
+        let msg = commit_message_batch(&entries);
+        assert!(msg.contains("Model: claude-sonnet-5"));
+        assert!(msg.contains("Effort: low"));
+    }
+
+    #[test]
+    fn commit_message_omits_empty_model_and_effort() {
+        let entries = vec![PendingDecision {
+            file: "src/lib.rs".into(),
+            line: 2,
+            action: Action::Delete,
+            provenance: Provenance::Human,
+            justification: None,
+            model_info: Some(("".into(), "".into())),
+        }];
+        let msg = commit_message_batch(&entries);
+        assert!(!msg.contains("Model:"));
+        assert!(!msg.contains("Effort:"));
+    }
+
+    #[test]
+    fn batch_documents_every_pending_decision() {
+        let entries = vec![
+            pending("src/lib.rs", 2, Action::Delete, "restates the code"),
+            pending(
+                "src/lib.rs",
+                9,
+                Action::Rewrite,
+                "clarifies the retry limit",
+            ),
+        ];
+        let msg = commit_message_batch(&entries);
+        assert!(msg.starts_with("review(comments): 2 comment decisions in src/lib.rs"));
+        assert!(msg.contains("delete src/lib.rs:2"), "{msg}");
+        assert!(msg.contains("restates the code"), "{msg}");
+        assert!(msg.contains("rewrite src/lib.rs:9"), "{msg}");
+        assert!(msg.contains("clarifies the retry limit"), "{msg}");
+        // Trailers are deduplicated, not repeated once per decision.
+        assert_eq!(msg.matches("Co-authored-by:").count(), 1, "{msg}");
+        assert_eq!(msg.matches("Model:").count(), 1, "{msg}");
     }
 
     #[test]

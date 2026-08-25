@@ -38,9 +38,10 @@ impl CraApp {
             return;
         }
         if !typing {
-            for (i, key) in NUM_KEYS.iter().enumerate().take(self.candidates.len()) {
+            let order = self.candidate_order();
+            for (pos, key) in NUM_KEYS.iter().enumerate().take(order.len()) {
                 if ctx.input_mut(|inp| inp.consume_key(Modifiers::NONE, *key)) {
-                    self.choose_candidate(i);
+                    self.choose_candidate(order[pos]);
                 }
             }
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::K)) {
@@ -51,6 +52,9 @@ impl CraApp {
             }
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::E)) {
                 self.focus_editor = true;
+            }
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F)) {
+                self.focus_follow_up = true;
             }
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::R)) {
                 self.enter_unit(ctx);
@@ -124,15 +128,22 @@ impl CraApp {
         theme::section_title(ui, "CANDIDATES");
         let n_slots = self.candidates.len().max(1);
         let mut pick: Option<usize> = None;
+        let mut ask_one: Option<usize> = None;
+        let mut show_prompt: Option<usize> = None;
+        let can_ask_slot: Vec<bool> = (0..n_slots).map(|i| self.can_ask(i)).collect();
+        let order = self.candidate_order();
+        let hidden = self.names_hidden();
         ui.columns(n_slots, |cols| {
-            for (i, ui) in cols.iter_mut().enumerate() {
-                let name = self
-                    .candidate_models
-                    .get(i)
-                    .map(|m| m.name.clone())
-                    .unwrap_or_else(|| format!("model {i}"));
+            for (pos, ui) in cols.iter_mut().enumerate() {
+                // `pos` is where the card sits on screen; `i` is which slot it
+                // actually belongs to. They differ while blinding is on.
+                let i = order.get(pos).copied().unwrap_or(pos);
+                let can_ask = can_ask_slot.get(i).copied().unwrap_or(false);
+                let name = self.slot_label(i, pos);
                 let is_chosen = self.chosen == Some(Choice::Candidate(i));
-                let color = theme::model_color(i);
+                // Colour is per display position while hidden, so the palette
+                // does not give the model away either.
+                let color = theme::model_color(if hidden { pos } else { i });
                 let frame = egui::Frame::group(ui.style())
                     .fill(if is_chosen {
                         theme::RAISED
@@ -151,12 +162,31 @@ impl CraApp {
                 frame.show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(
-                            RichText::new(format!("[{}]", i + 1))
+                            RichText::new(format!("[{}]", pos + 1))
                                 .monospace()
                                 .strong()
                                 .color(color),
                         );
                         ui.label(RichText::new(&name).strong().color(color));
+                        if !hidden {
+                            if let Some(variant) = self
+                                .candidate_models
+                                .get(i)
+                                .map(|m| m.model.trim())
+                                .filter(|v| !v.is_empty())
+                            {
+                                ui.label(
+                                    RichText::new(variant)
+                                        .monospace()
+                                        .small()
+                                        .color(theme::TEXT_DIM),
+                                );
+                            }
+                            if let Some(Some(id)) = self.sessions.get(i) {
+                                ui.label(theme::dim(&format!("· {}", &id[..8.min(id.len())])))
+                                    .on_hover_text(format!("session {id}"));
+                            }
+                        }
                         match self.candidates.get(i) {
                             Some(CandidateState::Ready(s)) => {
                                 theme::badge(ui, s.action.label(), theme::action_color(s.action));
@@ -178,9 +208,8 @@ impl CraApp {
                         Some(CandidateState::Ready(s)) => {
                             ui.label(
                                 RichText::new(format!("“{}”", s.justification))
-                                    .small()
                                     .italics()
-                                    .color(theme::TEXT_DIM),
+                                    .color(egui::Color32::from_rgb(196, 208, 220)),
                             );
                             egui::ScrollArea::vertical()
                                 .id_salt(("cand", i))
@@ -194,21 +223,48 @@ impl CraApp {
                                     };
                                     ui.label(RichText::new(preview).monospace());
                                 });
-                            if ui
-                                .add(egui::Button::new(
-                                    RichText::new(format!("PICK [{}]", i + 1)).strong(),
-                                ))
-                                .clicked()
-                            {
-                                pick = Some(i);
-                            }
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add(egui::Button::new(
+                                        RichText::new(format!("PICK [{}]", pos + 1)).strong(),
+                                    ))
+                                    .clicked()
+                                {
+                                    pick = Some(i);
+                                }
+                                if ui
+                                    .add_enabled(can_ask, egui::Button::new("↩ ask"))
+                                    .on_hover_text("send the follow-up below to this model only")
+                                    .clicked()
+                                {
+                                    ask_one = Some(i);
+                                }
+                                if ui
+                                    .button("🗎")
+                                    .on_hover_text("show the prompt/transcript")
+                                    .clicked()
+                                {
+                                    show_prompt = Some(i);
+                                }
+                            });
                         }
                         Some(CandidateState::Failed(e)) => {
-                            ui.label(
-                                RichText::new(crate::app::truncate(e, 220))
-                                    .small()
-                                    .color(theme::BAD),
-                            );
+                            ui.label(RichText::new(crate::app::truncate(e, 220)).color(theme::BAD));
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add_enabled(can_ask, egui::Button::new("↩ ask"))
+                                    .clicked()
+                                {
+                                    ask_one = Some(i);
+                                }
+                                if ui
+                                    .button("🗎")
+                                    .on_hover_text("show the prompt/transcript")
+                                    .clicked()
+                                {
+                                    show_prompt = Some(i);
+                                }
+                            });
                         }
                         _ => {}
                     }
@@ -217,6 +273,39 @@ impl CraApp {
         });
         if let Some(i) = pick {
             self.choose_candidate(i);
+        }
+        if let Some(i) = show_prompt {
+            self.show_prompt = Some(i);
+        }
+
+        // ---- follow-up ----
+        let mut ask_all = false;
+        ui.horizontal(|ui| {
+            theme::section_title(ui, "FOLLOW-UP");
+            let send_all = ui
+                .add_enabled(
+                    (0..n_slots).any(|i| can_ask_slot.get(i).copied().unwrap_or(false)),
+                    egui::Button::new("Send to all  [Enter]"),
+                )
+                .clicked();
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.follow_up)
+                    .id(egui::Id::new("follow_up_box"))
+                    .desired_width(f32::INFINITY)
+                    .hint_text("ask the models to reconsider, e.g. “too wordy — one line?”"),
+            );
+            if self.focus_follow_up {
+                resp.request_focus();
+                self.focus_follow_up = false;
+            }
+            let submitted =
+                resp.lost_focus() && ctx.input(|i| i.key_pressed(Key::Enter) && !i.modifiers.shift);
+            ask_all = send_all || submitted;
+        });
+        if let Some(i) = ask_one {
+            self.ask_followup(ctx, Some(i));
+        } else if ask_all {
+            self.ask_followup(ctx, None);
         }
         ui.add_space(4.0);
 
@@ -298,13 +387,26 @@ impl CraApp {
             }
         });
 
+        // ---- commit style ----
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.commit_each, "Commit each decision individually");
+            ui.label(theme::dim(if self.commit_each {
+                "— every decision is its own commit, made immediately"
+            } else {
+                "— decisions batch uncommitted until Commit and Continue, which \
+                 documents all of them in one commit"
+            }));
+        });
+
         // ---- continuation buttons ----
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            if ui
-                .button(RichText::new("💾 Save and Continue  [Ctrl+S]").strong())
-                .clicked()
-            {
+            let save_label = if self.commit_each {
+                "💾 Save and Commit  [Ctrl+S]"
+            } else {
+                "💾 Save and Continue  [Ctrl+S]"
+            };
+            if ui.button(RichText::new(save_label).strong()).clicked() {
                 self.save_and_continue(ctx, false);
                 return;
             }
@@ -334,5 +436,75 @@ impl CraApp {
                 self.skip_unit(ctx);
             }
         });
+
+        self.prompt_window(ctx);
+    }
+
+    /// Floating inspector for exactly what was piped to a model CLI and what
+    /// it printed back, including every follow-up turn.
+    fn prompt_window(&mut self, ctx: &egui::Context) {
+        let Some(slot) = self.show_prompt else { return };
+        let name = self
+            .settings
+            .models
+            .get(slot)
+            .map(|m| m.name.clone())
+            .unwrap_or_else(|| format!("model {slot}"));
+        let turns = self.convos.get(slot).cloned().unwrap_or_default();
+        let mut open = true;
+        egui::Window::new(format!("prompt · {name}"))
+            .id(egui::Id::new("prompt_window"))
+            .open(&mut open)
+            .default_size([760.0, 520.0])
+            .collapsible(false)
+            .show(ctx, |ui| {
+                if turns.is_empty() {
+                    ui.label(theme::dim("nothing sent yet"));
+                    return;
+                }
+                ui.horizontal(|ui| {
+                    match self.sessions.get(slot).and_then(|s| s.clone()) {
+                        Some(id) => {
+                            ui.label(theme::dim(&format!("{} turn(s) · session", turns.len())));
+                            ui.label(RichText::new(&id).monospace().small());
+                            if ui.small_button("copy id").clicked() {
+                                ctx.copy_text(id.clone());
+                            }
+                        }
+                        None => {
+                            ui.label(theme::dim(&format!("{} turn(s) · no session", turns.len())));
+                        }
+                    }
+                    if ui.button("copy last prompt").clicked() {
+                        ctx.copy_text(turns.last().map(|t| t.prompt.clone()).unwrap_or_default());
+                    }
+                });
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for (i, t) in turns.iter().enumerate() {
+                            theme::section_title(ui, &format!("SENT — turn {}", i + 1));
+                            ui.label(RichText::new(&t.prompt).monospace());
+                            ui.add_space(4.0);
+                            theme::section_title(ui, &format!("RECEIVED — turn {}", i + 1));
+                            if t.reply.is_empty() {
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    ui.label(theme::dim("waiting…"));
+                                });
+                            } else {
+                                ui.label(
+                                    RichText::new(&t.reply).monospace().color(theme::TEXT_DIM),
+                                );
+                            }
+                            ui.add_space(8.0);
+                        }
+                    });
+            });
+        if !open {
+            self.show_prompt = None;
+        }
     }
 }

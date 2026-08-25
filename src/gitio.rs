@@ -256,3 +256,269 @@ pub fn open_prs(dir: &str, gh: &str) -> Result<Vec<PrInfo>, String> {
 pub fn pr_checkout(dir: &str, gh: &str, number: u64) -> Result<(), String> {
     run(dir, gh, &["pr", "checkout", &number.to_string()]).map(|_| ())
 }
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::resolve_program;
+    use std::ffi::{OsStr, OsString};
+
+    #[test]
+    fn bare_name_resolves_through_pathext() {
+        // `cmd` exists on PATH only as `cmd.exe`, so a bare name must find it.
+        let resolved = resolve_program(OsStr::new("cmd"));
+        let s = resolved.to_string_lossy().to_ascii_lowercase();
+        assert!(s.ends_with("cmd.exe"), "unexpected resolution: {s}");
+        assert!(
+            s.contains(std::path::MAIN_SEPARATOR),
+            "expected a full path, got {s}"
+        );
+    }
+
+    #[test]
+    fn qualified_and_unknown_names_pass_through() {
+        let qualified = OsString::from(r"C:\definitely\not\here.exe");
+        assert_eq!(resolve_program(&qualified), qualified);
+        let unknown = OsString::from("cra-no-such-program");
+        assert_eq!(resolve_program(&unknown), unknown);
+    }
+}
+
+#[cfg(test)]
+mod repo_tests {
+    use super::*;
+    use crate::testkit::{TempDir, TempRepo};
+
+    /// A Rust file whose added comment says nothing the code does not.
+    const LIB_RS: &str = concat!(
+        "fn main() {\n",
+        "    // Increment the counter by one\n",
+        "    counter += 1;\n",
+        "}\n",
+    );
+
+    #[test]
+    fn recognises_a_repo_and_reads_its_branch() {
+        let repo = TempRepo::new("detect");
+        repo.write("a.txt", "hi\n");
+        repo.commit("first");
+
+        assert!(is_git_repo(&repo.path()));
+        assert_eq!(current_branch(&repo.path()).unwrap(), "main");
+        assert_eq!(repo_name(&repo.path()), repo_name(&repo.path()));
+        assert!(!head_sha(&repo.path()).unwrap().is_empty());
+
+        // A plain directory is not a repo, and must not be treated as one.
+        let plain = TempDir::new("plain");
+        assert!(!is_git_repo(&plain.path().to_string_lossy()));
+    }
+
+    #[test]
+    fn dirtiness_follows_the_working_tree() {
+        let repo = TempRepo::new("dirty");
+        repo.write("a.txt", "hi\n");
+        repo.commit("first");
+        assert!(
+            !is_dirty(&repo.path()),
+            "a clean checkout must not read as dirty"
+        );
+
+        repo.write("a.txt", "changed\n");
+        assert!(is_dirty(&repo.path()));
+        repo.commit("second");
+        assert!(!is_dirty(&repo.path()));
+
+        // Untracked files count too — they would be lost by a checkout.
+        repo.write("b.txt", "new\n");
+        assert!(is_dirty(&repo.path()));
+    }
+
+    #[test]
+    fn branches_come_back_newest_first_with_their_subjects() {
+        let repo = TempRepo::new("branches");
+        repo.write("a.txt", "hi\n");
+        repo.commit("base commit");
+        repo.git(&["checkout", "-b", "feature"]);
+        repo.write("a.txt", "more\n");
+        repo.commit("feature commit");
+
+        let branches = local_branches(&repo.path()).unwrap();
+        let names: Vec<&str> = branches.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["feature", "main"],
+            "most recently committed first"
+        );
+        assert_eq!(branches[0].subject, "feature commit");
+        assert!(!branches[0].sha.is_empty());
+        assert!(!branches[0].age.is_empty());
+    }
+
+    #[test]
+    fn default_branch_falls_back_when_there_is_no_origin() {
+        let repo = TempRepo::new("default");
+        repo.write("a.txt", "hi\n");
+        repo.commit("first");
+        // No remote, so it has to fall back to a branch that exists.
+        assert_eq!(default_branch(&repo.path(), "main"), "main");
+        // A fallback that does not exist must not be returned blindly.
+        assert_eq!(default_branch(&repo.path(), "trunk"), "main");
+    }
+
+    #[test]
+    fn checkout_switches_branches() {
+        let repo = TempRepo::new("checkout");
+        repo.write("a.txt", "hi\n");
+        repo.commit("first");
+        repo.git(&["branch", "feature"]);
+
+        checkout(&repo.path(), "feature").unwrap();
+        assert_eq!(current_branch(&repo.path()).unwrap(), "feature");
+        assert!(checkout(&repo.path(), "no-such-branch").is_err());
+    }
+
+    #[test]
+    fn review_diff_covers_working_tree_branch_and_whole_history() {
+        let repo = TempRepo::new("diff");
+        repo.write("src/lib.rs", "fn main() {}\n");
+        repo.commit("base");
+        repo.git(&["checkout", "-b", "feature"]);
+        repo.write("src/lib.rs", LIB_RS);
+        repo.commit("add counter");
+
+        // Against the base branch: only the feature's own change.
+        let branch_diff = review_diff(&repo.path(), "main", 12).unwrap();
+        assert!(
+            branch_diff.contains("Increment the counter"),
+            "{branch_diff}"
+        );
+
+        // Against the empty tree: the whole history, so a brand-new repo has
+        // something to review.
+        let all = review_diff(&repo.path(), EMPTY_TREE, 12).unwrap();
+        assert!(all.contains("src/lib.rs"), "{all}");
+
+        // Empty base means the uncommitted working tree, and a clean tree
+        // therefore has nothing to show.
+        assert!(review_diff(&repo.path(), "", 12).unwrap().trim().is_empty());
+        repo.write("src/lib.rs", LIB_RS.replace("one", "1").as_str());
+        assert!(review_diff(&repo.path(), "", 12)
+            .unwrap()
+            .contains("counter"));
+    }
+
+    #[test]
+    fn base_label_names_each_kind_of_base() {
+        assert_eq!(base_label(""), "HEAD");
+        assert_eq!(base_label(EMPTY_TREE), "root");
+        assert_eq!(base_label("main"), "main");
+    }
+
+    #[test]
+    fn stage_and_commit_commits_only_the_named_file() {
+        let repo = TempRepo::new("commit");
+        repo.write("a.txt", "hi\n");
+        repo.write("b.txt", "hi\n");
+        repo.commit("first");
+
+        repo.write("a.txt", "edited\n");
+        repo.write("b.txt", "also edited\n");
+        let sha = stage_and_commit(&repo.path(), "a.txt", "review: tweak a").unwrap();
+
+        assert_eq!(sha, head_sha(&repo.path()).unwrap());
+        let last = repo.git(&["log", "-1", "--name-only", "--format=%s"]);
+        assert!(last.contains("review: tweak a"), "{last}");
+        assert!(last.contains("a.txt"), "{last}");
+        assert!(
+            !last.contains("b.txt"),
+            "b.txt should still be uncommitted: {last}"
+        );
+    }
+
+    /// The whole non-interactive path: take a real diff, find the comment in
+    /// it, rewrite that comment on disk, and confirm only those lines moved.
+    #[test]
+    fn a_real_diff_becomes_an_edit_on_disk() {
+        use crate::comments;
+        use crate::review::{apply_edit, ReviewFile};
+
+        let repo = TempRepo::new("pipeline");
+        repo.write("src/lib.rs", "fn main() {}\n");
+        repo.commit("base");
+        repo.git(&["checkout", "-b", "feature"]);
+        repo.write("src/lib.rs", LIB_RS);
+        repo.commit("add counter");
+
+        let diff = review_diff(&repo.path(), "main", 12).unwrap();
+        let files = crate::diffparse::parse(&diff);
+        let extracted = comments::extract_units(&files, 12);
+        assert_eq!(
+            extracted.len(),
+            1,
+            "one file should have a reviewable comment"
+        );
+        let (path, units) = &extracted[0];
+        assert_eq!(path, "src/lib.rs");
+        assert_eq!(units.len(), 1);
+
+        let unit = &units[0];
+        assert_eq!(unit.lang, "Rust");
+        assert!(unit.has_added);
+        let file = ReviewFile {
+            path: path.clone(),
+            units: vec![],
+            line_offset: 0,
+            decided: 0,
+        };
+        let replacement = unit.format_replacement("Counting retries, not requests.");
+        let delta = apply_edit(&repo.path(), &file, unit, &replacement).unwrap();
+
+        assert_eq!(delta, 0, "one line replaced by one line");
+        let after = repo.read("src/lib.rs");
+        assert!(
+            after.contains("    // Counting retries, not requests."),
+            "indent lost: {after}"
+        );
+        assert!(!after.contains("Increment the counter"), "{after}");
+        assert!(
+            after.contains("counter += 1;"),
+            "the code itself must be untouched: {after}"
+        );
+        assert!(
+            is_dirty(&repo.path()),
+            "the edit should show up as a working-tree change"
+        );
+    }
+
+    /// Guard for the failure mode `apply_edit` exists to prevent: acting on a
+    /// diff that no longer matches the file.
+    #[test]
+    fn an_edit_against_a_changed_file_is_refused() {
+        use crate::comments;
+        use crate::review::{apply_edit, ReviewFile};
+
+        let repo = TempRepo::new("stale");
+        repo.write("src/lib.rs", "fn main() {}\n");
+        repo.commit("base");
+        repo.git(&["checkout", "-b", "feature"]);
+        repo.write("src/lib.rs", LIB_RS);
+        repo.commit("add counter");
+
+        let diff = review_diff(&repo.path(), "main", 12).unwrap();
+        let extracted = comments::extract_units(&crate::diffparse::parse(&diff), 12);
+        let (path, units) = &extracted[0];
+        let file = ReviewFile {
+            path: path.clone(),
+            units: vec![],
+            line_offset: 0,
+            decided: 0,
+        };
+
+        // Someone edits the file behind our back.
+        repo.write("src/lib.rs", "fn main() {\n    counter += 1;\n}\n");
+        let err = apply_edit(&repo.path(), &file, &units[0], &[]).unwrap_err();
+        assert!(
+            err.contains("mismatch") || err.contains("out of bounds"),
+            "should refuse the stale edit, said: {err}"
+        );
+    }
+}

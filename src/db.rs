@@ -9,6 +9,51 @@ pub struct Db {
     conn: Connection,
 }
 
+/// One human verdict on one comment.
+pub struct DecisionRecord<'a> {
+    pub session_id: i64,
+    pub file: &'a str,
+    pub line_start: u32,
+    pub line_end: u32,
+    pub original: &'a str,
+    pub action: &'a str,
+    pub final_text: &'a str,
+    pub source: &'a str,
+    pub human_edited: bool,
+    pub committed: bool,
+    pub commit_sha: Option<&'a str>,
+    pub justification: Option<&'a str>,
+    /// The unit exactly as reviewed, so the judgement can be replayed against
+    /// a different model later. `None` for decisions made before this existed.
+    pub unit_json: Option<&'a str>,
+    /// Whether model identities were hidden when the choice was made.
+    pub blinded: bool,
+}
+
+/// A labelled example: the unit, and what the human decided about it.
+pub struct CorpusRow {
+    pub unit_json: String,
+    pub action: String,
+    pub final_text: String,
+    pub source: String,
+    pub human_edited: bool,
+    pub blinded: bool,
+    /// Repository the comment was reviewed in, so a replay can put the models
+    /// back in it. Empty for a decision recorded without a session.
+    pub repo: String,
+}
+
+/// One model's proposal next to the human verdict for the same comment.
+pub struct AgreementRow {
+    pub model: String,
+    pub model_action: Option<String>,
+    pub latency_ms: i64,
+    pub error: Option<String>,
+    pub human_action: String,
+    pub human_source: String,
+    pub blinded: bool,
+}
+
 fn db_path() -> PathBuf {
     if let Ok(p) = std::env::var("CRA_DB") {
         return PathBuf::from(p);
@@ -18,6 +63,25 @@ fn db_path() -> PathBuf {
     let _ = std::fs::create_dir_all(&dir);
     dir.push("cra.db");
     dir
+}
+
+/// Add a column if the table does not already have it. SQLite has no
+/// `ADD COLUMN IF NOT EXISTS`, and blindly retrying the ALTER would mask real
+/// errors, so ask first.
+fn add_column(conn: &Connection, table: &str, column: &str, decl: &str) {
+    let Ok(mut stmt) = conn.prepare(&format!("PRAGMA table_info({table})")) else {
+        return;
+    };
+    let existing: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default();
+    if !existing.iter().any(|c| c == column) {
+        let _ = conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
+            [],
+        );
+    }
 }
 
 fn now() -> String {
@@ -88,6 +152,10 @@ impl Db {
              );",
         )
         .map_err(|e| e.to_string())?;
+        // Added after the first release; existing databases get them here so a
+        // review history recorded before evaluation existed stays usable.
+        add_column(&conn, "decisions", "unit_json", "TEXT");
+        add_column(&conn, "decisions", "blinded", "INTEGER NOT NULL DEFAULT 0");
         Ok(Db { conn })
     }
 
@@ -158,29 +226,170 @@ impl Db {
         );
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn log_decision(
-        &self,
-        session_id: i64,
-        file: &str,
-        line_start: u32,
-        line_end: u32,
-        original: &str,
-        action: &str,
-        final_text: &str,
-        source: &str,
-        human_edited: bool,
-        committed: bool,
-        commit_sha: Option<&str>,
-        justification: Option<&str>,
-    ) {
+    /// Returns the new row's id, so a decision saved without committing can
+    /// later be updated once it actually lands in a commit (see
+    /// [`Db::mark_committed`]).
+    pub fn log_decision(&self, d: &DecisionRecord) -> i64 {
         let _ = self.conn.execute(
             "INSERT INTO decisions(ts, session_id, file, line_start, line_end, original, action,
-                                   final_text, source, human_edited, committed, commit_sha, justification)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-            params![now(), session_id, file, line_start, line_end, original, action, final_text,
-                    source, human_edited as i64, committed as i64, commit_sha, justification],
+                                   final_text, source, human_edited, committed, commit_sha,
+                                   justification, unit_json, blinded)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![
+                now(),
+                d.session_id,
+                d.file,
+                d.line_start,
+                d.line_end,
+                d.original,
+                d.action,
+                d.final_text,
+                d.source,
+                d.human_edited as i64,
+                d.committed as i64,
+                d.commit_sha,
+                d.justification,
+                d.unit_json,
+                d.blinded as i64
+            ],
         );
+        self.conn.last_insert_rowid()
+    }
+
+    /// Back-fills `committed`/`commit_sha` on a decision that was saved
+    /// without committing, once a later `Commit and Continue` folds it into a
+    /// commit alongside the decision that triggered it.
+    pub fn mark_committed(&self, id: i64, sha: &str) {
+        let _ = self.conn.execute(
+            "UPDATE decisions SET committed = 1, commit_sha = ?1 WHERE id = ?2",
+            params![sha, id],
+        );
+    }
+
+    /// Reviewed comments that carry the unit they were judged on, newest
+    /// first. These are the labelled examples a replay is scored against.
+    pub fn corpus(&self, limit: usize) -> Vec<CorpusRow> {
+        let Ok(mut stmt) = self.conn.prepare(
+            "SELECT d.unit_json, d.action, d.final_text, d.source, d.human_edited, d.blinded,
+                    COALESCE(s.repo, '')
+             FROM decisions d
+             LEFT JOIN sessions s ON s.id = d.session_id
+             WHERE d.unit_json IS NOT NULL AND d.unit_json <> ''
+             ORDER BY d.id DESC LIMIT ?1",
+        ) else {
+            return Vec::new();
+        };
+        stmt.query_map(params![limit as i64], |r| {
+            Ok(CorpusRow {
+                unit_json: r.get(0)?,
+                action: r.get(1)?,
+                final_text: r.get(2)?,
+                source: r.get(3)?,
+                human_edited: r.get::<_, i64>(4)? != 0,
+                blinded: r.get::<_, i64>(5)? != 0,
+                repo: r.get(6)?,
+            })
+        })
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+    }
+
+    /// Labelled decisions from one repository only. Re-checking runs models
+    /// in the selected checkout, so mixing another repository's relative
+    /// paths into that plan would show them unrelated code.
+    pub fn corpus_for_repo(&self, repo: &str, limit: usize) -> Vec<CorpusRow> {
+        let Ok(mut stmt) = self.conn.prepare(
+            "SELECT d.unit_json, d.action, d.final_text, d.source, d.human_edited, d.blinded,
+                    s.repo
+             FROM decisions d
+             JOIN sessions s ON s.id = d.session_id
+             WHERE d.unit_json IS NOT NULL AND d.unit_json <> '' AND s.repo = ?1
+             ORDER BY d.id DESC LIMIT ?2",
+        ) else {
+            return Vec::new();
+        };
+        stmt.query_map(params![repo, limit as i64], |r| {
+            Ok(CorpusRow {
+                unit_json: r.get(0)?,
+                action: r.get(1)?,
+                final_text: r.get(2)?,
+                source: r.get(3)?,
+                human_edited: r.get::<_, i64>(4)? != 0,
+                blinded: r.get::<_, i64>(5)? != 0,
+                repo: r.get(6)?,
+            })
+        })
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+    }
+
+    /// Every model suggestion paired with the decision the human made on the
+    /// same comment. This join is the whole evaluation dataset.
+    pub fn agreement_rows(&self) -> Vec<AgreementRow> {
+        let Ok(mut stmt) = self.conn.prepare(
+            "SELECT s.model, s.action, s.latency_ms, s.error,
+                    d.action, d.source, d.blinded
+             FROM suggestions s
+             JOIN decisions d
+               ON s.session_id = d.session_id
+              AND s.file = d.file
+              AND s.line_start = d.line_start
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM suggestions newer
+                 WHERE newer.session_id = s.session_id
+                   AND newer.file = s.file
+                   AND newer.line_start = s.line_start
+                   AND newer.line_end = s.line_end
+                   AND newer.model = s.model
+                   AND newer.id > s.id
+             )",
+        ) else {
+            return Vec::new();
+        };
+        stmt.query_map([], |r| {
+            Ok(AgreementRow {
+                model: r.get(0)?,
+                model_action: r.get(1)?,
+                latency_ms: r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                error: r.get(3)?,
+                human_action: r.get(4)?,
+                human_source: r.get(5)?,
+                blinded: r.get::<_, i64>(6)? != 0,
+            })
+        })
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+    }
+
+    /// Comments judged more than once, oldest verdict first. Comparing a
+    /// reviewer against their own earlier self is the only way to know how
+    /// much of a model's disagreement is noise rather than error.
+    pub fn repeated_decisions(&self) -> Vec<(String, Vec<String>)> {
+        let Ok(mut stmt) = self.conn.prepare(
+            "SELECT COALESCE(s.repo, '') || ':' ||
+                    COALESCE(NULLIF(d.unit_json, ''),
+                             d.file || ':' || d.line_start || ':' || d.line_end || ':' || d.original)
+                    AS key,
+                    d.action
+             FROM decisions d
+             LEFT JOIN sessions s ON s.id = d.session_id
+             ORDER BY d.id ASC",
+        ) else {
+            return Vec::new();
+        };
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default();
+        let mut grouped: Vec<(String, Vec<String>)> = Vec::new();
+        for (key, action) in rows {
+            match grouped.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, actions)) => actions.push(action),
+                None => grouped.push((key, vec![action])),
+            }
+        }
+        grouped.retain(|(_, actions)| actions.len() > 1);
+        grouped
     }
 
     pub fn decision_counts(&self, session_id: i64) -> (i64, i64) {
