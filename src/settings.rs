@@ -757,9 +757,11 @@ mod tests {
 
     #[test]
     fn migrations_restore_read_access_and_add_separate_writable_fix_commands() {
-        let mut settings = Settings::default();
-        settings.schema_version = 1;
-        settings.model_timeout_secs = 120;
+        let mut settings = Settings {
+            schema_version: 1,
+            model_timeout_secs: 120,
+            ..Settings::default()
+        };
         let codex = &mut settings.models[1];
         codex.command = "codex exec --skip-git-repo-check --json".into();
         codex.resume_command = "codex exec --skip-git-repo-check --json resume {session} -".into();
