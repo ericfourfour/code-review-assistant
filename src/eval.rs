@@ -1543,6 +1543,7 @@ mod tests {
             cost: None,
             follow_up_id: None,
             round: 1,
+            stopped: false,
         });
         db.log_suggestion(&crate::db::SuggestionRecord {
             session_id: session,
@@ -1560,6 +1561,7 @@ mod tests {
             cost: None,
             follow_up_id: None,
             round: 2,
+            stopped: false,
         });
         log_label(&db, session, &judged, "rewrite", "m1");
 

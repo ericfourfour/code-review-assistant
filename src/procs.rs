@@ -346,6 +346,7 @@ impl ProcTable {
 #[derive(Clone)]
 pub struct StopReceipt {
     pub owner: Owner,
+    pub model_index: usize,
     pub model: String,
     pub what: String,
     /// The pid as it was when the stop was asked for. Held by value because
@@ -353,7 +354,7 @@ pub struct StopReceipt {
     /// has to survive the row being swept.
     pub pid: Option<u32>,
     pub session: Option<String>,
-    handle: ProcHandle,
+    pub(crate) handle: ProcHandle,
 }
 
 impl StopReceipt {
@@ -558,6 +559,7 @@ impl ProcTable {
             row.handle.stop(reason);
             out.push(StopReceipt {
                 owner: row.owner,
+                model_index: row.model_index,
                 model: row.model.clone(),
                 what: row.what.clone(),
                 pid: snap.pid,

@@ -65,6 +65,7 @@ impl Screen {
 /// offering a button that would quietly start a new conversation.
 #[derive(Clone)]
 pub struct PausedCall {
+    pub owner: Owner,
     pub model_index: usize,
     pub model: String,
     /// What the call was doing when it was stopped.
@@ -87,10 +88,13 @@ impl PausedCall {
     /// and the CLI holding it knows how to resume one.
     pub fn resumable(&self, settings: &Settings) -> bool {
         self.session.is_some()
-            && settings
-                .models
-                .get(self.model_index)
-                .is_some_and(|m| !m.resume_command.trim().is_empty())
+            && settings.models.get(self.model_index).is_some_and(|m| {
+                let command = match self.owner {
+                    Owner::Fix => &m.fix_resume_command,
+                    Owner::Review | Owner::Branch => &m.resume_command,
+                };
+                !command.trim().is_empty()
+            })
     }
 
     /// The one-line state a paused card shows.
@@ -1560,6 +1564,11 @@ impl CraApp {
     pub fn ask_followup(&mut self, ctx: &egui::Context, model: Option<usize>) {
         let message = self.follow_up.trim().to_string();
         if message.is_empty() {
+            return;
+        }
+        if let Some(why) = self.usage_block() {
+            self.review_error = Some(why.clone());
+            self.note("usage", &why);
             return;
         }
         let targets: Vec<usize> = match model {
@@ -3192,7 +3201,15 @@ impl CraApp {
                 CandidateState::Pending(h) => h.clone(),
                 _ => continue,
             };
-            let call = self.paused_call(idx, handle, reason, self.convo_prompt(idx));
+            let fallback = self.sessions.get(idx).cloned().flatten();
+            let call = self.paused_call(
+                Owner::Review,
+                idx,
+                handle,
+                reason,
+                self.convo_prompt(idx),
+                fallback,
+            );
             if call.resumable(&self.settings) {
                 resumable += 1;
             }
@@ -3216,7 +3233,7 @@ impl CraApp {
                 WholeBranchReviewState::Pending(h) => h.clone(),
                 _ => continue,
             };
-            let call = self.paused_call(idx, handle, reason, String::new());
+            let call = self.paused_call(Owner::Branch, idx, handle, reason, String::new(), None);
             if call.resumable(&self.settings) {
                 resumable += 1;
             }
@@ -3236,7 +3253,14 @@ impl CraApp {
             .last()
             .map(|t| t.prompt.clone())
             .unwrap_or_default();
-        let call = self.paused_call(idx, handle, reason, prompt);
+        let call = self.paused_call(
+            Owner::Fix,
+            idx,
+            handle,
+            reason,
+            prompt,
+            self.fix_session.clone(),
+        );
         let resumable = usize::from(call.resumable(&self.settings));
         // The session id the app holds is the fix screen's own record of the
         // conversation, and it outlasts any one turn.
@@ -3249,10 +3273,12 @@ impl CraApp {
     /// One stopped call, as the screen that owned it will show it.
     fn paused_call(
         &self,
+        owner: Owner,
         model_index: usize,
         handle: ProcHandle,
         reason: &str,
         prompt: String,
+        fallback_session: Option<String>,
     ) -> PausedCall {
         let snap = handle.snapshot();
         let model = self
@@ -3264,10 +3290,7 @@ impl CraApp {
         // Prefer what the process itself reported; fall back to the id the app
         // generated for it, which for a `{session}` model is the same id and
         // is known even when the call was killed before it printed anything.
-        let session = snap
-            .session
-            .clone()
-            .or_else(|| self.sessions.get(model_index).cloned().flatten());
+        let session = snap.session.clone().or(fallback_session);
         // By handle rather than by pid: a call stopped before it started has
         // no pid, and matching on `None` would pick some other row's label.
         let what = self
@@ -3276,6 +3299,7 @@ impl CraApp {
             .map(|r| r.what.clone())
             .unwrap_or_default();
         PausedCall {
+            owner,
             model_index,
             model,
             what,
@@ -3320,13 +3344,123 @@ impl CraApp {
         n
     }
 
+    /// Stop one ledger row and immediately mirror that stop into the owning
+    /// screen's state. Otherwise the process dies while its card keeps saying
+    /// "running" forever because cancelled replies deliberately do not
+    /// overwrite UI state.
+    pub fn stop_model(&mut self, id: u64, reason: &str) -> usize {
+        let receipts = self.procs.stop_one(id, reason);
+        let mut resumable = 0;
+        for receipt in &receipts {
+            resumable += self.pause_one(receipt, reason);
+        }
+        let n = receipts.len();
+        if n > 0 {
+            self.note(
+                "procs",
+                &format!("stopping {n} process(es) from the ledger"),
+            );
+            self.nav_notice = Some(NavNotice {
+                left: self.screen,
+                receipts,
+                resumable,
+            });
+        }
+        n
+    }
+
+    fn pause_one(&mut self, receipt: &StopReceipt, reason: &str) -> usize {
+        let idx = receipt.model_index;
+        match receipt.owner {
+            Owner::Review => {
+                let pending = self.candidates.get(idx).and_then(|state| match state {
+                    CandidateState::Pending(handle) if handle.is(&receipt.handle) => {
+                        Some(handle.clone())
+                    }
+                    _ => None,
+                });
+                if let Some(handle) = pending {
+                    let fallback = self.sessions.get(idx).cloned().flatten();
+                    let call = self.paused_call(
+                        Owner::Review,
+                        idx,
+                        handle,
+                        reason,
+                        self.convo_prompt(idx),
+                        fallback,
+                    );
+                    let resumable = usize::from(call.resumable(&self.settings));
+                    self.candidates[idx] = CandidateState::Paused(call);
+                    resumable
+                } else {
+                    // A prefetched call has no visible card. Drop its unfinished
+                    // prefetch so it can be asked cleanly when reached.
+                    self.prefetches.retain(|pf| {
+                        !pf.lives.iter().flatten().any(|h| h.is(&receipt.handle)) || pf.complete()
+                    });
+                    0
+                }
+            }
+            Owner::Branch => {
+                let pending = self
+                    .whole_branch_review
+                    .get(idx)
+                    .and_then(|state| match state {
+                        WholeBranchReviewState::Pending(handle) if handle.is(&receipt.handle) => {
+                            Some(handle.clone())
+                        }
+                        _ => None,
+                    });
+                if let Some(handle) = pending {
+                    let call =
+                        self.paused_call(Owner::Branch, idx, handle, reason, String::new(), None);
+                    let resumable = usize::from(call.resumable(&self.settings));
+                    self.whole_branch_review[idx] = WholeBranchReviewState::Paused(call);
+                    resumable
+                } else {
+                    0
+                }
+            }
+            Owner::Fix => {
+                let pending = self
+                    .fix_proc
+                    .as_ref()
+                    .filter(|handle| handle.is(&receipt.handle))
+                    .cloned();
+                if let Some(handle) = pending {
+                    let prompt = self
+                        .fix_convo
+                        .last()
+                        .map(|turn| turn.prompt.clone())
+                        .unwrap_or_default();
+                    let call = self.paused_call(
+                        Owner::Fix,
+                        idx,
+                        handle,
+                        reason,
+                        prompt,
+                        self.fix_session.clone(),
+                    );
+                    self.fix_session = call.session.clone();
+                    self.fix_running = false;
+                    self.fix_proc = None;
+                    let resumable = usize::from(call.resumable(&self.settings));
+                    self.fix_paused = Some(call);
+                    resumable
+                } else {
+                    0
+                }
+            }
+        }
+    }
+
     /// Continue a paused per-unit call on the session it was holding.
     pub fn resume_candidate(&mut self, ctx: &egui::Context, idx: usize) {
         let CandidateState::Paused(call) = &self.candidates[idx] else {
             return;
         };
         let call = call.clone();
-        let Some(model_config) = self.settings.models.get(idx).cloned() else {
+        let Some(model_config) = self.candidate_models.get(idx).cloned() else {
             return;
         };
         let Some(session) = call.session.clone() else {
@@ -3367,7 +3501,7 @@ impl CraApp {
     /// Ask a model the current unit again from a new session — what is on
     /// offer when a killed call left no session id to continue.
     pub fn restart_candidate(&mut self, ctx: &egui::Context, idx: usize) {
-        let Some(model_config) = self.settings.models.get(idx).cloned() else {
+        let Some(model_config) = self.candidate_models.get(idx).cloned() else {
             return;
         };
         let Some(unit) = self.current_unit() else {
@@ -3457,7 +3591,9 @@ impl CraApp {
             self.fix_error = Some(why);
             return;
         }
-        let command = model_config.resume_command.replace("{session}", &session);
+        let command = model_config
+            .fix_resume_command
+            .replace("{session}", &session);
         // The same instructions again, on the conversation that already has
         // them: the model picks up where the kill interrupted it rather than
         // being handed a summary of what it was doing.
@@ -3470,7 +3606,7 @@ impl CraApp {
         self.fix_error = None;
         self.fix_session = Some(session.clone());
         self.active_fix_model_index = call.model_index;
-        let cli_home = self.cli_home(&repo);
+        let cli_home = self.fix_cli_home(&repo, &command);
         let timeout = self.settings.model_timeout_secs.saturating_mul(4);
         let proc = self.procs.register(
             Owner::Fix,
@@ -4204,6 +4340,62 @@ mod state_tests {
         }
     }
 
+    /// A row stopped from the ledger must become paused on the page that
+    /// launched it. Branch and fix calls also have their own conversation
+    /// ids; borrowing the same model's review id would resume the wrong chat.
+    #[test]
+    fn stopping_one_ledger_row_pauses_its_owner_without_stealing_a_review_session() {
+        let dir = TempDir::new("one_row_owner");
+        let cli = FakeCli::new(&dir, "owner", FakeCliSpec::default());
+        let mut model = cli.model_config("");
+        model.resume_command = format!("{} --review {{session}}", cli.command());
+        model.fix_resume_command = format!("{} --fix {{session}}", cli.command());
+
+        let mut h = Harness::new("one_row_owner");
+        h.app.settings.models = vec![model];
+        h.app.sessions = vec![Some("review-session".into())];
+
+        let branch = h
+            .app
+            .procs
+            .register(Owner::Branch, 0, "fake", "branch review");
+        h.app.whole_branch_review = vec![WholeBranchReviewState::Pending(branch)];
+        let branch_id = h
+            .app
+            .procs
+            .live()
+            .find(|row| row.owner == Owner::Branch)
+            .unwrap()
+            .id;
+        assert_eq!(h.app.stop_model(branch_id, "test stop"), 1);
+        match &h.app.whole_branch_review[0] {
+            WholeBranchReviewState::Paused(call) => {
+                assert!(matches!(call.owner, Owner::Branch));
+                assert_eq!(call.session, None, "review session leaked into branch call");
+            }
+            _ => panic!("the branch row should be visibly paused"),
+        }
+
+        let fix = h.app.procs.register(Owner::Fix, 0, "fake", "fix turn");
+        h.app.fix_proc = Some(fix);
+        h.app.fix_running = true;
+        h.app.fix_session = Some("fix-session".into());
+        let fix_id = h
+            .app
+            .procs
+            .live()
+            .find(|row| row.owner == Owner::Fix)
+            .unwrap()
+            .id;
+        assert_eq!(h.app.stop_model(fix_id, "test stop"), 1);
+        let call = h.app.fix_paused.as_ref().expect("fix row should be paused");
+        assert!(matches!(call.owner, Owner::Fix));
+        assert_eq!(call.session.as_deref(), Some("fix-session"));
+        assert!(call.resumable(&h.app.settings));
+        assert!(!h.app.fix_running);
+        assert!(h.app.fix_proc.is_none());
+    }
+
     /// The spend a killed call had already run up stays on the books, or a
     /// reviewer who walks away often would never reach a limit they had set.
     #[test]
@@ -4250,6 +4442,27 @@ mod state_tests {
             "a limit that still launches calls is not one"
         );
         assert!(matches!(h.app.candidates[0], CandidateState::Disabled));
+
+        // Follow-ups are model calls too. Reaching the ceiling must leave the
+        // typed question intact and launch no resumed conversation.
+        h.app.candidates[0] = CandidateState::Ready(Suggestion {
+            action: Action::Keep,
+            comment: String::new(),
+            justification: "fine".into(),
+            evidence: Vec::new(),
+            latency_ms: 1,
+        });
+        h.app.sessions[0] = Some("review-session".into());
+        h.app.candidate_models[0].resume_command = cli.command();
+        h.app.follow_up = "why?".into();
+        h.app.ask_followup(&egui::Context::default(), Some(0));
+        assert_eq!(h.app.procs.running_total(), 0);
+        assert_eq!(h.app.follow_up, "why?");
+        assert!(h
+            .app
+            .review_error
+            .as_deref()
+            .is_some_and(|e| e.contains("usage limit")));
 
         // Raising it lets the work continue rather than needing a restart.
         h.app.settings.usage_limit_usd = 100.0;

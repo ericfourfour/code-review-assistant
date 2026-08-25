@@ -298,14 +298,7 @@ pub fn window(app: &mut CraApp, ctx: &egui::Context) {
     if stop_all {
         app.stop_all_models("stopped from the process ledger");
     } else if let Some(id) = stop {
-        let receipts = app.procs.stop_one(id, "stopped from the process ledger");
-        let n = receipts.len();
-        if n > 0 {
-            app.note(
-                "procs",
-                &format!("stopping {n} process(es) from the ledger"),
-            );
-        }
+        app.stop_model(id, "stopped from the process ledger");
     }
     if !open {
         app.show_procs = false;

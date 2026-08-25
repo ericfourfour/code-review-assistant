@@ -670,6 +670,7 @@ fn the_file_picker_lays_out_its_rows() {
 /// away: a real pid, a session that can be continued, and a reason.
 fn paused_call(session: Option<&str>) -> crate::app::PausedCall {
     crate::app::PausedCall {
+        owner: crate::procs::Owner::Review,
         model_index: 0,
         model: "claude".into(),
         what: "src/lib.rs:2 · verdict".into(),
@@ -800,6 +801,7 @@ fn a_paused_card_offers_resume_only_when_there_is_a_session() {
     app.settings.models = vec![crate::settings::ModelConfig {
         name: "claude".into(),
         command: "claude --session-id {session}".into(),
+        fix_command: "claude --session-id {session}".into(),
         coauthor: String::new(),
         enabled: false,
         model: String::new(),
@@ -807,6 +809,7 @@ fn a_paused_card_offers_resume_only_when_there_is_a_session() {
         effort: String::new(),
         effort_flag: "--effort".into(),
         resume_command: "claude --resume {session}".into(),
+        fix_resume_command: "claude --resume {session}".into(),
         session_key: String::new(),
         price_in: 0.0,
         price_out: 0.0,
