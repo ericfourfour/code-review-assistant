@@ -137,6 +137,23 @@ impl ReviewPlan {
         self.files.iter().map(|f| f.units.len()).sum()
     }
 
+    /// How many units the summary is reporting on. Normally the plan's own —
+    /// but a ref whose every unit was decided before this session opened has
+    /// no units *left*, and reporting "2 / 0" over a finished review reads as
+    /// a bug. There, the ones left out are what "reviewed" refers to.
+    pub fn reported_units(&self) -> usize {
+        match self.files.is_empty() {
+            true => self.skipped_decided,
+            false => self.total_units(),
+        }
+    }
+
+    /// Whether this plan exists only to carry a finished review's session to
+    /// the summary screen — nothing left to decide, only commits to deliver.
+    pub fn nothing_left(&self) -> bool {
+        self.files.is_empty() && self.skipped_decided > 0
+    }
+
     pub fn current(&self) -> Option<(&ReviewFile, &ReviewUnit)> {
         let f = self.files.get(self.file_idx)?;
         let u = f.units.get(self.unit_idx)?;

@@ -383,6 +383,40 @@ impl Db {
         self.conn.last_insert_rowid()
     }
 
+    /// The most recent session recorded for this ref in this repository.
+    ///
+    /// What lets a ref with nothing left to review reopen on the session its
+    /// fix commits were made in, rather than on an empty new one: publishing
+    /// proves a branch is safe to rewind by matching its commits against a
+    /// session's, and a session that made none proves nothing.
+    pub fn last_session(&self, repo: &str, ref_name: &str) -> Option<i64> {
+        self.conn
+            .query_row(
+                "SELECT id FROM sessions WHERE repo = ?1 AND ref_name = ?2
+                 ORDER BY id DESC LIMIT 1",
+                params![repo, ref_name],
+                |r| r.get(0),
+            )
+            .ok()
+    }
+
+    /// The session that made a given commit.
+    ///
+    /// Names are not reliable identity: a rescued branch carries a finished
+    /// review's commits under a name no session was ever opened for, and so
+    /// does a branch since renamed. The commits themselves are, so this is
+    /// what finds the session when [`Db::last_session`] draws a blank.
+    pub fn session_for_commit(&self, sha: &str) -> Option<i64> {
+        self.conn
+            .query_row(
+                "SELECT session_id FROM decisions
+                 WHERE commit_sha = ?1 AND committed = 1 ORDER BY id DESC LIMIT 1",
+                params![sha],
+                |r| r.get(0),
+            )
+            .ok()
+    }
+
     pub fn log_suggestion(&self, s: &SuggestionRecord) {
         let _ = self.conn.execute(
             "INSERT INTO suggestions(ts, session_id, file, line_start, line_end, model,
@@ -1008,5 +1042,22 @@ impl Db {
             )
             .unwrap_or(0);
         (total, committed)
+    }
+
+    /// Every distinct commit this session made, newest first. What lets
+    /// publishing prove a branch holds nothing but this review's work before
+    /// it offers to rewind it — see [`crate::publish::restore_blocker`].
+    pub fn session_commits(&self, session_id: i64) -> Vec<String> {
+        let Ok(mut stmt) = self.conn.prepare(
+            "SELECT DISTINCT commit_sha FROM decisions
+             WHERE session_id = ?1 AND committed = 1 AND commit_sha IS NOT NULL
+               AND commit_sha <> ''
+             ORDER BY id DESC",
+        ) else {
+            return Vec::new();
+        };
+        stmt.query_map(params![session_id], |r| r.get::<_, String>(0))
+            .map(|rows| rows.filter_map(Result::ok).collect())
+            .unwrap_or_default()
     }
 }

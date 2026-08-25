@@ -391,6 +391,353 @@ pub fn commit_index(dir: &str, message: &str) -> Result<String, String> {
 }
 
 // ---------------------------------------------------------------------------
+// Delivering a finished review
+
+/// Where a finished review's commits can go: the branch they were made on,
+/// the remote that branch belongs to, and how far the local copy has run
+/// ahead of what the remote holds.
+///
+/// Everything here is read-only and best-effort — a repository with no
+/// remotes, a detached HEAD and a branch nobody has ever pushed are all
+/// ordinary states, and each one only rules out some of the routes out.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Delivery {
+    /// The branch HEAD is on. `None` on a detached HEAD, which is what a
+    /// review gets when the branch was already checked out somewhere else —
+    /// the commits are real, but they are on no branch.
+    pub branch: Option<String>,
+    /// The remote to publish to: the branch's own, else `origin`, else the
+    /// only one configured. `None` when the repository has no remotes at all.
+    pub remote: Option<String>,
+    /// The remote-tracking ref the local commits were compared against, e.g.
+    /// `origin/feature`. `None` when the branch has never been pushed.
+    pub upstream: Option<String>,
+    /// The commit that will actually be published — normally `HEAD`.
+    ///
+    /// It is a sha instead when the review's own commits are not on this
+    /// checkout, which is what a detached review looks like once its commits
+    /// have been rescued onto a branch of their own: the session made them,
+    /// they are real, and HEAD has moved back to where the remote is. Asking
+    /// HEAD what there is to publish answers "nothing" over the top of a
+    /// summary that just said one commit was made.
+    pub tip: String,
+    /// The branch those commits live on, when they are not on this checkout.
+    pub tip_branch: Option<String>,
+    /// Commits publishing would add, newest first — everything between the
+    /// comparison point and HEAD.
+    pub unpushed: Vec<String>,
+    /// Commits the remote has that HEAD does not. Any at all means a plain
+    /// push is a non-fast-forward and will be refused.
+    pub behind: usize,
+    /// Uncommitted changes in the review's checkout — work neither route
+    /// would publish, so the reviewer is told before they pick one.
+    pub dirty: bool,
+}
+
+impl Delivery {
+    pub fn ahead(&self) -> usize {
+        self.unpushed.len()
+    }
+
+    /// Whether a plain push of these commits can work at all: somewhere to
+    /// push to, and something to send.
+    pub fn can_push(&self) -> bool {
+        self.remote.is_some() && !self.unpushed.is_empty()
+    }
+}
+
+/// Read the delivery state of `dir`, for a review of `ref_name` against
+/// `base`, whose session made `session_commits`.
+///
+/// `ref_name` is what the branch is called on the remote — needed because a
+/// detached review HEAD cannot name itself — and `base` is the fallback
+/// comparison point for a branch the remote has never seen, where "what a
+/// push would add" is the whole branch. `session_commits` is what keeps the
+/// answer about the *review* rather than about the checkout: see
+/// [`Delivery::tip`].
+pub fn delivery_state(
+    dir: &str,
+    ref_name: &str,
+    base: &str,
+    session_commits: &[String],
+) -> Delivery {
+    let branch = current_branch(dir).ok().filter(|b| b != "HEAD" && !b.is_empty());
+    let remote = default_remote(dir, branch.as_deref());
+    // The branch's configured upstream first — it is the reviewer's own answer
+    // to where this branch goes. Failing that, the tracking ref for the name
+    // the review was started under, which is what a detached PR checkout has.
+    let upstream = branch
+        .as_deref()
+        .and_then(|b| upstream_ref(dir, b))
+        .or_else(|| {
+            let cand = format!("{}/{ref_name}", remote.as_deref()?);
+            has_ref(dir, &format!("refs/remotes/{cand}")).then_some(cand)
+        });
+
+    // Publish what the review committed. Only when HEAD cannot reach those
+    // commits does the tip move off it — otherwise this is HEAD, and every
+    // ordinary review takes the cheap path.
+    let stranded: Vec<String> = session_commits
+        .iter()
+        .filter(|sha| exists(dir, sha) && !is_ancestor(dir, sha, "HEAD"))
+        .cloned()
+        .collect();
+    let (tip, tip_branch) = match newest(dir, &stranded) {
+        Some(sha) => {
+            let on = branch_containing(dir, &sha);
+            (sha, on)
+        }
+        None => ("HEAD".to_string(), None),
+    };
+
+    let (behind, unpushed) = match &upstream {
+        Some(u) => (commits_between(dir, &tip, u).len(), commits_between(dir, u, &tip)),
+        // Never pushed: everything the review was scoped to is unpublished.
+        None => (0, commits_between(dir, base, &tip)),
+    };
+    Delivery {
+        branch,
+        remote,
+        upstream,
+        tip,
+        tip_branch,
+        unpushed,
+        behind,
+        dirty: is_dirty(dir),
+    }
+}
+
+/// Whether this repository still has `rev` — a commit left on no branch can
+/// be collected, and asking about one that is gone is an error, not a fact.
+fn exists(dir: &str, rev: &str) -> bool {
+    git(dir, &["cat-file", "-e", &format!("{rev}^{{commit}}")]).is_ok()
+}
+
+fn is_ancestor(dir: &str, rev: &str, of: &str) -> bool {
+    git(dir, &["merge-base", "--is-ancestor", rev, of]).is_ok()
+}
+
+/// The most recent of `revs`. Review commits are made one after another on one
+/// line of development, so the newest of them is the tip of the chain.
+/// `--no-walk=sorted` orders them without reading their history.
+fn newest(dir: &str, revs: &[String]) -> Option<String> {
+    if revs.is_empty() {
+        return None;
+    }
+    let mut args = vec!["rev-list", "--no-walk=sorted"];
+    args.extend(revs.iter().map(String::as_str));
+    let out = git(dir, &args).ok()?;
+    out.lines().map(str::trim).find(|l| !l.is_empty()).map(str::to_string)
+}
+
+/// Every remote this repository has, in git's order.
+pub fn remotes(dir: &str) -> Vec<String> {
+    git(dir, &["remote"])
+        .map(|s| s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+        .unwrap_or_default()
+}
+
+/// The remote a push should go to: whatever the branch is configured to push
+/// to, else `origin`, else the only remote there is. `None` for a repository
+/// with no remotes, and for one with several and no `origin` — choosing
+/// between those is the reviewer's call, not ours.
+pub fn default_remote(dir: &str, branch: Option<&str>) -> Option<String> {
+    if let Some(b) = branch {
+        if let Ok(r) = git(dir, &["config", "--get", &format!("branch.{b}.remote")]) {
+            let r = r.trim().to_string();
+            if !r.is_empty() {
+                return Some(r);
+            }
+        }
+    }
+    let all = remotes(dir);
+    if all.iter().any(|r| r == "origin") {
+        return Some("origin".to_string());
+    }
+    match all.len() {
+        1 => all.into_iter().next(),
+        _ => None,
+    }
+}
+
+/// The remote-tracking ref a branch is set to track, e.g. `origin/feature`.
+fn upstream_ref(dir: &str, branch: &str) -> Option<String> {
+    let spec = format!("{branch}@{{upstream}}");
+    let out = git(dir, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", &spec]).ok()?;
+    let out = out.trim();
+    (!out.is_empty()).then(|| out.to_string())
+}
+
+/// Whether a fully-qualified ref exists here.
+fn has_ref(dir: &str, full: &str) -> bool {
+    git(dir, &["rev-parse", "--verify", "--quiet", full]).is_ok()
+}
+
+/// The commits in `to` that `from` does not have, newest first.
+///
+/// A `from` that names no commit — nothing, the empty tree, one of the
+/// pseudo-bases an uncommitted review is scoped by — means the whole history
+/// of `to`, which is the true answer to "what has the remote not got" for a
+/// branch that has never been pushed. An unreadable range is no commits
+/// rather than an error: this feeds a count and a safety check, and both are
+/// better off cautious than absent.
+pub fn commits_between(dir: &str, from: &str, to: &str) -> Vec<String> {
+    let from = from.trim();
+    let range = if from.is_empty() || from == EMPTY_TREE || from.starts_with(':') {
+        to.to_string()
+    } else {
+        format!("{from}..{to}")
+    };
+    git(dir, &["rev-list", &range])
+        .map(|s| s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+        .unwrap_or_default()
+}
+
+/// Commits at HEAD that no branch and no remote-tracking ref can reach —
+/// exactly what moving this checkout somewhere else would strand.
+///
+/// Empty for an attached HEAD, whose own branch always contains it, and empty
+/// for a detached HEAD sitting on commits the remote already has. It is only
+/// the third case that matters: a detached review that committed its fixes,
+/// where nothing but the reflog knows where they went.
+pub fn unreferenced_head(dir: &str) -> Vec<String> {
+    git(dir, &["rev-list", "HEAD", "--not", "--branches", "--remotes"])
+        .map(|s| s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+        .unwrap_or_default()
+}
+
+/// The name of some branch that contains `rev`, with any remote prefix
+/// stripped — `refs/remotes/origin/codex/cd` and `refs/heads/codex/cd` both
+/// answer `codex/cd`. Used to work out what a stranded commit was built on
+/// top of, so it can be saved under a name that says what it belongs to.
+///
+/// Full refnames rather than `%(refname:short)`, because only the full form
+/// says where the remote name ends and a branch name with slashes in it
+/// begins.
+pub fn branch_containing(dir: &str, rev: &str) -> Option<String> {
+    let out = git(
+        dir,
+        &["for-each-ref", "--contains", rev, "--format=%(refname)", "refs/heads", "refs/remotes"],
+    )
+    .ok()?;
+    out.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.ends_with("/HEAD"))
+        .find_map(|full| {
+            if let Some(b) = full.strip_prefix("refs/heads/") {
+                return Some(b.to_string());
+            }
+            // refs/remotes/<remote>/<branch...> — one segment of remote, then
+            // the branch, slashes and all.
+            full.strip_prefix("refs/remotes/")
+                .and_then(|rest| rest.split_once('/'))
+                .map(|(_, branch)| branch.to_string())
+        })
+}
+
+/// Push `source` to `branch` on `remote`.
+///
+/// An explicit `<source>:refs/heads/<branch>` rather than a bare branch name,
+/// so a detached review — the shape a branch already checked out elsewhere is
+/// reviewed in — can publish the commits it made just the same, so commits
+/// that are not on this checkout at all can still be sent, and so the
+/// destination is never resolved from local configuration the caller did not
+/// ask about.
+pub fn push_branch(
+    dir: &str,
+    remote: &str,
+    branch: &str,
+    set_upstream: bool,
+    source: &str,
+) -> Result<String, String> {
+    let refspec = format!("{source}:refs/heads/{branch}");
+    let mut args = vec!["push"];
+    if set_upstream {
+        args.push("--set-upstream");
+    }
+    args.push(remote);
+    args.push(&refspec);
+    git(dir, &args)
+}
+
+/// Point a new branch at `at` without checking it out. Fails when the name is
+/// taken, which is what should happen — silently reusing a branch would
+/// publish whatever was already on it.
+pub fn create_branch(dir: &str, name: &str, at: &str) -> Result<(), String> {
+    git(dir, &["branch", name, at]).map(|_| ())
+}
+
+pub fn branch_exists(dir: &str, name: &str) -> bool {
+    has_ref(dir, &format!("refs/heads/{name}"))
+}
+
+/// Move an existing branch to `target` without checking it out. Only ever
+/// used to put a branch back where the remote has it, and only once the
+/// commits being moved off it are safely pushed somewhere else.
+pub fn move_branch(dir: &str, name: &str, target: &str) -> Result<(), String> {
+    git(dir, &["branch", "--force", name, target]).map(|_| ())
+}
+
+/// A file that deletes itself, for handing prose to a process that wants a
+/// path rather than an argument.
+struct ScratchFile(std::path::PathBuf);
+
+impl ScratchFile {
+    fn new(tag: &str, contents: &str) -> Result<ScratchFile, String> {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("{tag}-{}-{n}", std::process::id()));
+        std::fs::write(&path, contents).map_err(|e| format!("write {}: {e}", path.display()))?;
+        Ok(ScratchFile(path))
+    }
+
+    fn path(&self) -> String {
+        self.0.to_string_lossy().to_string()
+    }
+}
+
+impl Drop for ScratchFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Open a pull request from `head` into `base`, returning the URL `gh`
+/// prints. `--head` is given explicitly so this does not depend on what the
+/// worktree happens to have checked out.
+///
+/// The body goes through `--body-file` rather than `--body`: it is prose the
+/// reviewer typed, so it has newlines and quotes in it, and passing that as a
+/// command-line argument is a different quoting question on every platform —
+/// one Windows answers by refusing outright when `gh` resolves to a batch
+/// shim. A file also has no length limit to bump into.
+pub fn pr_create(
+    dir: &str,
+    gh: &str,
+    base: &str,
+    head: &str,
+    title: &str,
+    body: &str,
+) -> Result<String, String> {
+    let body_file = ScratchFile::new("cra-pr-body", body)?;
+    let out = run(
+        dir,
+        gh,
+        &[
+            "pr", "create", "--base", base, "--head", head, "--title", title, "--body-file",
+            &body_file.path(),
+        ],
+    )?;
+    // `gh` prints the URL on its own line, with progress chatter around it.
+    Ok(out
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("http"))
+        .unwrap_or_else(|| out.trim())
+        .to_string())
+}
+
+// ---------------------------------------------------------------------------
 // GitHub PRs via the `gh` CLI
 
 #[derive(Clone, Deserialize)]
