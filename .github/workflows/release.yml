@@ -1,0 +1,63 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset-suffix: linux-x86_64
+          - name: Windows x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset-suffix: windows-x86_64
+          - name: macOS ARM64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            asset-suffix: macos-arm64
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build release executable
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Upload Unix executable
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          asset="code-review-assistant-${{ matrix.asset-suffix }}"
+          cp "target/${{ matrix.target }}/release/code-review-assistant" "$asset"
+          gh release upload "$GITHUB_REF_NAME" "$asset" --clobber
+
+      - name: Upload Windows executable
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $asset = "code-review-assistant-${{ matrix.asset-suffix }}.exe"
+          Copy-Item target/${{ matrix.target }}/release/code-review-assistant.exe $asset
+          gh release upload $env:GITHUB_REF_NAME $asset --clobber
