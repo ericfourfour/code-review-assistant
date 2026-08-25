@@ -69,8 +69,8 @@ Pick Repository  →  Pick Branch / PR (or working tree)  →  Start or Pick Fil
 A code unit's editable region is the tight cluster of changed lines, but its *context* is as
 wide as can be justified. When the language has a bundled grammar, the excerpt is the
 **whole enclosing function or class** — a change judged against the definition it actually
-lives in, with the scope named in the unit badge (`code · fn main()`). Everywhere else — 
-unknown extensions, config files, languages without a grammar, scopes over ~240 lines — 
+lives in, with the scope named in the unit badge (`code · fn main()`). Everywhere else —
+unknown extensions, config files, languages without a grammar, scopes over ~240 lines —
 the excerpt falls back to the surrounding **hunk**, which needs nothing but the diff. Both
 kinds are reviewable; semantic is simply preferred when possible so the context is relevant
 rather than merely nearby.
