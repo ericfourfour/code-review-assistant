@@ -1104,13 +1104,13 @@ impl CraApp {
     }
 
     /// The prompt for a unit: the reviewer's standing preferences (when
-    /// enabled and there is history to mine), then the unit itself.
+    /// enabled and either written or minable), then the unit itself.
     fn unit_prompt(&self, unit: &ReviewUnit) -> String {
         let base = unit.build_prompt();
         if !self.settings.send_profile {
             return base;
         }
-        match crate::profile::preamble(&self.db) {
+        match crate::profile::preamble(&self.db, &self.settings.reviewer_preferences) {
             Some(p) => format!("{p}\n{base}"),
             None => base,
         }
@@ -4870,7 +4870,7 @@ mod state_tests {
     }
 
     #[test]
-    fn past_follow_ups_reach_the_next_prompt_as_standing_guidance() {
+    fn standing_guidance_reaches_the_prompt_mined_or_written() {
         let dir = TempDir::new("profile_prompt");
         let cli = FakeCli::new(
             &dir,
@@ -4896,6 +4896,15 @@ mod state_tests {
         h.app.start_review(&egui::Context::default(), 0);
         h.wait_for_model_replies();
         assert!(!cli.stdin_seen().contains("Reviewer preferences"));
+
+        // Written in settings, that text is sent instead of the mined one.
+        h.app.settings.send_profile = true;
+        h.app.settings.reviewer_preferences = "Only judge what the diff changed.".into();
+        h.app.start_review(&egui::Context::default(), 0);
+        h.wait_for_model_replies();
+        let sent = cli.stdin_seen();
+        assert!(sent.contains("Only judge what the diff changed."), "{sent}");
+        assert!(!sent.contains("Say why, not what."), "{sent}");
     }
 
     #[test]
