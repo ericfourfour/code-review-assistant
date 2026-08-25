@@ -6,7 +6,7 @@ use egui::{Key, Modifiers, RichText};
 use crate::app::{CandidateState, CraApp};
 use crate::models::Action;
 use crate::review::{self, Choice};
-use crate::ui::theme;
+use crate::ui::{code, theme};
 
 const NUM_KEYS: [Key; 9] = [
     Key::Num1,
@@ -33,8 +33,10 @@ impl CraApp {
             self.save_and_continue(ctx, false);
             return;
         }
+        // An alias for Ctrl+S rather than a forced commit: the checkbox is
+        // the only thing that decides that now.
         if ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, Key::Enter)) {
-            self.save_and_continue(ctx, true);
+            self.save_and_continue(ctx, false);
             return;
         }
         if !typing {
@@ -56,6 +58,9 @@ impl CraApp {
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F)) {
                 self.focus_follow_up = true;
             }
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::C)) {
+                self.focus_note = true;
+            }
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::R)) {
                 self.enter_unit(ctx);
                 return;
@@ -66,6 +71,10 @@ impl CraApp {
             }
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::P)) {
                 self.prev_unit(ctx);
+                return;
+            }
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::X)) {
+                self.end_session();
                 return;
             }
         }
@@ -114,6 +123,62 @@ impl CraApp {
         });
         if let Some(err) = self.review_error.clone() {
             ui.colored_label(theme::BAD, err);
+            // A mismatch left resolution state behind: offer the exits right
+            // here — re-review what the file holds now, or move on — instead
+            // of stranding the review on an error it cannot get past.
+            if let Some(stale) = &self.stale_unit {
+                let mut reload = false;
+                let mut skip = false;
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("Reload unit from disk")
+                        .on_hover_text(
+                            "Re-read the lines as they sit now and review them fresh — \
+                             the models are asked again",
+                        )
+                        .clicked()
+                    {
+                        reload = true;
+                    }
+                    if ui
+                        .button("Skip unit")
+                        .on_hover_text("Leave the file alone and move on")
+                        .clicked()
+                    {
+                        skip = true;
+                    }
+                    ui.label(theme::dim(&format!(
+                        "on disk now at line {}:",
+                        stale.start0 + 1
+                    )));
+                });
+                egui::Frame::none()
+                    .fill(theme::CODE_BG)
+                    .inner_margin(egui::Margin::same(4.0))
+                    .show(ui, |ui| {
+                        let shown = 6.min(stale.lines.len());
+                        for l in &stale.lines[..shown] {
+                            ui.label(RichText::new(l).monospace().color(theme::CODE));
+                        }
+                        if stale.lines.len() > shown {
+                            ui.label(theme::dim(&format!(
+                                "… {} more line(s)",
+                                stale.lines.len() - shown
+                            )));
+                        }
+                        if stale.lines.is_empty() {
+                            ui.label(theme::dim("nothing — the region was removed"));
+                        }
+                    });
+                if reload {
+                    self.reload_stale_unit(ctx);
+                    return;
+                }
+                if skip {
+                    self.skip_unit(ctx);
+                    return;
+                }
+            }
         }
         ui.add_space(2.0);
 
@@ -121,59 +186,38 @@ impl CraApp {
 
         // ---- context ----
         theme::section_title(ui, "CONTEXT");
+        let rows = context_rows(unit.context());
         egui::Frame::none()
-            .fill(egui::Color32::from_rgb(8, 11, 15))
+            .fill(theme::CODE_BG)
             .inner_margin(egui::Margin::same(4.0))
             .show(ui, |ui| {
-                egui::ScrollArea::vertical()
+                egui::ScrollArea::both()
                     .id_salt("context_scroll")
                     .max_height(total_h * 0.30)
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.y = 0.0;
-                        for line in unit.context().lines() {
-                            let rt = RichText::new(line).monospace();
-                            match line.chars().next() {
-                                Some('>') => {
-                                    ui.label(
-                                        rt.background_color(theme::MARK_BG)
-                                            .color(egui::Color32::from_rgb(230, 237, 243)),
-                                    );
-                                }
-                                // Removed by this change — shown where it was.
-                                Some('-') => {
-                                    ui.label(rt.color(egui::Color32::from_rgb(190, 100, 95)));
-                                }
-                                // Added by this branch, outside this unit.
-                                Some('+') => {
-                                    ui.label(rt.color(egui::Color32::from_rgb(150, 190, 150)));
-                                }
-                                _ => {
-                                    ui.label(rt.color(theme::TEXT_DIM));
-                                }
-                            }
-                        }
+                        code::show(ui, unit.file(), &rows);
                     });
             });
         ui.add_space(4.0);
 
         // ---- candidates ----
         theme::section_title(ui, "CANDIDATES");
-        let n_slots = self.candidates.len().max(1);
+        let model_count = self.candidates.len().max(1);
         let mut pick: Option<usize> = None;
         let mut ask_one: Option<usize> = None;
         let mut show_prompt: Option<usize> = None;
         let mut evidence_click: Option<crate::models::Evidence> = None;
-        let can_ask_slot: Vec<bool> = (0..n_slots).map(|i| self.can_ask(i)).collect();
+        let can_ask_model: Vec<bool> = (0..model_count).map(|i| self.can_ask(i)).collect();
         let order = self.candidate_order();
         let hidden = self.names_hidden();
-        ui.columns(n_slots, |cols| {
+        ui.columns(model_count, |cols| {
             for (pos, ui) in cols.iter_mut().enumerate() {
-                // `pos` is where the card sits on screen; `i` is which slot it
+                // `pos` is where the card sits on screen; `i` is which model_index it
                 // actually belongs to. They differ while blinding is on.
                 let i = order.get(pos).copied().unwrap_or(pos);
-                let can_ask = can_ask_slot.get(i).copied().unwrap_or(false);
-                let name = self.slot_label(i, pos);
+                let can_ask = can_ask_model.get(i).copied().unwrap_or(false);
+                let name = self.model_label(i, pos);
                 let is_chosen = self.chosen == Some(Choice::Candidate(i));
                 // Colour is per display position while hidden, so the palette
                 // does not give the model away either.
@@ -230,9 +274,16 @@ impl CraApp {
                                 );
                                 ui.label(theme::dim(&format!("{} ms", s.latency_ms)));
                             }
-                            Some(CandidateState::Pending) => {
+                            Some(CandidateState::Pending(live)) => {
                                 ui.spinner();
-                                ui.label(theme::dim("thinking…"));
+                                let snap = live.snapshot();
+                                ui.label(theme::dim(&format!(
+                                    "thinking… {}",
+                                    snap.clock(self.settings.model_timeout_secs)
+                                )));
+                                if let Some(a) = snap.activity_line() {
+                                    ui.label(theme::dim(&a));
+                                }
                             }
                             Some(CandidateState::Failed(_)) => {
                                 theme::badge(ui, "ERROR", theme::BAD)
@@ -249,28 +300,49 @@ impl CraApp {
                                     .italics()
                                     .color(egui::Color32::from_rgb(196, 208, 220)),
                             );
-                            egui::ScrollArea::vertical()
+                            egui::ScrollArea::both()
                                 .id_salt(("cand", i))
                                 .max_height(96.0)
                                 .auto_shrink([false, true])
                                 .show(ui, |ui| {
-                                    let preview = match (s.action, is_code) {
-                                        (Action::Keep, false) => "(keep original text)".to_string(),
-                                        (Action::Keep, true) => {
-                                            "(approve — sound as written)".to_string()
-                                        }
-                                        (Action::Delete, false) => {
-                                            "(delete this comment)".to_string()
-                                        }
-                                        (Action::Delete, true) => {
-                                            "(delete these lines)".to_string()
-                                        }
-                                        (Action::Flag, _) => "(flagged — no replacement proposed; \
+                                    // A rewrite previews as the text picking it
+                                    // would put in the editor — real code, not the
+                                    // model's raw prose. Code shows it as a diff
+                                    // against the original: a REVISE is a claim
+                                    // about what should change, and a fresh block
+                                    // leaves the eye to find that change by hand.
+                                    // Comments do not — prose rewords wholesale,
+                                    // so a line diff there is only the old text
+                                    // restated above the new.
+                                    let stand_in = match (s.action, is_code) {
+                                        (Action::Keep, false) => "(keep original text)",
+                                        (Action::Keep, true) => "(approve — sound as written)",
+                                        (Action::Delete, false) => "(delete this comment)",
+                                        (Action::Delete, true) => "(delete these lines)",
+                                        (Action::Flag, _) => {
+                                            "(flagged — no replacement proposed; \
                                                               the concern above is the verdict)"
-                                            .to_string(),
-                                        (Action::Rewrite, _) => s.comment.clone(),
+                                        }
+                                        (Action::Rewrite, _) => "",
                                     };
-                                    ui.label(RichText::new(preview).monospace());
+                                    if stand_in.is_empty() {
+                                        let text = unit.replacement_display(&s.comment);
+                                        if is_code {
+                                            code::show(
+                                                ui,
+                                                unit.file(),
+                                                &code::diff_rows(&unit.display_text(), &text),
+                                            );
+                                        } else {
+                                            code::show_block(ui, unit.file(), &text, theme::CODE);
+                                        }
+                                    } else {
+                                        ui.label(
+                                            RichText::new(stand_in)
+                                                .monospace()
+                                                .color(theme::TEXT_DIM),
+                                        );
+                                    }
                                 });
                             // What the model says it read on the way to this
                             // verdict — click to see that spot in the real file.
@@ -360,7 +432,7 @@ impl CraApp {
             theme::section_title(ui, "FOLLOW-UP");
             let send_all = ui
                 .add_enabled(
-                    (0..n_slots).any(|i| can_ask_slot.get(i).copied().unwrap_or(false)),
+                    (0..model_count).any(|i| can_ask_model.get(i).copied().unwrap_or(false)),
                     egui::Button::new("Send to all  [Enter]"),
                 )
                 .clicked();
@@ -383,12 +455,70 @@ impl CraApp {
         } else if ask_all {
             self.ask_followup(ctx, None);
         }
+
+        // ---- note for follow-up ----
+        //
+        // A unit sometimes reveals an issue bigger than itself, and the
+        // review flow deliberately cannot act beyond the unit's own lines.
+        // The note parks that issue for the follow-up screen; the unit still
+        // gets decided here, on its own merits.
+        let mut leave = false;
+        ui.horizontal(|ui| {
+            theme::section_title(ui, "NOTE");
+            leave = ui
+                .add_enabled(
+                    !self.note_input.trim().is_empty(),
+                    egui::Button::new("Park for follow-up  [Enter]"),
+                )
+                .on_hover_text(
+                    "saved with this unit's file, lines and code — triage it later on the \
+                     follow-up screen, where a model with room for bigger changes takes over",
+                )
+                .clicked();
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.note_input)
+                    .id(egui::Id::new("note_box"))
+                    .desired_width(f32::INFINITY)
+                    .hint_text(
+                        "issue bigger than this unit? note it for the follow-up session — \
+                         this unit still gets decided here",
+                    ),
+            );
+            if self.focus_note {
+                resp.request_focus();
+                self.focus_note = false;
+            }
+            let submitted =
+                resp.lost_focus() && ctx.input(|i| i.key_pressed(Key::Enter) && !i.modifiers.shift);
+            leave = leave || submitted;
+        });
+        if leave {
+            self.leave_note();
+        }
         ui.add_space(4.0);
 
         // ---- original vs final ----
+        //
+        // The two panes take every pixel the rows under them do not, and both
+        // scroll in both directions: a unit is as long as it is, and a
+        // fixed-height box either wastes the space below it or hides the text
+        // that ran past it.
         let editor_id = egui::Id::new("final_editor");
         let action = self.current_action();
         let mut keep_clicked = false;
+        // Everything from here down that is not the panes themselves — their
+        // headers and frame margins, the provenance and commit rows, the
+        // button bar and the spacing between all of it — is measured on the
+        // way past rather than estimated. Estimating it ran a few pixels
+        // light and clipped the button bar off the bottom of the window.
+        let overhead_id = egui::Id::new("review_pane_overhead");
+        let overhead = ui
+            .ctx()
+            .memory(|m| m.data.get_temp(overhead_id))
+            .unwrap_or(FIRST_FRAME_OVERHEAD);
+        let panes_h = pane_height(ui.available_height(), overhead);
+        let measured_from = ui.cursor().top();
+        let path = unit.file().to_string();
         ui.columns(2, |cols| {
             {
                 let ui = &mut cols[0];
@@ -404,15 +534,15 @@ impl CraApp {
                     }
                 });
                 egui::Frame::none()
-                    .fill(egui::Color32::from_rgb(8, 11, 15))
+                    .fill(theme::CODE_BG)
                     .inner_margin(egui::Margin::same(4.0))
                     .show(ui, |ui| {
-                        egui::ScrollArea::vertical()
+                        egui::ScrollArea::both()
                             .id_salt("orig_scroll")
-                            .max_height(110.0)
-                            .auto_shrink([false, true])
+                            .max_height(panes_h)
+                            .auto_shrink([false, false])
                             .show(ui, |ui| {
-                                ui.label(RichText::new(&self.original_display).monospace());
+                                code::show_block(ui, &path, &self.original_display, theme::CODE);
                             });
                     });
             }
@@ -427,13 +557,26 @@ impl CraApp {
                     );
                 });
                 let mut editor = std::mem::take(&mut self.editor);
-                let resp = ui.add(
-                    egui::TextEdit::multiline(&mut editor)
-                        .id(editor_id)
-                        .font(egui::TextStyle::Monospace)
-                        .desired_rows(5)
-                        .desired_width(f32::INFINITY),
-                );
+                let mono_h = ui.text_style_height(&egui::TextStyle::Monospace);
+                let rows = (panes_h / mono_h).floor().max(3.0) as usize;
+                let mut layouter = |ui: &egui::Ui, text: &str, _wrap: f32| {
+                    code::galley(ui, &path, &code::rows(text, theme::CODE))
+                };
+                let resp = egui::ScrollArea::both()
+                    .id_salt("editor_scroll")
+                    .max_height(panes_h)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut editor)
+                                .id(editor_id)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_rows(rows)
+                                .desired_width(f32::INFINITY)
+                                .layouter(&mut layouter),
+                        )
+                    })
+                    .inner;
                 self.editor = editor;
                 if self.focus_editor {
                     resp.request_focus();
@@ -478,28 +621,23 @@ impl CraApp {
             ui.label(theme::dim(if self.commit_each {
                 "— every decision is its own commit, made immediately"
             } else {
-                "— decisions batch uncommitted until Commit and Continue, which \
-                 documents all of them in one commit"
+                "— decisions are only written to the working tree; commit them \
+                 with git when ready"
             }));
         });
 
-        // ---- continuation buttons ----
+        // ---- continuation ----
+        // One button: the checkbox above already decides whether continuing
+        // also commits, so a second button could only contradict it.
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            let save_label = if self.commit_each {
-                "💾 Save and Commit  [Ctrl+S]"
+            let continue_label = if self.commit_each {
+                "⎘ Commit and Continue  [Ctrl+S]"
             } else {
                 "💾 Save and Continue  [Ctrl+S]"
             };
-            if ui.button(RichText::new(save_label).strong()).clicked() {
+            if ui.button(RichText::new(continue_label).strong()).clicked() {
                 self.save_and_continue(ctx, false);
-                return;
-            }
-            if ui
-                .button(RichText::new("⎘ Commit and Continue  [Ctrl+Enter]").strong())
-                .clicked()
-            {
-                self.save_and_continue(ctx, true);
                 return;
             }
             ui.separator();
@@ -534,7 +672,26 @@ impl CraApp {
             if ui.button("Skip ▶ [N]").clicked() {
                 self.skip_unit(ctx);
             }
+            ui.separator();
+            if ui
+                .button("■ End session [X]")
+                .on_hover_text(
+                    "go to the summary without finishing the review — decisions made so far \
+                    stand, the rest resume from the file picker, and the whole-branch review and \
+                     follow-up notes are available from there",
+                )
+                .clicked()
+            {
+                self.end_session();
+            }
         });
+
+        // What all of that actually cost, minus the panes, for the next
+        // frame to size them by. The floating windows below allocate nothing
+        // here, so this is the whole screen.
+        let spent = ui.cursor().top() - measured_from - panes_h;
+        ui.ctx()
+            .memory_mut(|m| m.data.insert_temp(overhead_id, spent.clamp(40.0, 600.0)));
 
         self.prompt_window(ctx);
         self.evidence_window(ctx);
@@ -591,23 +748,35 @@ impl CraApp {
                     hi + 1,
                     lines.len()
                 )));
-                egui::ScrollArea::vertical()
+                // A margin around the named range keeps it honest: the reader
+                // sees what surrounds the excerpt the model chose.
+                let view_lo = lo.saturating_sub(8);
+                let view_hi = (hi + 8).min(lines.len().saturating_sub(1));
+                let rows: Vec<code::Line> = lines
+                    .iter()
+                    .enumerate()
+                    .take(view_hi + 1)
+                    .skip(view_lo)
+                    .map(|(i, line)| {
+                        let in_range = i >= lo && i <= hi;
+                        let base = if in_range {
+                            theme::CODE
+                        } else {
+                            theme::CODE_CTX
+                        };
+                        let row = code::Line::code(*line, base)
+                            .gutter(format!("{:>5}| ", i + 1), theme::GUTTER);
+                        if in_range {
+                            row.background(theme::MARK_BG)
+                        } else {
+                            row
+                        }
+                    })
+                    .collect();
+                egui::ScrollArea::both()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.y = 0.0;
-                        // A margin around the named range keeps it honest: the
-                        // reader sees what surrounds the excerpt the model chose.
-                        let view_lo = lo.saturating_sub(8);
-                        let view_hi = (hi + 8).min(lines.len().saturating_sub(1));
-                        for (i, line) in lines.iter().enumerate().take(view_hi + 1).skip(view_lo) {
-                            let in_range = i >= lo && i <= hi;
-                            let rt = RichText::new(format!("{:>5}| {line}", i + 1)).monospace();
-                            if in_range {
-                                ui.label(rt.background_color(theme::MARK_BG));
-                            } else {
-                                ui.label(rt.color(theme::TEXT_DIM));
-                            }
-                        }
+                        code::show(ui, &ev.file, &rows);
                     });
             });
         if !open {
@@ -618,14 +787,16 @@ impl CraApp {
     /// Floating inspector for exactly what was piped to a model CLI and what
     /// it printed back, including every follow-up turn.
     fn prompt_window(&mut self, ctx: &egui::Context) {
-        let Some(slot) = self.show_prompt else { return };
+        let Some(model_index) = self.show_prompt else {
+            return;
+        };
         let name = self
             .settings
             .models
-            .get(slot)
+            .get(model_index)
             .map(|m| m.name.clone())
-            .unwrap_or_else(|| format!("model {slot}"));
-        let turns = self.convos.get(slot).cloned().unwrap_or_default();
+            .unwrap_or_else(|| format!("model {model_index}"));
+        let turns = self.convos.get(model_index).cloned().unwrap_or_default();
         let mut open = true;
         egui::Window::new(format!("prompt · {name}"))
             .id(egui::Id::new("prompt_window"))
@@ -638,7 +809,7 @@ impl CraApp {
                     return;
                 }
                 ui.horizontal(|ui| {
-                    match self.sessions.get(slot).and_then(|s| s.clone()) {
+                    match self.sessions.get(model_index).and_then(|s| s.clone()) {
                         Some(id) => {
                             ui.label(theme::dim(&format!("{} turn(s) · session", turns.len())));
                             ui.label(RichText::new(&id).monospace().small());
@@ -667,7 +838,22 @@ impl CraApp {
                             if t.reply.is_empty() {
                                 ui.horizontal(|ui| {
                                     ui.spinner();
-                                    ui.label(theme::dim("waiting…"));
+                                    // The running turn: the same live view
+                                    // the candidate row shows.
+                                    if let Some(CandidateState::Pending(live)) =
+                                        self.candidates.get(model_index)
+                                    {
+                                        let snap = live.snapshot();
+                                        ui.label(theme::dim(&format!(
+                                            "waiting… {}",
+                                            snap.clock(self.settings.model_timeout_secs)
+                                        )));
+                                        if let Some(a) = snap.activity_line() {
+                                            ui.label(theme::dim(&a));
+                                        }
+                                    } else {
+                                        ui.label(theme::dim("waiting…"));
+                                    }
                                 });
                             } else {
                                 ui.label(
@@ -682,6 +868,65 @@ impl CraApp {
             self.show_prompt = None;
         }
     }
+}
+
+/// What to assume the pane overhead is before a frame has measured it.
+/// Deliberately generous: too large only makes the first frame's panes short,
+/// where too small would let them push the buttons off the screen — and the
+/// real figure arrives before anyone can read either.
+const FIRST_FRAME_OVERHEAD: f32 = 160.0;
+
+/// How much height the ORIGINAL and FINAL panes get: whatever is left once
+/// everything else on the screen below the candidates is paid for, and never
+/// less than a workable minimum on a window too short to satisfy.
+fn pane_height(available: f32, overhead: f32) -> f32 {
+    (available - overhead).max(110.0)
+}
+
+/// Turn a rendered excerpt back into display rows. Every line is
+/// `{marker}{line number}| {code}`: the marker and number become the gutter,
+/// the code keeps its own indentation and gets syntax colour, and the diff
+/// role shows as a background tint so colour is free to mean syntax.
+///
+/// Removed lines are marked unparsed — they are not in the file the grammar
+/// is being asked about, and mixing them in would only confuse the parse.
+fn context_rows(context: &str) -> Vec<code::Line> {
+    context
+        .lines()
+        .map(|line| {
+            // The renderer puts exactly one space after the bar; anything
+            // beyond it is the line's own indentation. A line that does not
+            // fit the shape is all code.
+            let split = line
+                .find('|')
+                .map(|i| i + 2)
+                .filter(|p| *p <= line.len() && line.is_char_boundary(*p));
+            let (gutter, text) = match split {
+                Some(p) => line.split_at(p),
+                None => ("", line),
+            };
+            let marker = line.chars().next().unwrap_or(' ');
+            let (base, bg) = match marker {
+                '>' => (theme::CODE, Some(theme::MARK_BG)),
+                '+' => (theme::CODE, Some(theme::ADD_BG)),
+                '-' => (theme::REMOVED, Some(theme::DEL_BG)),
+                _ => (theme::CODE_CTX, None),
+            };
+            let gutter_color = match marker {
+                '+' => theme::ADDED,
+                '-' => theme::REMOVED,
+                _ => theme::GUTTER,
+            };
+            let mut row = code::Line::code(text, base).gutter(gutter, gutter_color);
+            if let Some(bg) = bg {
+                row = row.background(bg);
+            }
+            if marker == '-' {
+                row = row.unparsed();
+            }
+            row
+        })
+        .collect()
 }
 
 /// Parse a model-reported line range ("12-40", "12", "L12-L40") into 0-based
@@ -709,7 +954,50 @@ fn evidence_range(spec: &str, len: usize) -> (usize, usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::evidence_range;
+    use super::{context_rows, evidence_range, pane_height};
+    use crate::ui::theme;
+
+    #[test]
+    fn context_rows_split_the_gutter_off_and_keep_the_indentation() {
+        let rendered = concat!(
+            "    11|     let a = 1;\n",
+            ">   12|         deeper();\n",
+            "-     |         gone();\n",
+            "+   13|     let b = 2;\n",
+        );
+        let rows = context_rows(rendered);
+        assert_eq!(rows.len(), 4);
+        // The code keeps every leading space it had in the file.
+        assert_eq!(rows[0].text, "    let a = 1;");
+        assert_eq!(rows[1].text, "        deeper();");
+        assert_eq!(rows[0].gutter, "    11| ");
+        assert_eq!(rows[1].gutter, ">   12| ");
+        // Diff role lives in the background, leaving colour free for syntax.
+        assert_eq!(rows[1].background, Some(theme::MARK_BG));
+        assert_eq!(rows[2].background, Some(theme::DEL_BG));
+        assert_eq!(rows[3].background, Some(theme::ADD_BG));
+        assert!(rows[0].background.is_none());
+        // A removed line is not in the file, so it is not in the parse.
+        assert!(!rows[2].syntax, "removed lines must stay out of the parse");
+        assert!(rows.iter().enumerate().all(|(i, r)| i == 2 || r.syntax));
+    }
+
+    #[test]
+    fn a_line_with_no_gutter_is_all_code() {
+        let rows = context_rows("no gutter here\n");
+        assert_eq!(rows[0].gutter, "");
+        assert_eq!(rows[0].text, "no gutter here");
+    }
+
+    #[test]
+    fn the_panes_take_the_space_left_over_but_never_collapse() {
+        // Every pixel the rest of the screen does not need goes to the panes.
+        assert_eq!(pane_height(600.0, 95.0), 505.0);
+        assert_eq!(pane_height(900.0, 95.0), 805.0);
+        // A window too short to satisfy still leaves something usable rather
+        // than a zero-height box.
+        assert_eq!(pane_height(40.0, 95.0), 110.0);
+    }
 
     #[test]
     fn evidence_ranges_parse_and_clamp() {

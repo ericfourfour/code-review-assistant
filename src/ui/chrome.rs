@@ -52,6 +52,8 @@ pub fn top_bar(app: &mut CraApp, ctx: &egui::Context) {
                     Screen::FilePicker => "PICK FILE",
                     Screen::Review => "REVIEW",
                     Screen::Summary => "SUMMARY",
+                    Screen::Followup => "FOLLOW-UP",
+                    Screen::Eval => "EVALUATION",
                     Screen::Settings => "SETTINGS",
                 };
                 ui.label(RichText::new(name).small().strong().color(theme::ACCENT));
@@ -82,7 +84,8 @@ pub fn hotkey_bar(app: &mut CraApp, ctx: &egui::Context) {
                     Screen::RepoPicker => {
                         k(ui, "↑↓", "select");
                         k(ui, "Enter", "open repo");
-                        k(ui, "X", "forget");
+                        k(ui, "X", "forget / exclude");
+                        k(ui, "R", "refresh");
                     }
                     Screen::RefPicker => {
                         k(ui, "Tab", "branches ⇄ PRs");
@@ -104,24 +107,35 @@ pub fn hotkey_bar(app: &mut CraApp, ctx: &egui::Context) {
                         k(ui, "D", "delete");
                         k(ui, "E", "edit");
                         k(ui, "F", "follow-up");
+                        k(ui, "C", "note");
                         k(ui, "R", "re-run");
                         k(ui, "P", "prev");
                         k(ui, "N", "skip");
-                        k(ui, "Ctrl+S", "save");
-                        k(ui, "Ctrl+Enter", "commit");
+                        k(ui, "X", "end session");
+                        k(ui, "Ctrl+S", "continue");
                         k(ui, "Esc", "files");
                     }
                     Screen::Summary => {
-                        k(ui, "G", "branch pass");
+                        k(ui, "G", "whole-branch review");
+                        k(ui, "N", "follow-up notes");
                         k(ui, "F", "files");
                         k(ui, "B", "branches/PRs");
                         k(ui, "Esc", "repos");
+                    }
+                    Screen::Followup => {
+                        k(ui, "Esc", "back");
+                    }
+                    Screen::Eval => {
+                        k(ui, "B", "blinded only");
+                        k(ui, "R", "refresh");
+                        k(ui, "Esc", "back");
                     }
                     Screen::Settings => {
                         k(ui, "Ctrl+S", "save + close");
                         k(ui, "Esc", "save + close");
                     }
                 }
+                k(ui, "Ctrl+E", "evaluation");
                 k(ui, "Ctrl+,", "settings");
                 k(ui, "Ctrl+Q", "quit");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -194,17 +208,17 @@ pub fn side_panel(app: &mut CraApp, ctx: &egui::Context) {
                 theme::section_title(ui, "MODELS");
                 // While blinding is on this panel must not pair a name with a
                 // verdict, or the cards on the left are blinded for nothing.
-                // That means the label AND the dot colour: colour is branded
-                // by slot position (see theme::model_color), so leaving it
-                // keyed to the real slot index would leak identity through
-                // the palette even with the name itself hidden.
+                // That means the label AND the dot colour: the palette is
+                // keyed by settings position (see theme::model_color), so leaving the dot
+                // on the real model index would pair every shuffled card with
+                // its assigned colour and leak identity anyway.
                 let hidden = app.names_hidden();
                 let order = app.candidate_order();
                 let kind = app
                     .current_unit()
                     .map(|u| u.kind())
                     .unwrap_or(crate::units::UnitKind::Comment);
-                for (i, slot) in app.candidate_models.iter().enumerate() {
+                for (i, model_config) in app.candidate_models.iter().enumerate() {
                     let pos = order.iter().position(|&s| s == i).unwrap_or(i);
                     ui.horizontal(|ui| {
                         ui.label(
@@ -212,13 +226,17 @@ pub fn side_panel(app: &mut CraApp, ctx: &egui::Context) {
                                 .color(theme::model_color(if hidden { pos } else { i }))
                                 .monospace(),
                         );
-                        ui.label(RichText::new(app.slot_label(i, pos)).monospace().small());
-                        if !slot.model.trim().is_empty() && !hidden {
-                            ui.label(theme::dim(slot.model.trim()));
+                        ui.label(RichText::new(app.model_label(i, pos)).monospace().small());
+                        if !model_config.model.trim().is_empty() && !hidden {
+                            ui.label(theme::dim(model_config.model.trim()));
                         }
                         match app.candidates.get(i) {
-                            Some(CandidateState::Pending) => {
+                            Some(CandidateState::Pending(live)) => {
                                 ui.spinner();
+                                ui.label(theme::dim(&format!(
+                                    "{}s",
+                                    live.snapshot().elapsed.as_secs()
+                                )));
                             }
                             Some(CandidateState::Ready(s)) if hidden => {
                                 ui.label(theme::dim(&format!("answered · {} ms", s.latency_ms)));

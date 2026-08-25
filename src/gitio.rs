@@ -1,12 +1,13 @@
-//! Git and GitHub-CLI plumbing. Everything shells out to `git` / `gh` so the
+//! Git and GitHub CLI process execution. Everything runs `git` / `gh` so the
 //! app works against whatever the user already has installed and
 //! authenticated.
 
 use serde::Deserialize;
+use std::io::Write;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// Build a `Command` that will not flash a console window on Windows. The
 /// app is a windowed (no-console) process, so console-subsystem children
@@ -120,6 +121,21 @@ pub fn is_dirty(dir: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether one file has uncommitted state — staged, unstaged, or untracked.
+/// Pathspec-scoped, so an unrelated dirty file cannot answer for this one.
+pub fn file_is_dirty(dir: &str, file: &str) -> bool {
+    git(dir, &["status", "--porcelain", "--", file])
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// Whether the index contains any change relative to HEAD.
+pub fn index_is_dirty(dir: &str) -> bool {
+    git(dir, &["diff", "--cached", "--name-only"])
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+}
+
 /// Resolve the repo's default branch: origin/HEAD if set, else the fallback.
 pub fn default_branch(dir: &str, fallback: &str) -> String {
     if let Ok(s) = git(
@@ -184,11 +200,22 @@ pub fn checkout(dir: &str, branch: &str) -> Result<(), String> {
 /// repo), so the whole history becomes reviewable.
 pub const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
+/// Sentinel base for "review what is staged": `git diff --cached`. The colon
+/// makes it impossible as a ref name, so it can never shadow a real branch.
+pub const STAGED: &str = ":staged";
+
+/// Sentinel base for the working-tree diff with untracked files appended as
+/// new-file hunks — `git diff HEAD` alone never shows a file git is not
+/// tracking, so a brand-new module would silently escape review.
+pub const UNTRACKED: &str = ":worktree+untracked";
+
 /// Human-readable name for a diff base, for the UI and session log.
 pub fn base_label(base: &str) -> &str {
     match base {
         "" => "HEAD",
         EMPTY_TREE => "root",
+        STAGED => "staged",
+        UNTRACKED => "HEAD+untracked",
         other => other,
     }
 }
@@ -202,17 +229,30 @@ pub fn base_from_label(label: &str) -> String {
     match label {
         "HEAD" => String::new(),
         "root" => EMPTY_TREE.to_string(),
+        "staged" => STAGED.to_string(),
+        "HEAD+untracked" => UNTRACKED.to_string(),
         other => other.to_string(),
     }
 }
 
 /// Diff of `base...HEAD` (merge-base) with generous context. When `base` is
 /// empty, diff the working tree against HEAD instead; when it is
-/// [`EMPTY_TREE`], diff the entire history.
+/// [`EMPTY_TREE`], diff the entire history; [`STAGED`] diffs the index, and
+/// [`UNTRACKED`] is the working-tree diff plus every untracked file.
 pub fn review_diff(dir: &str, base: &str, context: usize) -> Result<String, String> {
     let u = format!("-U{context}");
     if base.is_empty() {
         git(dir, &["diff", "--no-color", &u, "HEAD"])
+    } else if base == STAGED {
+        git(dir, &["diff", "--no-color", &u, "--cached"])
+    } else if base == UNTRACKED {
+        let mut diff = git(dir, &["diff", "--no-color", &u, "HEAD"])?;
+        for path in untracked_files(dir)? {
+            if let Some(d) = untracked_file_diff(dir, &path, context) {
+                diff.push_str(&d);
+            }
+        }
+        Ok(diff)
     } else if base == EMPTY_TREE {
         // A tree object has no merge base, so use a plain two-point diff.
         git(dir, &["diff", "--no-color", &u, EMPTY_TREE, "HEAD"])
@@ -221,9 +261,132 @@ pub fn review_diff(dir: &str, base: &str, context: usize) -> Result<String, Stri
     }
 }
 
+/// Files in the working tree that git does not track, honouring .gitignore.
+/// `-z` keeps unusual path characters literal instead of quoted-and-escaped.
+pub fn untracked_files(dir: &str) -> Result<Vec<String>, String> {
+    let out = git(dir, &["ls-files", "--others", "--exclude-standard", "-z"])?;
+    Ok(out
+        .split('\0')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect())
+}
+
+/// One untracked file rendered as a new-file diff. `--no-index` against
+/// git's special `/dev/null` name works on every platform, but exits 1 when
+/// the sides differ — which here means success, so [`run`] cannot be used.
+/// A file that cannot be diffed (unreadable, binary emits no hunks anyway)
+/// yields None and is simply left out, degraded rather than fatal.
+fn untracked_file_diff(dir: &str, path: &str, context: usize) -> Option<String> {
+    let u = format!("-U{context}");
+    let out = hidden_command("git")
+        .args([
+            "diff",
+            "--no-color",
+            &u,
+            "--no-index",
+            "--",
+            "/dev/null",
+            path,
+        ])
+        .current_dir(dir)
+        .output()
+        .ok()?;
+    match out.status.code() {
+        Some(0) | Some(1) => Some(String::from_utf8_lossy(&out.stdout).to_string()),
+        _ => None,
+    }
+}
+
+/// Which tree a [`review_diff`]'s *new side* describes. Every ranged diff
+/// (branch, PR, whole history) ends at HEAD; only the bare working-tree diff
+/// shows uncommitted lines. Extraction must read file content from the same
+/// tree the diff's line numbers point into, or a single uncommitted edit
+/// above a hunk shifts every line and semantic context silently degrades.
+#[derive(Clone, Copy, PartialEq)]
+pub enum NewSide {
+    WorkTree,
+    Head,
+    /// The staged diff ends at the index — not the worktree (unstaged edits
+    /// would shift line numbers) and not HEAD (the staged lines are not there).
+    Index,
+}
+
+/// The new side of the diff [`review_diff`] produces for this base.
+pub fn new_side(base: &str) -> NewSide {
+    if base.is_empty() || base == UNTRACKED {
+        NewSide::WorkTree
+    } else if base == STAGED {
+        NewSide::Index
+    } else {
+        NewSide::Head
+    }
+}
+
+/// A file's content as HEAD has it. `None` when HEAD holds no such file,
+/// which callers treat like any unreadable file: hunk context, no semantic
+/// split — degraded, never wrong.
+pub fn file_at_head(dir: &str, path: &str) -> Option<String> {
+    git(dir, &["show", &format!("HEAD:{path}")]).ok()
+}
+
+/// A file's content as the index has it (stage 0). Same degradation contract
+/// as [`file_at_head`].
+pub fn file_at_index(dir: &str, path: &str) -> Option<String> {
+    git(dir, &["show", &format!(":0:{path}")]).ok()
+}
+
+/// Replace one stage-0 index blob without touching the working tree. The file
+/// mode is preserved from the existing index entry.
+pub fn write_index_file(dir: &str, path: &str, content: &str) -> Result<(), String> {
+    let entry = git(dir, &["ls-files", "-s", "--", path])?;
+    let mode = entry
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| format!("no staged index entry for {path}"))?
+        .to_string();
+
+    let mut child = hidden_command("git")
+        .args(["hash-object", "-w", "--stdin"])
+        .current_dir(dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("git hash-object: {e}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| "git hash-object stdin unavailable".to_string())?
+        .write_all(content.as_bytes())
+        .map_err(|e| format!("git hash-object stdin: {e}"))?;
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("git hash-object: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git hash-object failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    let object = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    git(
+        dir,
+        &["update-index", "--add", "--cacheinfo", &mode, &object, path],
+    )?;
+    Ok(())
+}
+
 pub fn stage_and_commit(dir: &str, file: &str, message: &str) -> Result<String, String> {
     git(dir, &["add", "--", file])?;
     git(dir, &["commit", "-m", message, "--", file])?;
+    head_sha(dir)
+}
+
+/// Commit the index exactly as it stands. Unlike [`stage_and_commit`], this
+/// never copies an unstaged working-tree version over a reviewed staged blob.
+pub fn commit_index(dir: &str, message: &str) -> Result<String, String> {
+    git(dir, &["commit", "-m", message])?;
     head_sha(dir)
 }
 
@@ -424,6 +587,105 @@ mod repo_tests {
         assert_eq!(base_label(""), "HEAD");
         assert_eq!(base_label(EMPTY_TREE), "root");
         assert_eq!(base_label("main"), "main");
+        // The sentinels must survive the label round-trip: the whole-branch review
+        // re-runs the diff from the stored label alone.
+        for base in ["", EMPTY_TREE, STAGED, UNTRACKED, "main"] {
+            assert_eq!(base_from_label(base_label(base)), base);
+        }
+    }
+
+    #[test]
+    fn the_new_side_matches_what_each_diff_actually_ends_at() {
+        assert!(
+            new_side("") == NewSide::WorkTree,
+            "bare diff shows uncommitted lines"
+        );
+        assert!(new_side("main") == NewSide::Head);
+        assert!(new_side(EMPTY_TREE) == NewSide::Head);
+        assert!(
+            new_side(STAGED) == NewSide::Index,
+            "staged lines live in the index only"
+        );
+        assert!(new_side(UNTRACKED) == NewSide::WorkTree);
+    }
+
+    #[test]
+    fn staged_diff_shows_the_index_and_only_the_index() {
+        let repo = TempRepo::new("staged");
+        repo.write("a.txt", "one\n");
+        repo.commit("first");
+
+        // Nothing staged: nothing to review.
+        assert!(review_diff(&repo.path(), STAGED, 12)
+            .unwrap()
+            .trim()
+            .is_empty());
+
+        // A staged edit shows; a later unstaged edit to the same file must not.
+        repo.write("a.txt", "one\nstaged line\n");
+        repo.git(&["add", "a.txt"]);
+        repo.write("a.txt", "one\nstaged line\nunstaged line\n");
+        let diff = review_diff(&repo.path(), STAGED, 12).unwrap();
+        assert!(diff.contains("staged line"), "{diff}");
+        assert!(
+            !diff.contains("unstaged line"),
+            "the unstaged edit leaked in: {diff}"
+        );
+
+        // And the extractor must read content from the index, not the dirty
+        // worktree, or the diff's line numbers point into the wrong file.
+        assert_eq!(
+            file_at_index(&repo.path(), "a.txt").as_deref(),
+            Some("one\nstaged line\n")
+        );
+        assert!(file_at_index(&repo.path(), "nope.txt").is_none());
+    }
+
+    #[test]
+    fn untracked_base_appends_new_files_to_the_working_tree_diff() {
+        let repo = TempRepo::new("untracked");
+        repo.write("a.txt", "one\n");
+        repo.write(".gitignore", "ignored.txt\n");
+        repo.commit("first");
+
+        repo.write("a.txt", "one\ntracked edit\n");
+        repo.write("brand_new.rs", "fn shiny() {}\n");
+        repo.write("ignored.txt", "never reviewed\n");
+
+        // The plain working-tree diff cannot see the untracked file...
+        let plain = review_diff(&repo.path(), "", 12).unwrap();
+        assert!(!plain.contains("shiny"), "{plain}");
+
+        // ...the untracked base sees both, but still honours .gitignore.
+        let diff = review_diff(&repo.path(), UNTRACKED, 12).unwrap();
+        assert!(diff.contains("tracked edit"), "{diff}");
+        assert!(diff.contains("fn shiny() {}"), "{diff}");
+        assert!(!diff.contains("never reviewed"), "{diff}");
+
+        // The appended hunks must parse like any other new-file diff.
+        let files = crate::diffparse::parse(&diff);
+        assert!(
+            files.iter().any(|f| f.path == "brand_new.rs"),
+            "untracked file lost in parsing: {:?}",
+            files.iter().map(|f| &f.path).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            untracked_files(&repo.path()).unwrap(),
+            vec!["brand_new.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn file_at_head_reads_the_commit_not_the_working_tree() {
+        let repo = TempRepo::new("athead");
+        repo.write("src/lib.rs", "committed\n");
+        repo.commit("base");
+        repo.write("src/lib.rs", "dirty\n");
+        assert_eq!(
+            file_at_head(&repo.path(), "src/lib.rs").as_deref(),
+            Some("committed\n")
+        );
+        assert!(file_at_head(&repo.path(), "src/nope.rs").is_none());
     }
 
     #[test]
@@ -444,6 +706,39 @@ mod repo_tests {
         assert!(
             !last.contains("b.txt"),
             "b.txt should still be uncommitted: {last}"
+        );
+    }
+
+    #[test]
+    fn staged_revision_and_commit_never_copy_the_unstaged_worktree() {
+        let repo = TempRepo::new("staged-index");
+        repo.write("a.txt", "base\n");
+        repo.commit("base");
+
+        repo.write("a.txt", "staged\n");
+        repo.git(&["add", "--", "a.txt"]);
+        repo.write("a.txt", "unstaged\n");
+
+        write_index_file(&repo.path(), "a.txt", "reviewed staged\n").unwrap();
+        assert_eq!(
+            file_at_index(&repo.path(), "a.txt").as_deref(),
+            Some("reviewed staged\n")
+        );
+        assert_eq!(
+            repo.read("a.txt"),
+            "unstaged\n",
+            "index edit touched the worktree"
+        );
+
+        commit_index(&repo.path(), "review: staged snapshot").unwrap();
+        assert_eq!(
+            file_at_head(&repo.path(), "a.txt").as_deref(),
+            Some("reviewed staged\n")
+        );
+        assert_eq!(
+            repo.read("a.txt"),
+            "unstaged\n",
+            "commit staged the unstaged copy"
         );
     }
 
@@ -476,12 +771,7 @@ mod repo_tests {
         let unit = &units[0];
         assert_eq!(unit.lang, "Rust");
         assert!(unit.has_added);
-        let file = ReviewFile {
-            path: path.clone(),
-            units: vec![],
-            edits: Vec::new(),
-            decided: 0,
-        };
+        let file = ReviewFile::new(path.clone(), vec![]);
         let replacement = unit.format_replacement("Counting retries, not requests.");
         let wrapped = crate::units::ReviewUnit::Comment(unit.clone());
         let delta = apply_edit(&repo.path(), &file, &wrapped, &replacement).unwrap();
@@ -520,12 +810,7 @@ mod repo_tests {
         let diff = review_diff(&repo.path(), "main", 12).unwrap();
         let extracted = comments::extract_units(&crate::diffparse::parse(&diff), 12);
         let (path, units) = &extracted[0];
-        let file = ReviewFile {
-            path: path.clone(),
-            units: vec![],
-            edits: Vec::new(),
-            decided: 0,
-        };
+        let file = ReviewFile::new(path.clone(), vec![]);
 
         // Someone edits the file behind our back.
         repo.write("src/lib.rs", "fn main() {\n    counter += 1;\n}\n");

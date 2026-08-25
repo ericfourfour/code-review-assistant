@@ -8,7 +8,9 @@ enum RefAction {
     Branch(String),
     Pr(PrInfo),
     WorkingTree,
+    Staged,
     Recheck,
+    Followup,
 }
 
 impl CraApp {
@@ -48,8 +50,18 @@ impl CraApp {
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::W)) {
                 action = Some(RefAction::WorkingTree);
             }
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::S)) {
+                action = Some(RefAction::Staged);
+            }
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::U)) {
+                self.settings.include_untracked = !self.settings.include_untracked;
+                self.settings.save(&self.db);
+            }
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::C)) {
                 action = Some(RefAction::Recheck);
+            }
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::N)) {
+                action = Some(RefAction::Followup);
             }
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::R)) {
                 self.load_refs();
@@ -73,8 +85,29 @@ impl CraApp {
                 self.ref_sel = 0;
             }
             ui.separator();
-            if ui.button("Review working tree [W]").clicked() {
+            if ui
+                .button("Review working tree [W]")
+                .on_hover_text("everything uncommitted, staged or not, against HEAD")
+                .clicked()
+            {
                 action = Some(RefAction::WorkingTree);
+            }
+            if ui
+                .checkbox(&mut self.settings.include_untracked, "untracked [U]")
+                .on_hover_text(
+                    "working-tree reviews also take in files git does not track yet \
+                     (shown as new-file diffs; .gitignore still applies)",
+                )
+                .changed()
+            {
+                self.settings.save(&self.db);
+            }
+            if ui
+                .button("Review staged [S]")
+                .on_hover_text("only what `git add` staged — the commit being prepared")
+                .clicked()
+            {
+                action = Some(RefAction::Staged);
             }
             if ui
                 .button("Re-check past decisions [C]")
@@ -86,6 +119,21 @@ scored against. Nothing is written to disk.",
                 .clicked()
             {
                 action = Some(RefAction::Recheck);
+            }
+            let open_notes = self
+                .repo
+                .as_ref()
+                .map(|r| self.db.count_open_notes(&r.path))
+                .unwrap_or(0);
+            if ui
+                .button(format!("Follow-up notes ({open_notes}) [N]"))
+                .on_hover_text(
+                    "the backlog survives the session that wrote it — triage past notes and \
+                     start a fix session without re-running a review",
+                )
+                .clicked()
+            {
+                action = Some(RefAction::Followup);
             }
             if ui.button("Refresh [R]").clicked() {
                 self.load_refs();
@@ -173,7 +221,9 @@ scored against. Nothing is written to disk.",
             Some(RefAction::Branch(name)) => self.select_branch(&name),
             Some(RefAction::Pr(pr)) => self.select_pr(&pr),
             Some(RefAction::WorkingTree) => self.select_working_tree(),
+            Some(RefAction::Staged) => self.select_staged(),
             Some(RefAction::Recheck) => self.start_recheck(ctx, 25),
+            Some(RefAction::Followup) => self.open_followup(),
             None => {}
         }
     }

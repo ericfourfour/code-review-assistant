@@ -74,6 +74,24 @@ fn git_path(raw: &str) -> String {
     String::from_utf8_lossy(&decoded).into_owned()
 }
 
+impl DiffFile {
+    /// Lines this diff adds and removes in the file, as `(added, removed)`.
+    /// Context lines are not counted, however many of them the diff was asked
+    /// for — this is the `+/-` a reviewer expects, not the size of the hunks.
+    pub fn line_changes(&self) -> (usize, usize) {
+        let mut added = 0;
+        let mut removed = 0;
+        for line in self.hunks.iter().flat_map(|h| &h.lines) {
+            match line.origin {
+                '+' => added += 1,
+                '-' => removed += 1,
+                _ => {}
+            }
+        }
+        (added, removed)
+    }
+}
+
 pub fn parse(diff: &str) -> Vec<DiffFile> {
     let mut files: Vec<DiffFile> = Vec::new();
     let mut cur_file: Option<DiffFile> = None;
@@ -226,6 +244,13 @@ index 111..222 100644
         // context line after the removal keeps correct numbering
         let last = h.lines.iter().rev().find(|l| l.origin == ' ').unwrap();
         assert_eq!(last.new_lineno, Some(6));
+    }
+
+    #[test]
+    fn line_changes_counts_only_the_changed_lines() {
+        // The diff is generated with context, so the count has to ignore it:
+        // this hunk is six lines of which three are added and one removed.
+        assert_eq!(parse(DIFF)[0].line_changes(), (3, 1));
     }
 
     #[test]

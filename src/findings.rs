@@ -1,9 +1,9 @@
-//! The branch pass: one whole-branch look per model, after the unit walk.
+//! The whole-branch review: one whole-branch look per model, after the unit review.
 //!
-//! The per-unit review judges each change in isolation, which is exactly what
-//! it cannot see past: two hunks that contradict each other, a rename applied
+//! The per-unit review judges each change in isolation, so it cannot detect
+//! two changed sections that contradict each other, a rename applied
 //! in some places, a code path left dead, the test a change obviously needs.
-//! When the walk finishes, each enabled model gets the branch's full diff and
+//! When the review finishes, each enabled model gets the branch's full diff and
 //! the run of the repository, and reports *cross-cutting* findings — things a
 //! verdict on any single unit could not carry. Nothing is edited: findings
 //! are recorded, shown for human triage, and dismissable.
@@ -11,7 +11,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::models::{self, Evidence};
-use crate::settings::ModelSlot;
+use crate::settings::ModelConfig;
 
 /// A diff bigger than this goes over truncated. The models can read the
 /// repository for the rest; the cap keeps the prompt inside every CLI's
@@ -52,10 +52,10 @@ struct Reply {
     findings: Vec<Finding>,
 }
 
-/// Message sent back to the UI thread when one model's branch pass finishes.
-pub struct BranchMsg {
+/// Message sent back to the UI thread when one model's whole-branch review finishes.
+pub struct WholeBranchReviewMsg {
     pub seq: u64,
-    pub slot_idx: usize,
+    pub model_index: usize,
     pub model: String,
     pub result: Result<Vec<Finding>, String>,
     pub latency_ms: i64,
@@ -84,7 +84,7 @@ pub fn build_prompt(
 ) -> String {
     format!(
         "A unit-by-unit review of branch {ref_name} (against {base}) just finished: {n_units} \
-unit(s) across {n_files} file(s), each judged in isolation. Your job now is what that pass \
+unit(s) across {n_files} file(s), each judged in isolation. Your job now is what that review \
 cannot see — problems that only exist across changes. This is the branch's diff:\n\n{}\n\
 Look for cross-cutting findings only; do not re-review individual hunks:\n\
 - changes that contradict each other, or a change that breaks an invariant another relies on\n\
@@ -105,48 +105,56 @@ In \"evidence\", list the places you actually read — the reviewer is shown the
     )
 }
 
-/// Parse a branch-pass reply out of raw CLI output (envelopes included).
+/// Parse a whole-branch review reply out of raw CLI output (envelopes included).
 pub fn parse(output: &str) -> Option<Vec<Finding>> {
-    models::extract_payload::<Reply>(output).map(|r| r.findings)
+    models::extract_reply::<Reply>(output).map(|r| r.findings)
 }
 
-/// Run one model's branch pass on a background thread, mirroring
-/// [`models::spawn_model`] but for the findings payload.
+/// Run one model's whole-branch review on a background thread, mirroring
+/// [`models::spawn_model`] but for a whole-branch findings reply.
 #[allow(clippy::too_many_arguments)]
-pub fn spawn_pass(
+pub fn spawn_whole_branch_review(
     seq: u64,
-    slot_idx: usize,
-    slot: ModelSlot,
+    model_index: usize,
+    model_config: ModelConfig,
     command: String,
     prompt: String,
     repo: String,
     cli_home: String,
     timeout_secs: u64,
-    send: impl FnOnce(BranchMsg) + Send + 'static,
+    live: models::LiveHandle,
+    send: impl FnOnce(WholeBranchReviewMsg) + Send + 'static,
     ctx: egui::Context,
 ) {
     std::thread::spawn(move || {
-        // capture_cli wants a transcript sink; the branch pass has no
+        // capture_cli requires a transcript buffer; the whole-branch review has no
         // inspector window, so the useful part of a failure travels through
         // cli_error instead.
         let mut raw = String::new();
         let timeout = std::time::Duration::from_secs(timeout_secs.max(5));
         let result = models::capture_cli(
-            &slot, &command, &prompt, &repo, &cli_home, timeout, &mut raw,
+            &model_config,
+            &command,
+            &prompt,
+            &repo,
+            &cli_home,
+            timeout,
+            &mut raw,
+            Some(&live),
         );
         let (result, latency_ms) = match result {
             Ok((stdout, stderr, latency_ms)) => {
                 let parsed = parse(&stdout)
                     .or_else(|| parse(&stderr))
-                    .ok_or_else(|| models::cli_error(&slot.name, &stdout, &stderr));
+                    .ok_or_else(|| models::cli_error(&model_config.name, &stdout, &stderr));
                 (parsed, latency_ms)
             }
             Err(e) => (Err(e), 0),
         };
-        send(BranchMsg {
+        send(WholeBranchReviewMsg {
             seq,
-            slot_idx,
-            model: slot.name.clone(),
+            model_index,
+            model: model_config.name.clone(),
             result,
             latency_ms,
         });

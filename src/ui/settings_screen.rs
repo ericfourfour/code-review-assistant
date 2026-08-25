@@ -1,7 +1,7 @@
 use egui::{Key, Modifiers, RichText};
 
 use crate::app::CraApp;
-use crate::settings::ModelSlot;
+use crate::settings::ModelConfig;
 use crate::ui::theme;
 
 impl CraApp {
@@ -81,6 +81,14 @@ than the other way round.",
                                 .font(egui::TextStyle::Monospace),
                         );
                     });
+                    field(ui, "fix command", |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut m.fix_command)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("writable command for fix sessions")
+                                .font(egui::TextStyle::Monospace),
+                        );
+                    });
                     field(ui, "model", |ui| {
                         let presets = crate::settings::model_presets(&m.command);
                         ui.add(
@@ -152,6 +160,14 @@ than the other way round.",
                                 .font(egui::TextStyle::Monospace),
                         );
                     });
+                    field(ui, "fix resume", |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut m.fix_resume_command)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("writable resume command for fix sessions")
+                                .font(egui::TextStyle::Monospace),
+                        );
+                    });
                     field(ui, "session key", |ui| {
                         ui.add(
                             egui::TextEdit::singleline(&mut m.session_key)
@@ -170,6 +186,25 @@ than the other way round.",
                         };
                         ui.label(theme::dim(explain));
                     });
+                    field(ui, "price", |ui| {
+                        ui.label(theme::dim("$/Mtok  in"));
+                        ui.add(
+                            egui::DragValue::new(&mut m.price_in)
+                                .speed(0.05)
+                                .range(0.0..=10_000.0)
+                                .max_decimals(3),
+                        );
+                        ui.label(theme::dim("out"));
+                        ui.add(
+                            egui::DragValue::new(&mut m.price_out)
+                                .speed(0.05)
+                                .range(0.0..=10_000.0)
+                                .max_decimals(3),
+                        );
+                        ui.label(theme::dim(
+                            "used only when the CLI reports no cost of its own; 0 leaves the model unpriced on the evaluation page rather than free",
+                        ));
+                    });
                     field(ui, "co-author", |ui| {
                         ui.add(
                             egui::TextEdit::singleline(&mut m.coauthor)
@@ -185,9 +220,10 @@ than the other way round.",
             self.settings.models.remove(i);
         }
         if ui.button("+ add model").clicked() {
-            self.settings.models.push(ModelSlot {
+            self.settings.models.push(ModelConfig {
                 name: "model".into(),
                 command: "mycli --print -".into(),
+                fix_command: String::new(),
                 coauthor: "Model <model@example.com>".into(),
                 enabled: true,
                 model: String::new(),
@@ -195,7 +231,10 @@ than the other way round.",
                 effort: String::new(),
                 effort_flag: "--effort".into(),
                 resume_command: String::new(),
+                fix_resume_command: String::new(),
                 session_key: String::new(),
+                price_in: 0.0,
+                price_out: 0.0,
             });
         }
 
@@ -222,44 +261,127 @@ than the other way round.",
             });
 
         ui.add_space(8.0);
-        theme::section_title(ui, "REVIEW");
-        egui::Grid::new("review_grid")
+        theme::section_title(ui, "REPOSITORY DISCOVERY");
+        egui::Grid::new("discover_grid")
             .num_columns(2)
             .spacing([8.0, 4.0])
             .show(ui, |ui| {
-                ui.label(theme::dim("model timeout (s)"));
-                ui.add(egui::DragValue::new(&mut self.settings.model_timeout_secs).range(5..=900));
-                ui.end_row();
-                ui.label(theme::dim("context lines"));
-                ui.add(egui::DragValue::new(&mut self.settings.context_lines).range(2..=60));
-                ui.end_row();
-                ui.label(theme::dim("blind review"));
-                ui.checkbox(
-                    &mut self.settings.blind_review,
-                    "hide model names until you choose",
-                );
-                ui.end_row();
-                ui.label(theme::dim("review"));
+                ui.label(theme::dim("max age (days)"));
                 ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.settings.review_comments, "comments");
-                    ui.checkbox(&mut self.settings.review_code, "code");
+                    ui.add(
+                        egui::DragValue::new(&mut self.settings.repo_max_age_days).range(0..=3650),
+                    );
+                    ui.label(theme::dim("0 = no cutoff"));
                 });
                 ui.end_row();
-                ui.label(theme::dim("walk order"));
-                ui.checkbox(
-                    &mut self.settings.triage_order,
-                    "riskiest first (local heuristic; hover the risk badge for its reasons)",
+                ui.label(theme::dim("clone directory"));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.settings.clone_dir)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("(home folder)")
+                        .font(egui::TextStyle::Monospace),
                 );
                 ui.end_row();
             });
+        ui.label(theme::dim(
+            "The picker scans your home folder for clones and asks gh for your GitHub \
+repositories, both in the background, and caches what it finds for an hour — the refresh \
+button rescans on the spot. Repositories whose last activity is older than the cutoff are \
+hidden; one that only exists on GitHub is cloned into the clone directory when opened.",
+        ));
+        ui.add_space(4.0);
+        if self.settings.excluded_repos.is_empty() {
+            ui.label(theme::dim(
+                "excluded: none — ✕ (or X) on a discovered row in the picker hides it here",
+            ));
+        } else {
+            ui.label(theme::dim("excluded repositories:"));
+            let mut unexclude: Option<usize> = None;
+            for (i, key) in self.settings.excluded_repos.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    if ui
+                        .small_button("✕")
+                        .on_hover_text("stop excluding")
+                        .clicked()
+                    {
+                        unexclude = Some(i);
+                    }
+                    ui.label(RichText::new(key).monospace());
+                });
+            }
+            if let Some(i) = unexclude {
+                self.settings.excluded_repos.remove(i);
+            }
+        }
+
+        ui.add_space(8.0);
+        theme::section_title(ui, "REVIEW");
+        egui::Grid::new("review_grid").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
+            ui.label(theme::dim("model timeout (s)"));
+            ui.add(egui::DragValue::new(&mut self.settings.model_timeout_secs).range(5..=900));
+            ui.end_row();
+            ui.label(theme::dim("context lines"));
+            ui.add(egui::DragValue::new(&mut self.settings.context_lines).range(2..=60));
+            ui.end_row();
+            ui.label(theme::dim("blind review"));
+            ui.checkbox(&mut self.settings.blind_review, "hide model names until you choose");
+            ui.end_row();
+            ui.label(theme::dim("review"));
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.settings.review_comments, "comments");
+                ui.checkbox(&mut self.settings.review_code, "code");
+            });
+            ui.end_row();
+            ui.label(theme::dim("untracked files"));
+            ui.checkbox(
+                &mut self.settings.include_untracked,
+                "working-tree reviews also take in untracked files (as new-file diffs)",
+            );
+            ui.end_row();
+            ui.label(theme::dim("review order"));
+            ui.checkbox(
+                &mut self.settings.triage_order,
+                "riskiest first (local heuristic; hover the risk badge for its reasons)",
+            );
+            ui.end_row();
+            ui.label(theme::dim("skip decided"));
+            ui.checkbox(
+                &mut self.settings.skip_decided,
+                "leave out units this repository already has a verdict on",
+            );
+            ui.end_row();
+            ui.label(theme::dim("preferences"));
+            ui.checkbox(
+                &mut self.settings.send_profile,
+                "send your standing preferences (mined from past follow-ups and verdicts) with every prompt",
+            );
+            ui.end_row();
+            ui.label(theme::dim("prefetch"));
+            ui.checkbox(
+                &mut self.settings.prefetch_next,
+                "query the models for the next unit while you decide the current one",
+            );
+            ui.end_row();
+            ui.label(theme::dim("defer keeps"));
+            ui.checkbox(
+                &mut self.settings.defer_unanimous_keeps,
+                "when a prefetched unit comes back all-keep, review it after the contested ones",
+            );
+            ui.end_row();
+        });
         ui.label(theme::dim(
             "Blind review also shuffles the candidates per comment. Every review is also a \
 labelled example, and knowing which model wrote which suggestion while you choose biases that \
 label — turn it off only if you are not measuring the models against each other.",
         ));
         ui.add_space(4.0);
+        ui.add_space(4.0);
         ui.label(theme::dim(
-            "Code review walks every changed cluster of code — as the whole enclosing \
+            "Skipping decided units matches a unit to a past decision by its file and its exact text, so a unit keeps its verdict as edits above it move it down the file, and a rewrite you already accepted is not offered back as new work. Keep, rewrite, delete and flag all count as decided; a unit you skipped during a review does not, so it returns next time. Untick this to review everything the diff touches again.",
+        ));
+        ui.add_space(4.0);
+        ui.label(theme::dim(
+            "Code review reviews every changed cluster of code — as the whole enclosing \
 function or class where the language allows, as the surrounding hunk where it does not. \
 Comment runs sitting between changed code lines are judged with that code rather than \
 separately. Turning a kind off here narrows every future session to the other.",
@@ -293,7 +415,7 @@ separately. Turning a kind off here narrows every future session to the other.",
             "Run in the repository after each applied edit, whitespace-tokenized, no shell — \
 the repo's own fast check (cargo check, tsc --noEmit, go build, pytest -x …). An edit whose \
 check fails is reverted on the spot and the failure shown, so a bad model rewrite can never \
-walk the review onto a broken tree. The check runs synchronously: pick a fast one.",
+review the review onto a broken tree. The check runs synchronously: pick a fast one.",
         ));
 
         ui.add_space(10.0);

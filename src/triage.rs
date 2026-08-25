@@ -1,18 +1,9 @@
-//! Risk triage: a fast, local, deterministic score per unit so the walk can
+//! Risk triage: a fast, local, deterministic score per unit so the review can
 //! visit the changes most worth human attention first.
-//!
-//! Deliberately *not* a model call. Triage runs at plan build, synchronously,
-//! for every unit on the branch — a model pass there would freeze the app for
-//! minutes and add a failure mode to the one step that must always work. The
-//! models still judge every unit when it is reached; this only decides the
-//! order, so cheap static signals are enough: what kind of change it is, how
-//! big, whether it deletes code, and whether it touches the vocabulary of
-//! things that go wrong (locks, secrets, unsafe blocks, subprocesses…).
-//! The score is shown with its reasons, so the ordering is inspectable
-//! rather than an oracle.
 
 use crate::units::ReviewUnit;
 
+/// A deterministic score and explanation used to prioritize review units.
 pub struct Risk {
     /// 0–100. Ordering signal, not a judgement.
     pub score: u32,
@@ -20,20 +11,21 @@ pub struct Risk {
     pub reasons: Vec<String>,
 }
 
-/// One vocabulary bucket: a label, the points it adds, and the substrings
-/// (matched case-insensitively) that trigger it. A bucket fires at most once
-/// per unit — five `unwrap`s are not five times as risky as one.
-struct Bucket {
+/// Keyword pattern that signals risky code to help prioritize human review attention.
+struct RiskRule {
+    /// Label shown in the risk assessment explanation.
     label: &'static str,
+    /// Points added to the risk score when a term matches.
     points: u32,
-    needles: &'static [&'static str],
+    /// Keywords that trigger this rule (matched case-insensitively).
+    terms: &'static [&'static str],
 }
 
-const BUCKETS: &[Bucket] = &[
-    Bucket {
+const RISK_RULES: &[RiskRule] = &[
+    RiskRule {
         label: "security-sensitive terms",
         points: 15,
-        needles: &[
+        terms: &[
             "passw",
             "secret",
             "credential",
@@ -47,10 +39,10 @@ const BUCKETS: &[Bucket] = &[
             "certif",
         ],
     },
-    Bucket {
+    RiskRule {
         label: "concurrency",
         points: 12,
-        needles: &[
+        terms: &[
             "mutex",
             "rwlock",
             ".lock(",
@@ -63,10 +55,10 @@ const BUCKETS: &[Bucket] = &[
             "race ",
         ],
     },
-    Bucket {
+    RiskRule {
         label: "panics or unsafe code",
         points: 12,
-        needles: &[
+        terms: &[
             "unsafe",
             ".unwrap(",
             ".expect(",
@@ -79,10 +71,10 @@ const BUCKETS: &[Bucket] = &[
             "throw ",
         ],
     },
-    Bucket {
+    RiskRule {
         label: "external effects",
         points: 10,
-        needles: &[
+        terms: &[
             "subprocess",
             "command",
             "exec(",
@@ -104,15 +96,15 @@ const BUCKETS: &[Bucket] = &[
             "migrat",
         ],
     },
-    Bucket {
+    RiskRule {
         label: "unfinished-work markers",
         points: 8,
-        needles: &["todo", "fixme", "hack", "xxx", "workaround", "temporar"],
+        terms: &["todo", "fixme", "hack", "xxx", "workaround", "temporar"],
     },
 ];
 
 /// Path fragments that mark lower-stakes files. Tests matter, but a bug in a
-/// test rarely ships; halving keeps them in the walk without letting a big
+/// test rarely ships; halving keeps them in the review without letting a big
 /// test file outrank the code it tests.
 fn is_test_path(path: &str) -> bool {
     let p = path.to_ascii_lowercase();
@@ -123,18 +115,12 @@ fn is_test_path(path: &str) -> bool {
         || p.contains(".spec.")
 }
 
-/// Documentation. Prose *about* locks and secrets fires the vocabulary
-/// buckets exactly as hard as code that touches them — dogfooding this tool
-/// on its own branch put the README at risk 100 for that reason — so doc
-/// files are cut to a third rather than letting their subject matter outrank
-/// the code it describes.
 fn is_doc_path(path: &str) -> bool {
     let p = path.to_ascii_lowercase();
     [".md", ".markdown", ".rst", ".txt", ".adoc"]
         .iter()
         .any(|ext| p.ends_with(ext))
 }
-
 pub fn assess(unit: &ReviewUnit) -> Risk {
     let mut score: u32 = 0;
     let mut reasons: Vec<String> = Vec::new();
@@ -189,14 +175,14 @@ pub fn assess(unit: &ReviewUnit) -> Risk {
         );
     }
 
-    let haystack = unit.raw_lines().join("\n").to_ascii_lowercase();
-    for bucket in BUCKETS {
-        if bucket.needles.iter().any(|n| haystack.contains(n)) {
+    let unit_text = unit.raw_lines().join("\n").to_ascii_lowercase();
+    for rule in RISK_RULES {
+        if rule.terms.iter().any(|term| unit_text.contains(term)) {
             add(
                 &mut score,
                 &mut reasons,
-                bucket.points,
-                bucket.label.to_string(),
+                rule.points,
+                rule.label.to_string(),
             );
         }
     }
@@ -215,26 +201,24 @@ pub fn assess(unit: &ReviewUnit) -> Risk {
     }
 }
 
-/// Order units riskiest-first (stable: ties keep their line order), and files
-/// by the riskiest unit they contain. Called on the assembled plan when the
-/// triage setting is on; the offset bookkeeping tolerates any walk order.
 pub fn order_riskiest_first(files: &mut Vec<(String, Vec<ReviewUnit>)>) {
-    for (_, units) in files.iter_mut() {
-        let mut scored: Vec<(u32, ReviewUnit)> =
-            units.drain(..).map(|u| (assess(&u).score, u)).collect();
-        scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.start_line().cmp(&b.1.start_line())));
-        units.extend(scored.into_iter().map(|(_, u)| u));
-    }
-    // Units are now sorted riskiest-first, so a file's risk is its first unit.
-    let mut scored: Vec<(u32, (String, Vec<ReviewUnit>))> = files
+    let mut file_scores: Vec<(u32, (String, Vec<ReviewUnit>))> = files
         .drain(..)
-        .map(|f| (f.1.first().map(|u| assess(u).score).unwrap_or(0), f))
-        .collect();
-    // Stable, so equally risky files keep their diff order.
-    scored.sort_by_key(|a| std::cmp::Reverse(a.0));
-    files.extend(scored.into_iter().map(|(_, f)| f));
-}
+        .map(|(name, units)| {
+            let mut scored: Vec<(u32, ReviewUnit)> =
+                units.into_iter().map(|u| (assess(&u).score, u)).collect();
+            scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.start_line().cmp(&b.1.start_line())));
 
+            let file_risk = scored.first().map(|s| s.0).unwrap_or(0);
+            let sorted_units = scored.into_iter().map(|(_, u)| u).collect();
+
+            (file_risk, (name, sorted_units))
+        })
+        .collect();
+
+    file_scores.sort_by_key(|a| std::cmp::Reverse(a.0));
+    files.extend(file_scores.into_iter().map(|(_, f)| f));
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,13 +226,14 @@ mod tests {
     use crate::comments::{CommentStyle, CommentUnit};
 
     fn comment(file: &str, line: u32, text: &str) -> ReviewUnit {
+        let indent = text[..text.len() - text.trim_start().len()].to_string();
         ReviewUnit::Comment(CommentUnit {
             file: file.into(),
             lang: "Rust".into(),
             start_line: line,
             end_line: line,
             raw_lines: vec![text.to_string()],
-            indent: String::new(),
+            indent,
             style: CommentStyle::Line {
                 prefix: "//".into(),
             },
@@ -257,7 +242,6 @@ mod tests {
             has_added: true,
         })
     }
-
     fn code(
         file: &str,
         line: u32,
@@ -297,9 +281,12 @@ mod tests {
             "{:?}",
             scary_code.reasons
         );
-        assert!(scary_code.reasons.iter().any(|r| r.contains("concurrency")));
+        assert!(
+            scary_code.reasons.iter().any(|r| r.contains("concurrency")),
+            "{:?}",
+            scary_code.reasons
+        );
     }
-
     #[test]
     fn removals_and_missing_scope_raise_the_score() {
         let with_removal = assess(&code(
@@ -329,8 +316,8 @@ mod tests {
 
     #[test]
     fn prose_about_risky_things_does_not_outrank_the_code() {
-        // Found by running the tool on its own branch: the README hit risk
-        // 100 because it *describes* the vocabulary buckets.
+        // Documentation changes carry no runtime risk, so review attention
+        // should prioritize executable code even when prose mentions risky terms.
         let prose = &["This guards secrets with a mutex; unsafe code panics on TODO."];
         let doc = assess(&code("README.md", 1, prose, None, ""));
         let src = assess(&code("src/vault.rs", 1, prose, None, ""));
@@ -346,7 +333,6 @@ mod tests {
             doc.reasons
         );
     }
-
     #[test]
     fn test_files_are_halved_and_the_score_is_bounded() {
         let prod = assess(&code(
@@ -363,7 +349,7 @@ mod tests {
             Some("fn f"),
             "",
         ));
-        assert!(test.score < prod.score);
+        assert_eq!(test.score, prod.score / 2);
         assert!(test.reasons.iter().any(|r| r.contains("test code")));
 
         let everything = assess(&code(
@@ -377,7 +363,6 @@ mod tests {
         ));
         assert!(everything.score <= 100, "{}", everything.score);
     }
-
     #[test]
     fn scores_are_deterministic() {
         let u = code("src/a.rs", 1, &["    spawn(worker);"], Some("fn f"), "");
@@ -385,14 +370,21 @@ mod tests {
     }
 
     #[test]
-    fn ordering_walks_riskiest_first_but_keeps_line_order_on_ties() {
+    fn ordering_puts_riskiest_first_but_keeps_diff_order_on_ties() {
+        // Surfacing highest-risk changes first makes effective use of human reviewer
+        // time and attention. For equal risk, preserving diff order lets reviewers
+        // lean on their built-up mental model.
         let mut files = vec![
             (
-                "src/mild.rs".to_string(),
+                "src/a_mild.rs".to_string(),
                 vec![
-                    comment("src/mild.rs", 2, "// a"),
-                    comment("src/mild.rs", 9, "// b"),
+                    comment("src/a_mild.rs", 2, "// a"),
+                    comment("src/a_mild.rs", 9, "// b"),
                 ],
+            ),
+            (
+                "src/z_mild.rs".to_string(),
+                vec![comment("src/z_mild.rs", 5, "// z")],
             ),
             (
                 "src/hot.rs".to_string(),
@@ -418,7 +410,10 @@ mod tests {
             "within a file, the risky code unit leads"
         );
         assert_eq!(files[0].1[1].start_line(), 3);
-        // Equal-score units stay in line order, so the tie-break is stable.
+        // Equal-score files stay in original diff order.
+        assert_eq!(files[1].0, "src/a_mild.rs");
+        assert_eq!(files[2].0, "src/z_mild.rs");
+        // Equal-score units within a file stay in line order.
         assert_eq!(files[1].1[0].start_line(), 2);
         assert_eq!(files[1].1[1].start_line(), 9);
     }
