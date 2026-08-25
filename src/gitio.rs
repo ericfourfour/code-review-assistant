@@ -139,6 +139,25 @@ pub fn default_branch(dir: &str, fallback: &str) -> String {
     fallback.to_string()
 }
 
+/// The ref a pull request's base should actually be diffed against.
+///
+/// `gh pr checkout` fetches the pull request's head and nothing else, so the
+/// *local* branch named by `baseRefName` is only as current as whatever the
+/// reviewer last pulled. Diffing `base...HEAD` against a stale tip puts the
+/// merge base too far back, and every change merged into the base since then
+/// arrives in the review dressed as part of the pull request. The
+/// remote-tracking ref is what the pull request is genuinely proposed
+/// against, so refresh it and prefer it — falling back to the plain name when
+/// there is no such ref to prefer (no remote, a fork's base, offline).
+pub fn pr_base_ref(dir: &str, base: &str) -> String {
+    let _ = git(dir, &["fetch", "--quiet", "origin", base]);
+    let remote = format!("origin/{base}");
+    match git(dir, &["rev-parse", "--verify", "--quiet", &format!("refs/remotes/{remote}")]) {
+        Ok(_) => remote,
+        Err(_) => base.to_string(),
+    }
+}
+
 #[derive(Clone)]
 pub struct BranchInfo {
     pub name: String,
@@ -173,6 +192,66 @@ pub fn local_branches(dir: &str) -> Result<Vec<BranchInfo>, String> {
 
 pub fn checkout(dir: &str, branch: &str) -> Result<(), String> {
     git(dir, &["checkout", branch]).map(|_| ())
+}
+
+/// Move HEAD onto `rev` without claiming a branch. A review only ever reads
+/// `base...HEAD`, so a detached HEAD is exactly as reviewable as an attached
+/// one — and it is the only way in when the branch is checked out elsewhere.
+pub fn checkout_detached(dir: &str, rev: &str) -> Result<(), String> {
+    git(dir, &["checkout", "--detach", rev]).map(|_| ())
+}
+
+/// Path of the worktree that holds `branch`, ignoring the one at `except`.
+/// Git gives a branch to one worktree at a time, so this is what turns a
+/// checkout into a refusal — and what tells the caller to detach instead.
+/// `except` is the worktree doing the asking, which its own branch never
+/// blocks: it is already standing on it.
+pub fn worktree_for_branch(dir: &str, branch: &str, except: &str) -> Option<String> {
+    let out = git(dir, &["worktree", "list", "--porcelain"]).ok()?;
+    let want = format!("refs/heads/{branch}");
+    let mut path = String::new();
+    for line in out.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            path = p.trim().to_string();
+        } else if line.strip_prefix("branch ").map(str::trim) == Some(want.as_str())
+            && !path.is_empty()
+            && !same_path(&path, except)
+        {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// Create a linked worktree at `path` with `target` checked out in it.
+pub fn worktree_add(dir: &str, path: &str, target: &str) -> Result<(), String> {
+    git(dir, &["worktree", "add", path, target]).map(|_| ())
+}
+
+/// The same, with HEAD detached — for a target some other worktree already
+/// holds, and for a starting point that is about to be moved anyway.
+pub fn worktree_add_detached(dir: &str, path: &str, target: &str) -> Result<(), String> {
+    git(dir, &["worktree", "add", "--detach", path, target]).map(|_| ())
+}
+
+/// Forget worktrees whose directories are gone. Git keeps the registration
+/// after a directory is deleted, and the stale entry refuses the path back.
+pub fn worktree_prune(dir: &str) {
+    let _ = git(dir, &["worktree", "prune"]);
+}
+
+/// Whether two spellings name the same path.
+pub fn same_path(a: &str, b: &str) -> bool {
+    path_key(a) == path_key(b)
+}
+
+/// One spelling of a path, so two of them can be compared or one can name a
+/// directory: git reports worktrees with forward slashes, and Windows does
+/// not care about case.
+pub fn path_key(p: &str) -> String {
+    let s = p.trim().replace('\\', "/");
+    let s = s.trim_end_matches('/');
+    if cfg!(windows) { s.to_lowercase() } else { s.to_string() }
 }
 
 /// Git's well-known empty-tree object. Used as the diff base when a branch
@@ -687,8 +766,30 @@ pub fn open_prs(dir: &str, gh: &str) -> Result<Vec<PrInfo>, String> {
     serde_json::from_str(&out).map_err(|e| format!("parse gh output: {e}"))
 }
 
-pub fn pr_checkout(dir: &str, gh: &str, number: u64) -> Result<(), String> {
-    run(dir, gh, &["pr", "checkout", &number.to_string()]).map(|_| ())
+/// Put a PR's head into this working tree. When the head branch is already
+/// checked out in another worktree git refuses to switch, so fall back to a
+/// detached checkout of the same commits rather than making the reviewer go
+/// tidy up an unrelated worktree first. `Ok(Some(path))` names the worktree
+/// that forced the fallback, so the UI can say why HEAD came back detached.
+pub fn pr_checkout(dir: &str, gh: &str, number: u64) -> Result<Option<String>, String> {
+    let n = number.to_string();
+    let Err(e) = run(dir, gh, &["pr", "checkout", &n]) else {
+        return Ok(None);
+    };
+    let Some(other) = worktree_in_error(&e) else {
+        return Err(e);
+    };
+    run(dir, gh, &["pr", "checkout", &n, "--detach"])
+        .map_err(|d| format!("{e}\n\nchecking it out detached instead also failed: {d}"))?;
+    Ok(Some(other))
+}
+
+/// The worktree path out of git's "is already used by worktree at '<path>'"
+/// refusal — the one checkout failure a detached HEAD can still get past.
+fn worktree_in_error(err: &str) -> Option<String> {
+    let rest = err.split("is already used by worktree at").nth(1)?.trim();
+    let rest = rest.strip_prefix('\'').unwrap_or(rest);
+    Some(rest.split('\'').next().unwrap_or(rest).trim().to_string())
 }
 
 #[cfg(all(test, windows))]
@@ -801,6 +902,51 @@ mod repo_tests {
     }
 
     #[test]
+    fn a_branch_another_worktree_holds_is_still_reviewable_detached() {
+        let repo = TempRepo::new("worktree");
+        repo.write("a.txt", "hi\n");
+        repo.commit("first");
+        repo.git(&["branch", "feature"]);
+        // A worktree's own branch never blocks it: `except` excuses itself.
+        assert!(worktree_for_branch(&repo.path(), "main", &repo.path()).is_none());
+        // Anyone else asking sees that the repository is standing on it.
+        assert!(worktree_for_branch(&repo.path(), "main", "C:/nowhere").is_some());
+
+        let elsewhere = TempDir::new("wt-linked");
+        let other = elsewhere.path().join("held").to_string_lossy().to_string();
+        repo.git(&["worktree", "add", &other, "feature"]);
+
+        // Claimed elsewhere, so git refuses to switch to it here...
+        assert!(worktree_for_branch(&repo.path(), "feature", &repo.path()).is_some());
+        assert!(checkout(&repo.path(), "feature").is_err());
+
+        // ...but its commits are reachable all the same, which is all a
+        // review needs: the diff only ever reads base...HEAD.
+        checkout_detached(&repo.path(), "feature").unwrap();
+        assert_eq!(current_branch(&repo.path()).unwrap(), "HEAD");
+        assert_eq!(
+            head_sha(&repo.path()).unwrap(),
+            repo.git(&["rev-parse", "feature"]).trim()
+        );
+    }
+
+    #[test]
+    fn worktree_refusal_names_the_worktree_that_caused_it() {
+        let err = concat!(
+            "gh pr checkout 3 failed: fatal: 'codex/cd' is already used by ",
+            "worktree at 'C:/Users/eric/.codex/worktrees/7e55/cra'",
+            "\n",
+            "failed to run git: exit status 128"
+        );
+        assert_eq!(
+            worktree_in_error(err).as_deref(),
+            Some("C:/Users/eric/.codex/worktrees/7e55/cra")
+        );
+        // Every other failure is left alone — detaching would not help.
+        assert!(worktree_in_error("fatal: pathspec 'nope' did not match").is_none());
+    }
+
+    #[test]
     fn review_diff_covers_working_tree_branch_and_whole_history() {
         let repo = TempRepo::new("diff");
         repo.write("src/lib.rs", "fn main() {}\n");
@@ -823,6 +969,57 @@ mod repo_tests {
         assert!(review_diff(&repo.path(), "", 12).unwrap().trim().is_empty());
         repo.write("src/lib.rs", LIB_RS.replace("one", "1").as_str());
         assert!(review_diff(&repo.path(), "", 12).unwrap().contains("counter"));
+    }
+
+    #[test]
+    fn a_pr_is_diffed_against_the_server_base_not_a_stale_local_branch() {
+        // An "upstream" repository, and a clone of it whose local `main` is
+        // left behind — exactly what a reviewer who has not pulled in a while
+        // is holding when they open somebody's pull request.
+        let upstream = TempRepo::new("pr-base-up");
+        upstream.write("a.txt", "one
+");
+        upstream.commit("first");
+        let clone = TempRepo::new("pr-base-clone");
+        clone.git(&["remote", "add", "origin", &upstream.path()]);
+        clone.git(&["fetch", "--quiet", "origin"]);
+        clone.git(&["reset", "--hard", "origin/main"]);
+
+        // Upstream moves on, and the pull request branches from where it now is.
+        upstream.write("merged-since.txt", "landed on main
+");
+        upstream.commit("second");
+        upstream.git(&["checkout", "-b", "feature"]);
+        upstream.write("the-pr.txt", "the change under review
+");
+        upstream.commit("the pull request");
+
+        // The head is fetched, as `gh pr checkout` would; nothing updates the
+        // clone's own `main`, which still points at the first commit.
+        clone.git(&["fetch", "--quiet", "origin", "feature"]);
+        clone.git(&["checkout", "--quiet", "--detach", "FETCH_HEAD"]);
+        assert_eq!(clone.git(&["rev-list", "--count", "main"]).trim(), "1");
+
+        // Diffing the stale local name drags in whatever landed on main since.
+        let stale = review_diff(&clone.path(), "main", 3).unwrap();
+        assert!(stale.contains("merged-since.txt"), "expected the stale base to leak: {stale}");
+
+        // The resolved base is the remote-tracking ref, and it shows the pull
+        // request's own change and nothing else.
+        let base = pr_base_ref(&clone.path(), "main");
+        assert_eq!(base, "origin/main");
+        let diff = review_diff(&clone.path(), &base, 3).unwrap();
+        assert!(diff.contains("the-pr.txt"), "{diff}");
+        assert!(!diff.contains("merged-since.txt"), "the base's own commits leaked in: {diff}");
+    }
+
+    #[test]
+    fn a_base_with_no_remote_tracking_ref_keeps_its_plain_name() {
+        let repo = TempRepo::new("pr-base-local");
+        repo.write("a.txt", "one
+");
+        repo.commit("first");
+        assert_eq!(pr_base_ref(&repo.path(), "main"), "main");
     }
 
     #[test]

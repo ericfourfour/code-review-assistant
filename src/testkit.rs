@@ -252,3 +252,33 @@ impl TempRepo {
         self.git(&["commit", "-m", message]);
     }
 }
+
+/// A disposable root for review worktrees, and exclusive use of it.
+/// `CRA_WORKTREES` is process-global, so holding one of these also holds out
+/// every other test that needs one — they would otherwise hand each other the
+/// wrong root halfway through.
+pub struct WorktreeRoot {
+    /// Held, not read: the directory is deleted when this is dropped, and the
+    /// lock outlives it so the deletion cannot race the next test's root.
+    _dir: TempDir,
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+static WORKTREE_ROOT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+impl WorktreeRoot {
+    pub fn new(tag: &str) -> WorktreeRoot {
+        // A panicking test poisons the lock but leaves nothing behind that the
+        // next one cannot overwrite, so the poison is not worth failing over.
+        let guard = WORKTREE_ROOT.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = TempDir::new(tag);
+        std::env::set_var("CRA_WORKTREES", dir.path());
+        WorktreeRoot { _dir: dir, _guard: guard }
+    }
+}
+
+impl Drop for WorktreeRoot {
+    fn drop(&mut self) {
+        std::env::remove_var("CRA_WORKTREES");
+    }
+}
