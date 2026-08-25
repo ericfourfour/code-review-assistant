@@ -1524,32 +1524,40 @@ mod tests {
         let db = Db::open_at(&dir.path().join("cra.db")).expect("open test db");
         let session = db.new_session("C:/work/widgets", "branch", "feature", "main");
         let judged = unit("src/lib.rs", 2);
-        db.log_suggestion(
-            session,
-            judged.file(),
-            2,
-            2,
-            "m1",
-            Some("keep"),
-            Some(""),
-            Some("first answer"),
-            10,
-            None,
-            None,
-        );
-        db.log_suggestion(
-            session,
-            judged.file(),
-            2,
-            2,
-            "m1",
-            Some("rewrite"),
-            Some("better"),
-            Some("follow-up answer"),
-            20,
-            None,
-            None,
-        );
+        db.log_suggestion(&crate::db::SuggestionRecord {
+            session_id: session,
+            file: judged.file(),
+            line_start: 2,
+            line_end: 2,
+            model: "m1",
+            action: Some("keep"),
+            comment: Some(""),
+            justification: Some("first answer"),
+            latency_ms: 10,
+            error: None,
+            evidence: None,
+            usage: None,
+            cost: None,
+            follow_up_id: None,
+            round: 1,
+        });
+        db.log_suggestion(&crate::db::SuggestionRecord {
+            session_id: session,
+            file: judged.file(),
+            line_start: 2,
+            line_end: 2,
+            model: "m1",
+            action: Some("rewrite"),
+            comment: Some("better"),
+            justification: Some("follow-up answer"),
+            latency_ms: 20,
+            error: None,
+            evidence: None,
+            usage: None,
+            cost: None,
+            follow_up_id: None,
+            round: 2,
+        });
         log_label(&db, session, &judged, "rewrite", "m1");
 
         let report = Report::from_db(&db);

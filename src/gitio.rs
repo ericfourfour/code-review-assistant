@@ -3,10 +3,11 @@
 //! authenticated.
 
 use serde::Deserialize;
+use std::io::Write;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// Build a `Command` that will not flash a console window on Windows. The
 /// app is a windowed (no-console) process, so console-subsystem children
@@ -124,6 +125,13 @@ pub fn is_dirty(dir: &str) -> bool {
 /// Pathspec-scoped, so an unrelated dirty file cannot answer for this one.
 pub fn file_is_dirty(dir: &str, file: &str) -> bool {
     git(dir, &["status", "--porcelain", "--", file])
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// Whether the index contains any change relative to HEAD.
+pub fn index_is_dirty(dir: &str) -> bool {
+    git(dir, &["diff", "--cached", "--name-only"])
         .map(|s| !s.trim().is_empty())
         .unwrap_or(false)
 }
@@ -328,9 +336,57 @@ pub fn file_at_index(dir: &str, path: &str) -> Option<String> {
     git(dir, &["show", &format!(":0:{path}")]).ok()
 }
 
+/// Replace one stage-0 index blob without touching the working tree. The file
+/// mode is preserved from the existing index entry.
+pub fn write_index_file(dir: &str, path: &str, content: &str) -> Result<(), String> {
+    let entry = git(dir, &["ls-files", "-s", "--", path])?;
+    let mode = entry
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| format!("no staged index entry for {path}"))?
+        .to_string();
+
+    let mut child = hidden_command("git")
+        .args(["hash-object", "-w", "--stdin"])
+        .current_dir(dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("git hash-object: {e}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| "git hash-object stdin unavailable".to_string())?
+        .write_all(content.as_bytes())
+        .map_err(|e| format!("git hash-object stdin: {e}"))?;
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("git hash-object: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git hash-object failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    let object = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    git(
+        dir,
+        &["update-index", "--add", "--cacheinfo", &mode, &object, path],
+    )?;
+    Ok(())
+}
+
 pub fn stage_and_commit(dir: &str, file: &str, message: &str) -> Result<String, String> {
     git(dir, &["add", "--", file])?;
     git(dir, &["commit", "-m", message, "--", file])?;
+    head_sha(dir)
+}
+
+/// Commit the index exactly as it stands. Unlike [`stage_and_commit`], this
+/// never copies an unstaged working-tree version over a reviewed staged blob.
+pub fn commit_index(dir: &str, message: &str) -> Result<String, String> {
+    git(dir, &["commit", "-m", message])?;
     head_sha(dir)
 }
 
@@ -650,6 +706,39 @@ mod repo_tests {
         assert!(
             !last.contains("b.txt"),
             "b.txt should still be uncommitted: {last}"
+        );
+    }
+
+    #[test]
+    fn staged_revision_and_commit_never_copy_the_unstaged_worktree() {
+        let repo = TempRepo::new("staged-index");
+        repo.write("a.txt", "base\n");
+        repo.commit("base");
+
+        repo.write("a.txt", "staged\n");
+        repo.git(&["add", "--", "a.txt"]);
+        repo.write("a.txt", "unstaged\n");
+
+        write_index_file(&repo.path(), "a.txt", "reviewed staged\n").unwrap();
+        assert_eq!(
+            file_at_index(&repo.path(), "a.txt").as_deref(),
+            Some("reviewed staged\n")
+        );
+        assert_eq!(
+            repo.read("a.txt"),
+            "unstaged\n",
+            "index edit touched the worktree"
+        );
+
+        commit_index(&repo.path(), "review: staged snapshot").unwrap();
+        assert_eq!(
+            file_at_head(&repo.path(), "a.txt").as_deref(),
+            Some("reviewed staged\n")
+        );
+        assert_eq!(
+            repo.read("a.txt"),
+            "unstaged\n",
+            "commit staged the unstaged copy"
         );
     }
 

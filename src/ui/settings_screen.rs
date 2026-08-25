@@ -81,6 +81,14 @@ than the other way round.",
                                 .font(egui::TextStyle::Monospace),
                         );
                     });
+                    field(ui, "fix command", |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut m.fix_command)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("writable command for fix sessions")
+                                .font(egui::TextStyle::Monospace),
+                        );
+                    });
                     field(ui, "model", |ui| {
                         let presets = crate::settings::model_presets(&m.command);
                         ui.add(
@@ -152,6 +160,14 @@ than the other way round.",
                                 .font(egui::TextStyle::Monospace),
                         );
                     });
+                    field(ui, "fix resume", |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut m.fix_resume_command)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("writable resume command for fix sessions")
+                                .font(egui::TextStyle::Monospace),
+                        );
+                    });
                     field(ui, "session key", |ui| {
                         ui.add(
                             egui::TextEdit::singleline(&mut m.session_key)
@@ -207,6 +223,7 @@ than the other way round.",
             self.settings.models.push(ModelConfig {
                 name: "model".into(),
                 command: "mycli --print -".into(),
+                fix_command: String::new(),
                 coauthor: "Model <model@example.com>".into(),
                 enabled: true,
                 model: String::new(),
@@ -214,6 +231,7 @@ than the other way round.",
                 effort: String::new(),
                 effort_flag: "--effort".into(),
                 resume_command: String::new(),
+                fix_resume_command: String::new(),
                 session_key: String::new(),
                 price_in: 0.0,
                 price_out: 0.0,

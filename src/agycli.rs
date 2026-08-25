@@ -40,17 +40,38 @@ fn settings_json(repo: &str) -> String {
     )
 }
 
+/// Fix sessions get a separate home whose write grant is scoped to the same
+/// repository. Keeping it separate prevents a concurrent reviewer from ever
+/// inheriting writable permissions.
+fn fix_settings_json(repo: &str) -> String {
+    let repo = repo.replace('\\', "/");
+    format!(
+        "{{\n  \"enableTerminalSandbox\": true,\n  \"permissions\": {{\n    \
+\"allow\": [\n      \"command(*)\",\n      \"read_file({repo})\",\n      \
+\"write_file({repo})\"\n    ],\n    \"deny\": [\n      \"unsandboxed(*)\",\n      \
+\"read_url(*)\",\n      \"execute_url(*)\"\n    ]\n  }}\n}}\n"
+    )
+}
+
 /// Point agy's home at `repo` and return the directory to pass it.
 ///
 /// Rewritten whenever the repository changes, because the read grant names one
 /// path. Cheap enough to do per review: it is one small file, and skipping the
 /// write when nothing changed keeps it off the disk on every comment.
 pub fn configure(repo: &str) -> Result<PathBuf, String> {
-    let home = home_dir();
+    configure_home(home_dir(), settings_json(repo))
+}
+
+pub fn configure_fix(repo: &str) -> Result<PathBuf, String> {
+    let mut home = home_dir();
+    home.set_file_name("agy-fix-home");
+    configure_home(home, fix_settings_json(repo))
+}
+
+fn configure_home(home: PathBuf, wanted: String) -> Result<PathBuf, String> {
     let dir = home.join("antigravity-cli");
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     let path = dir.join("settings.json");
-    let wanted = settings_json(repo);
     if std::fs::read_to_string(&path)
         .map(|c| c == wanted)
         .unwrap_or(false)
@@ -84,6 +105,17 @@ mod tests {
         assert!(deny.iter().any(|r| r == "write_file(*)"), "{deny:?}");
         assert!(deny.iter().any(|r| r == "read_url(*)"), "{deny:?}");
         assert_eq!(v["enableTerminalSandbox"], serde_json::Value::Bool(true));
+    }
+
+    #[test]
+    fn fix_rules_grant_writes_only_inside_the_repository() {
+        let json = fix_settings_json("C:/work/widgets");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        let allow = v["permissions"]["allow"].as_array().unwrap();
+        let deny = v["permissions"]["deny"].as_array().unwrap();
+        assert!(allow.iter().any(|r| r == "write_file(C:/work/widgets)"));
+        assert!(!allow.iter().any(|r| r == "write_file(*)"));
+        assert!(deny.iter().any(|r| r == "unsandboxed(*)"));
     }
 
     #[test]

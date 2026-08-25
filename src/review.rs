@@ -336,6 +336,41 @@ pub fn apply_edit(
     splice_lines(repo, unit.file(), start, unit.raw_lines(), new_lines)
 }
 
+/// Apply an edit to the staged snapshot while leaving the working tree alone.
+pub fn apply_edit_to_index(
+    repo: &str,
+    file: &ReviewFile,
+    unit: &ReviewUnit,
+    new_lines: &[String],
+) -> Result<i64, String> {
+    let offset = file.offset_for(unit.start_line());
+    let start = (unit.start_line() as i64 - 1 + offset).max(0) as usize;
+    let content = crate::gitio::file_at_index(repo, unit.file())
+        .ok_or_else(|| format!("read staged {}: no stage-0 index entry", unit.file()))?;
+    let had_trailing_newline = content.ends_with('\n');
+    let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
+    let end = start + unit.raw_lines().len();
+    if end > lines.len()
+        || !lines[start..end]
+            .iter()
+            .zip(unit.raw_lines())
+            .all(|(actual, expected)| actual == expected)
+    {
+        return Err(format!(
+            "content mismatch at staged {}:{} — index changed since the diff was taken",
+            unit.file(),
+            start + 1
+        ));
+    }
+    lines.splice(start..end, new_lines.iter().cloned());
+    let mut out = lines.join("\n");
+    if had_trailing_newline {
+        out.push('\n');
+    }
+    crate::gitio::write_index_file(repo, unit.file(), &out)?;
+    Ok(new_lines.len() as i64 - unit.raw_lines().len() as i64)
+}
+
 /// Safely apply or undo a reviewed line edit in a working-tree file,
 /// refusing to modify the file if its expected contents are no longer present
 /// and returning the resulting line-count delta for tracking later edits.

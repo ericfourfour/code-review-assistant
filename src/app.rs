@@ -1298,6 +1298,22 @@ impl CraApp {
         }
     }
 
+    fn fix_cli_home(&mut self, repo: &str, command: &str) -> String {
+        if !command.contains("{cli_home}") {
+            return String::new();
+        }
+        match crate::agycli::configure_fix(repo) {
+            Ok(home) => home.to_string_lossy().to_string(),
+            Err(e) => {
+                self.note(
+                    "agy",
+                    &format!("could not write fix-session permissions: {e}"),
+                );
+                String::new()
+            }
+        }
+    }
+
     /// A model can take a follow-up once its previous request has come back and
     /// it has a session to resume. Waiting for the reply keeps one answer per
     /// request, so a late one can never be misfiled against the wrong turn.
@@ -1535,15 +1551,24 @@ impl CraApp {
         entry: review::PendingDecision,
     ) -> Option<String> {
         let file = entry.file.clone();
+        let staged = self
+            .plan
+            .as_ref()
+            .is_some_and(|p| p.ref_kind == RefKind::Staged);
         let (ids, mut entries): (Vec<i64>, Vec<review::PendingDecision>) = self
             .pending
             .iter()
-            .filter(|(_, p)| p.file == file)
+            .filter(|(_, p)| staged || p.file == file)
             .cloned()
             .unzip();
         entries.push(entry);
         let msg = review::commit_message_batch(&entries);
-        match gitio::stage_and_commit(repo_path, &file, &msg) {
+        let result = if staged {
+            gitio::commit_index(repo_path, &msg)
+        } else {
+            gitio::stage_and_commit(repo_path, &file, &msg)
+        };
+        match result {
             Ok(s) => {
                 self.note(
                     "commit",
@@ -1558,7 +1583,7 @@ impl CraApp {
                 for id in &ids {
                     self.db.mark_committed(*id, &s);
                 }
-                self.pending.retain(|(_, p)| p.file != file);
+                self.pending.retain(|(_, p)| !staged && p.file != file);
                 Some(s)
             }
             Err(e) => {
@@ -1628,6 +1653,10 @@ impl CraApp {
         // measuring the reviewer, not editing code, so it stops short of this
         // — and a keep or a flag has nothing to write.
         let recheck = self.plan.as_ref().is_some_and(|p| p.is_recheck());
+        let staged = self
+            .plan
+            .as_ref()
+            .is_some_and(|p| p.ref_kind == RefKind::Staged);
         let makes_edit = matches!(action, Action::Rewrite | Action::Delete)
             && !recheck
             && !unit.is_deleted_file();
@@ -1646,9 +1675,19 @@ impl CraApp {
             // Where the edit was actually applied — the revert below must aim here,
             // not at where the plan thought the unit was.
             let mut applied_start0 = expected_start0;
-            match review::apply_edit(&repo_path, file, &unit, &new_lines) {
+            let applied = if staged {
+                review::apply_edit_to_index(&repo_path, file, &unit, &new_lines)
+            } else {
+                review::apply_edit(&repo_path, file, &unit, &new_lines)
+            };
+            match applied {
                 Ok(d) => delta = d,
                 Err(first_err) => {
+                    if staged {
+                        self.review_error = Some(first_err.clone());
+                        self.note("error", &first_err);
+                        return;
+                    }
                     // The file changed on disk since the diff was taken. If
                     // the unit's lines merely moved, apply the edit where they
                     // sit now; if they are gone, put the resolution in the
@@ -1710,7 +1749,10 @@ impl CraApp {
             // edit is allowed to stand. A failing edit is reverted on the
             // spot: better to lose a rewrite than to review on over a break.
             let check = self.settings.check_command.trim().to_string();
-            if !check.is_empty() && (unit.is_code() || self.settings.validate_comment_edits) {
+            if !staged
+                && !check.is_empty()
+                && (unit.is_code() || self.settings.validate_comment_edits)
+            {
                 self.note("check", &format!("running `{check}`…"));
                 let timeout =
                     std::time::Duration::from_secs(self.settings.check_timeout_secs.max(5));
@@ -1775,7 +1817,12 @@ impl CraApp {
                 // Commits are per file, not per hunk, so an earlier decision
                 // on this file may have already swept this one's lines into
                 // its commit — then there is genuinely nothing left to do.
-                if keep_commits && !gitio::file_is_dirty(&repo_path, unit.file()) {
+                let nothing_to_commit = if staged {
+                    !gitio::index_is_dirty(&repo_path)
+                } else {
+                    !gitio::file_is_dirty(&repo_path, unit.file())
+                };
+                if keep_commits && nothing_to_commit {
                     self.note("commit", "file already committed — nothing left to commit");
                 } else {
                     match self.commit_decision(&repo_path, entry.clone()) {
@@ -2285,6 +2332,13 @@ impl CraApp {
             self.fix_error = Some(format!("{} is disabled in settings", model_config.name));
             return;
         }
+        if model_config.fix_command.trim().is_empty() {
+            self.fix_error = Some(format!(
+                "{} has no writable fix command — configure one in settings",
+                model_config.name
+            ));
+            return;
+        }
         let Some(repo) = self.repo.as_ref().map(|r| r.path.clone()) else {
             return;
         };
@@ -2301,16 +2355,16 @@ impl CraApp {
         // Same session setup as a review turn: a model that names no
         // session key takes an id of our choosing, the rest report theirs.
         let command = if model_config.session_key.trim().is_empty()
-            && model_config.command.contains("{session}")
+            && model_config.fix_command.contains("{session}")
         {
             let id = uuid::Uuid::new_v4().to_string();
-            let command = model_config.command.replace("{session}", &id);
+            let command = model_config.fix_command.replace("{session}", &id);
             self.fix_session = Some(id);
             command
         } else {
-            model_config.command.clone()
+            model_config.fix_command.clone()
         };
-        let cli_home = self.cli_home(&repo);
+        let cli_home = self.fix_cli_home(&repo, &command);
         // Resolving a backlog of larger issues is a different order of work
         // from judging one unit; give the session room to do it.
         let timeout = self.settings.model_timeout_secs.saturating_mul(4);
@@ -2357,7 +2411,7 @@ impl CraApp {
                 .settings
                 .models
                 .get(self.active_fix_model_index)
-                .is_some_and(|m| !m.resume_command.trim().is_empty())
+                .is_some_and(|m| !m.fix_resume_command.trim().is_empty())
     }
 
     /// Send the pending message into the live fix session. Free-form on
@@ -2382,14 +2436,16 @@ impl CraApp {
         let Some(repo) = self.repo.as_ref().map(|r| r.path.clone()) else {
             return;
         };
-        let command = model_config.resume_command.replace("{session}", &session);
+        let command = model_config
+            .fix_resume_command
+            .replace("{session}", &session);
         self.fix_convo.push(Turn {
             prompt: message.clone(),
             reply: String::new(),
         });
         self.fix_seq += 1;
         self.fix_running = true;
-        let cli_home = self.cli_home(&repo);
+        let cli_home = self.fix_cli_home(&repo, &command);
         let timeout = self.settings.model_timeout_secs.saturating_mul(4);
         let live = models::LiveHandle::new();
         self.fix_live = Some(live.clone());
@@ -3191,7 +3247,8 @@ mod state_tests {
             ),
         );
         h.repo.commit("third comment");
-        h.app.plan = Some(Harness::plan(&h.repo));
+        let session_id = h.app.plan.as_ref().unwrap().session_id;
+        h.app.plan = Some(Harness::plan(&h.repo, session_id));
         h.enter_with(vec![cli.model_config("")]);
         h.wait_for_model_replies();
         h.wait_for_prefetch_replies();
@@ -3633,6 +3690,7 @@ mod state_tests {
             ref_kind: RefKind::WorkingTree,
             ref_name: "feature".into(),
             base_ref: "HEAD+untracked".into(),
+            branch_base: gitio::head_sha(&h.repo.path()).unwrap(),
             files: vec![ReviewFile::new(
                 path,
                 units.into_iter().map(ReviewUnit::Comment).collect(),
@@ -4972,7 +5030,9 @@ mod state_tests {
         // Check the first and launch: it is the session's job now.
         let checked_id = h.app.notes[0].note.id;
         h.app.notes[0].checked = true;
-        h.app.settings.models = vec![cli.model_config("")];
+        let mut fixer = cli.model_config("");
+        fixer.command = "this-review-command-must-not-run".into();
+        h.app.settings.models = vec![fixer];
         h.app.selected_fix_model_index = 0;
         h.app.start_fix_session(&egui::Context::default());
         assert!(h.app.fix_error.is_none());

@@ -1,7 +1,7 @@
 //! One reviewable unit — a comment run or a code change — and the plan
 //! assembly that merges the two extractors into a single ordered review.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -227,14 +227,33 @@ pub fn decided_key(unit: &ReviewUnit) -> (String, String) {
 /// difference between "not now" and "decided".
 pub fn drop_decided(
     files: &mut Vec<(String, Vec<ReviewUnit>)>,
-    decided: &HashSet<(String, String)>,
+    decided: &[(String, String)],
 ) -> usize {
     if decided.is_empty() {
         return 0;
     }
     let before: usize = files.iter().map(|(_, u)| u.len()).sum();
+    // A key is intentionally position-independent so edits above a unit do not
+    // resurrect it, but identical units can coexist in one file. Consume one
+    // historical verdict per occurrence instead of letting a set erase all of
+    // them at once.
+    let mut remaining: HashMap<(String, String), usize> = HashMap::new();
+    for key in decided {
+        *remaining.entry(key.clone()).or_default() += 1;
+    }
     for (_, units) in files.iter_mut() {
-        units.retain(|u| !decided.contains(&decided_key(u)));
+        units.retain(|u| {
+            let key = decided_key(u);
+            let Some(count) = remaining.get_mut(&key) else {
+                return true;
+            };
+            if *count == 0 {
+                true
+            } else {
+                *count -= 1;
+                false
+            }
+        });
     }
     files.retain(|(_, units)| !units.is_empty());
     before - files.iter().map(|(_, u)| u.len()).sum::<usize>()
@@ -349,21 +368,39 @@ diff --git a/src/main.rs b/src/main.rs
 
         // Nothing decided yet: the plan is untouched and the review is free.
         let mut none: Vec<_> = extracted.clone_for_test();
-        assert_eq!(drop_decided(&mut none, &HashSet::new()), 0);
+        assert_eq!(drop_decided(&mut none, &[]), 0);
         assert_eq!(none[0].1.len(), 2);
 
-        let decided: HashSet<(String, String)> =
-            [decided_key(&extracted[0].1[0])].into_iter().collect();
+        let decided = vec![decided_key(&extracted[0].1[0])];
         assert_eq!(drop_decided(&mut extracted, &decided), 1);
         assert_eq!(extracted[0].1.len(), 1, "only the judged unit goes");
         assert!(!extracted[0].1[0].is_code());
 
         // The last unit in a file takes the file with it, or the picker would
         // list a file with nothing behind it.
-        let decided: HashSet<(String, String)> =
-            [decided_key(&extracted[0].1[0])].into_iter().collect();
+        let decided = vec![decided_key(&extracted[0].1[0])];
         assert_eq!(drop_decided(&mut extracted, &decided), 1);
         assert!(extracted.is_empty());
+    }
+
+    #[test]
+    fn one_verdict_skips_only_one_of_two_identical_units() {
+        let dir = repo_with_file();
+        let files = crate::diffparse::parse(DIFF);
+        let extracted = assemble(
+            &dir.path().to_string_lossy(),
+            &files,
+            12,
+            true,
+            true,
+            crate::gitio::NewSide::WorkTree,
+        );
+        let unit = extracted[0].1[1].clone();
+        let key = decided_key(&unit);
+        let mut duplicated = vec![(unit.file().to_string(), vec![unit.clone(), unit])];
+
+        assert_eq!(drop_decided(&mut duplicated, &[key]), 1);
+        assert_eq!(duplicated[0].1.len(), 1);
     }
 
     #[test]

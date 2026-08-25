@@ -1352,7 +1352,7 @@ deleted file mode 100644
 -}
 ";
         let files = crate::diffparse::parse(diff);
-        let extracted = extract("", &files, 12);
+        let extracted = extract("", &files, 12, NewSide::Head);
         assert_eq!(extracted.len(), 1);
         assert_eq!(extracted[0].0, "src/gone.rs");
         assert_eq!(extracted[0].1.len(), 1);

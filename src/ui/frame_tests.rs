@@ -551,6 +551,7 @@ fn a_revise_candidate_lays_out_as_a_diff_inside_its_card() {
         scope: Some("fn main()".into()),
         context: unit.context().to_string(),
         hunk_header: unit.hunk_header().to_string(),
+        deleted_file: false,
     };
     if let Some(p) = app.plan.as_mut() {
         p.files[0].units[0] = crate::units::ReviewUnit::Code(code);

@@ -1128,6 +1128,7 @@ mod tests {
             price_out: 0.0,
             name: "t".into(),
             command: String::new(),
+            fix_command: String::new(),
             coauthor: String::new(),
             enabled: true,
             model: model.into(),
@@ -1135,6 +1136,7 @@ mod tests {
             effort: effort.into(),
             effort_flag: effort_flag.into(),
             resume_command: String::new(),
+            fix_resume_command: String::new(),
             session_key: String::new(),
         }
     }

@@ -173,7 +173,8 @@ impl FakeCli {
             price_in: 0.0,
             price_out: 0.0,
             name: "fake".into(),
-            command,
+            command: command.clone(),
+            fix_command: command,
             coauthor: "Fake <fake@example.com>".into(),
             enabled: true,
             model: String::new(),
@@ -181,6 +182,7 @@ impl FakeCli {
             effort: String::new(),
             effort_flag: "--effort".into(),
             resume_command: String::new(),
+            fix_resume_command: String::new(),
             session_key: String::new(),
         }
     }

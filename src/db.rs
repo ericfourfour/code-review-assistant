@@ -3,7 +3,6 @@
 //! (override with the CRA_DB env var).
 
 use rusqlite::{params, Connection};
-use std::collections::HashSet;
 use std::path::PathBuf;
 
 pub struct Db {
@@ -455,17 +454,17 @@ impl Db {
     ///
     /// Scoped by repository path: identical boilerplate in two checkouts is
     /// two separate review jobs.
-    pub fn decided_units(&self, repo: &str) -> HashSet<(String, String)> {
+    pub fn decided_units(&self, repo: &str) -> Vec<(String, String)> {
         let Ok(mut stmt) = self.conn.prepare(
             "SELECT d.file, d.original FROM decisions d
                JOIN sessions s ON s.id = d.session_id
               WHERE s.repo = ?1
-             UNION
+             UNION ALL
              SELECT d.file, d.final_text FROM decisions d
-               JOIN sessions s ON s.id = d.session_id
-              WHERE s.repo = ?1 AND d.final_text <> ''",
+                JOIN sessions s ON s.id = d.session_id
+              WHERE s.repo = ?1 AND d.final_text <> '' AND d.final_text <> d.original",
         ) else {
-            return HashSet::new();
+            return Vec::new();
         };
         stmt.query_map(params![repo], |r| Ok((r.get(0)?, r.get(1)?)))
             .map(|rows| rows.flatten().collect())

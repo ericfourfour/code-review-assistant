@@ -12,6 +12,10 @@ use crate::db::Db;
 pub struct ModelConfig {
     pub name: String,
     pub command: String,
+    /// Writable command used by follow-up fix sessions. Kept separate from the
+    /// read-only review command so granting edit tools cannot leak into review.
+    #[serde(default)]
+    pub fix_command: String,
     /// Optional `Name <email>` used in the Co-authored-by trailer when this
     /// model's suggestion is picked. Empty records model provenance without
     /// claiming a GitHub identity.
@@ -36,6 +40,9 @@ pub struct ModelConfig {
     /// so follow-ups are unavailable for the model.
     #[serde(default)]
     pub resume_command: String,
+    /// Writable resume command for the fix conversation.
+    #[serde(default)]
+    pub fix_resume_command: String,
     /// JSON key in the CLI output that carries the session id. Empty means
     /// the id is ours to generate — `command` must then contain `{session}`
     /// (that is claude's `--session-id <uuid>`).
@@ -212,7 +219,7 @@ pub struct Settings {
     pub schema_version: u32,
 }
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 
 /// A model that reads its way around the repository before answering takes far
 /// longer than one that only reads the hunk, so the ceiling that was generous
@@ -227,6 +234,7 @@ impl Default for Settings {
                 ModelConfig {
                     name: "claude".into(),
                     command: CLAUDE_CMD.into(),
+                    fix_command: CLAUDE_FIX.into(),
                     coauthor: "Claude <noreply@anthropic.com>".into(),
                     enabled: true,
                     model: CLAUDE_MODEL.into(),
@@ -234,6 +242,7 @@ impl Default for Settings {
                     effort: CLAUDE_EFFORT.into(),
                     effort_flag: "--effort".into(),
                     resume_command: CLAUDE_RESUME.into(),
+                    fix_resume_command: CLAUDE_FIX_RESUME.into(),
                     session_key: String::new(),
                     // Claude's CLI prices its own calls, so these stay unset;
                     // they exist for a model whose CLI only counts tokens.
@@ -243,6 +252,7 @@ impl Default for Settings {
                 ModelConfig {
                     name: "codex".into(),
                     command: CODEX_CMD.into(),
+                    fix_command: CODEX_FIX.into(),
                     coauthor: "Codex <codex@openai.com>".into(),
                     enabled: true,
                     model: CODEX_MODEL.into(),
@@ -250,6 +260,7 @@ impl Default for Settings {
                     effort: CODEX_EFFORT.into(),
                     effort_flag: "-c".into(),
                     resume_command: CODEX_RESUME.into(),
+                    fix_resume_command: CODEX_FIX_RESUME.into(),
                     session_key: "thread_id".into(),
                     price_in: 0.0,
                     price_out: 0.0,
@@ -259,6 +270,7 @@ impl Default for Settings {
                 ModelConfig {
                     name: "agy".into(),
                     command: AGY_CMD.into(),
+                    fix_command: AGY_FIX.into(),
                     // Google does not publish a GitHub co-author identity for
                     // Antigravity. The old antigravity@google.com placeholder
                     // is associated with an unrelated GitHub user, so rely on
@@ -272,6 +284,7 @@ impl Default for Settings {
                     effort: String::new(),
                     effort_flag: "--effort".into(),
                     resume_command: AGY_RESUME.into(),
+                    fix_resume_command: AGY_FIX_RESUME.into(),
                     session_key: "conversation_id".into(),
                     price_in: 0.0,
                     price_out: 0.0,
@@ -337,13 +350,28 @@ const CLAUDE_CMD: &str = "claude -p --verbose --output-format stream-json \
 const CLAUDE_RESUME: &str = "claude -p --verbose --output-format stream-json \
                              --resume {session} \
                              --tools Read,Grep,Glob --allowed-tools Read,Grep,Glob";
+const CLAUDE_FIX: &str = "claude -p --verbose --output-format stream-json \
+                          --session-id {session} \
+                          --tools Read,Grep,Glob,Edit,Write,Bash \
+                          --allowed-tools Read,Grep,Glob,Edit,Write,Bash";
+const CLAUDE_FIX_RESUME: &str = "claude -p --verbose --output-format stream-json \
+                                 --resume {session} \
+                                 --tools Read,Grep,Glob,Edit,Write,Bash \
+                                 --allowed-tools Read,Grep,Glob,Edit,Write,Bash";
 const CODEX_CMD: &str = "codex exec --skip-git-repo-check --json --sandbox read-only";
 const CODEX_RESUME: &str =
     "codex exec --skip-git-repo-check --json --sandbox read-only resume {session} -";
+const CODEX_FIX: &str = "codex exec --skip-git-repo-check --json --sandbox workspace-write";
+const CODEX_FIX_RESUME: &str =
+    "codex exec --skip-git-repo-check --json --sandbox workspace-write resume {session} -";
 const AGY_CMD: &str = "agy --gemini_dir={cli_home} -p {prompt} --output-format json \
                        --mode plan --add-dir {repo}";
 const AGY_RESUME: &str = "agy --gemini_dir={cli_home} -p {prompt} --output-format json \
                           --mode plan --add-dir {repo} --conversation {session}";
+const AGY_FIX: &str = "agy --gemini_dir={cli_home} -p {prompt} --output-format json \
+                       --add-dir {repo}";
+const AGY_FIX_RESUME: &str = "agy --gemini_dir={cli_home} -p {prompt} --output-format json \
+                              --add-dir {repo} --conversation {session}";
 
 // Start small and cheap: a first-pass comment reviewer runs on every hunk, and
 // the cheapest tier of each family handles "does this comment restate the
@@ -372,20 +400,34 @@ const SESSION_WIRING: &[(&str, &str, &str)] = &[
 /// Command templates that shipped in earlier versions, mapped to the current
 /// one. Applied on load to both the opening and the resume template, so an
 /// existing install picks up fixes and repository access automatically.
+const FIX_WIRING: &[(&str, &str, &str)] = &[
+    (CLAUDE_CMD, CLAUDE_FIX, CLAUDE_FIX_RESUME),
+    (CODEX_CMD, CODEX_FIX, CODEX_FIX_RESUME),
+    (AGY_CMD, AGY_FIX, AGY_FIX_RESUME),
+];
+
 const COMMAND_FIXUPS: &[(&str, &str)] = &[
     ("codex exec {prompt}", CODEX_CMD),
     ("codex exec --skip-git-repo-check", CODEX_CMD),
-    ("claude -p {prompt}", CLAUDE_CMD),
-    ("claude -p", CLAUDE_CMD),
-    ("agy -p {prompt}", AGY_CMD),
-    ("agy --print -", AGY_CMD),
-    ("claude -p --session-id {session}", CLAUDE_CMD),
-    ("claude -p --resume {session}", CLAUDE_RESUME),
     ("codex exec --skip-git-repo-check --json", CODEX_CMD),
     (
         "codex exec --skip-git-repo-check --json resume {session} -",
         CODEX_RESUME,
     ),
+    ("claude -p {prompt}", CLAUDE_CMD),
+    ("claude -p", CLAUDE_CMD),
+    ("claude -p --session-id {session}", CLAUDE_CMD),
+    ("claude -p --resume {session}", CLAUDE_RESUME),
+    (
+        "claude -p --session-id {session} --tools Read,Grep,Glob --allowed-tools Read,Grep,Glob",
+        CLAUDE_CMD,
+    ),
+    (
+        "claude -p --resume {session} --tools Read,Grep,Glob --allowed-tools Read,Grep,Glob",
+        CLAUDE_RESUME,
+    ),
+    ("agy -p {prompt}", AGY_CMD),
+    ("agy --print -", AGY_CMD),
     ("agy -p {prompt} --output-format json", AGY_CMD),
     (
         "agy -p {prompt} --output-format json --conversation {session}",
@@ -413,67 +455,69 @@ impl Settings {
         settings
     }
 
-    /// Repair known-broken command templates. Only exact matches against a
-    /// shipped default are touched — a template the user has edited is theirs.
+    /// Repair only exact shipped templates; user-authored commands remain
+    /// untouched. New writable fix templates are filled for known reviewers.
     fn migrate(&mut self) -> bool {
         let mut changed = false;
-        // Each step is gated on the version it was introduced at, so an install
-        // that has already taken one is not walked through it twice.
         let fresh_fields = self.schema_version < 1;
         let repo_access = self.schema_version < 2;
-        for m in &mut self.models {
-            // Both templates, not just the opening one: a follow-up that
-            // resumed without repo access would answer from a different vantage
-            // point than the turn it is continuing.
-            for template in [&mut m.command, &mut m.resume_command] {
+        for model in &mut self.models {
+            for template in [&mut model.command, &mut model.resume_command] {
                 if let Some((_, fixed)) = COMMAND_FIXUPS
                     .iter()
-                    .find(|(broken, _)| template.trim() == *broken)
+                    .find(|(old, _)| template.trim() == *old)
                 {
                     *template = (*fixed).to_string();
                     changed = true;
                 }
             }
-            if m.model_flag.trim().is_empty() {
-                m.model_flag = default_model_flag();
+            if model.model_flag.trim().is_empty() {
+                model.model_flag = default_model_flag();
                 changed = true;
             }
-            if m.effort_flag.trim().is_empty() {
-                m.effort_flag = default_effort_flag();
+            if model.effort_flag.trim().is_empty() {
+                model.effort_flag = default_effort_flag();
                 changed = true;
             }
-            // Give a recognised command its starting model/effort, but only
-            // on the one pass that upgrades the row — after that an empty
-            // model means the user chose the CLI default, and we leave it be.
             if fresh_fields {
-                if let Some((_, model, effort, effort_flag)) = STARTING_TIER
+                if let Some((_, tier, effort, effort_flag)) = STARTING_TIER
                     .iter()
-                    .find(|(cmd, ..)| m.command.trim() == *cmd)
+                    .find(|(command, ..)| model.command.trim() == *command)
                 {
-                    if m.model.trim().is_empty() {
-                        m.model = (*model).to_string();
+                    if model.model.trim().is_empty() {
+                        model.model = (*tier).to_string();
                     }
-                    if m.effort.trim().is_empty() {
-                        m.effort = (*effort).to_string();
-                        m.effort_flag = (*effort_flag).to_string();
+                    if model.effort.trim().is_empty() {
+                        model.effort = (*effort).to_string();
+                        model.effort_flag = (*effort_flag).to_string();
                     }
                     changed = true;
                 }
             }
-            // Fill in session wiring for a recognised command that predates it.
-            if m.resume_command.trim().is_empty() {
+            if model.resume_command.trim().is_empty() {
                 if let Some((_, resume, key)) = SESSION_WIRING
                     .iter()
-                    .find(|(cmd, _, _)| m.command.trim() == *cmd)
+                    .find(|(command, _, _)| model.command.trim() == *command)
                 {
-                    m.resume_command = (*resume).to_string();
-                    m.session_key = (*key).to_string();
+                    model.resume_command = (*resume).to_string();
+                    model.session_key = (*key).to_string();
+                    changed = true;
+                }
+            }
+            if let Some((_, fix, fix_resume)) = FIX_WIRING
+                .iter()
+                .find(|(command, _, _)| model.command.trim() == *command)
+            {
+                if model.fix_command.trim().is_empty() {
+                    model.fix_command = (*fix).to_string();
+                    changed = true;
+                }
+                if model.fix_resume_command.trim().is_empty() {
+                    model.fix_resume_command = (*fix_resume).to_string();
                     changed = true;
                 }
             }
         }
-        // Only a timeout still sitting on the old default is raised; one the
-        // user has typed in is their answer to the same question.
         if repo_access && self.model_timeout_secs == PRE_BROWSE_TIMEOUT_SECS {
             self.model_timeout_secs = DEFAULT_TIMEOUT_SECS;
             changed = true;
@@ -558,6 +602,7 @@ mod tests {
                 ModelConfig {
                     name: "codex".into(),
                     command: "codex exec {prompt}".into(),
+                    fix_command: String::new(),
                     coauthor: String::new(),
                     enabled: true,
                     model: String::new(),
@@ -565,6 +610,7 @@ mod tests {
                     effort: String::new(),
                     effort_flag: String::new(),
                     resume_command: String::new(),
+                    fix_resume_command: String::new(),
                     session_key: String::new(),
                     price_in: 0.0,
                     price_out: 0.0,
@@ -572,6 +618,7 @@ mod tests {
                 ModelConfig {
                     name: "mine".into(),
                     command: "mycli --weird {prompt}".into(),
+                    fix_command: String::new(),
                     coauthor: String::new(),
                     enabled: true,
                     model: String::new(),
@@ -579,6 +626,7 @@ mod tests {
                     effort: String::new(),
                     effort_flag: "-e".into(),
                     resume_command: String::new(),
+                    fix_resume_command: String::new(),
                     session_key: String::new(),
                     price_in: 0.0,
                     price_out: 0.0,
@@ -614,6 +662,7 @@ mod tests {
             models: vec![ModelConfig {
                 name: "claude".into(),
                 command: "claude -p --session-id {session}".into(),
+                fix_command: String::new(),
                 coauthor: String::new(),
                 enabled: true,
                 model: "haiku".into(),
@@ -621,6 +670,7 @@ mod tests {
                 effort: "low".into(),
                 effort_flag: "--effort".into(),
                 resume_command: "claude -p --resume {session}".into(),
+                fix_resume_command: String::new(),
                 session_key: String::new(),
                 price_in: 0.0,
                 price_out: 0.0,
@@ -701,6 +751,54 @@ mod tests {
                 !model_config.session_key.is_empty() || model_config.command.contains("{session}"),
                 "{} can neither report nor accept a session id",
                 model_config.name
+            );
+        }
+    }
+
+    #[test]
+    fn migrations_restore_read_access_and_add_separate_writable_fix_commands() {
+        let mut settings = Settings::default();
+        settings.schema_version = 1;
+        settings.model_timeout_secs = 120;
+        let codex = &mut settings.models[1];
+        codex.command = "codex exec --skip-git-repo-check --json".into();
+        codex.resume_command = "codex exec --skip-git-repo-check --json resume {session} -".into();
+        codex.fix_command.clear();
+        codex.fix_resume_command.clear();
+
+        assert!(settings.migrate());
+        let codex = &settings.models[1];
+        assert!(codex.command.contains("--sandbox read-only"));
+        assert!(codex.resume_command.contains("--sandbox read-only"));
+        assert!(codex.fix_command.contains("--sandbox workspace-write"));
+        assert!(codex
+            .fix_resume_command
+            .contains("--sandbox workspace-write"));
+        assert_eq!(settings.model_timeout_secs, DEFAULT_TIMEOUT_SECS);
+        assert_eq!(settings.schema_version, SCHEMA_VERSION);
+        assert!(
+            !settings.migrate(),
+            "a completed migration must be idempotent"
+        );
+    }
+
+    #[test]
+    fn every_default_model_has_a_distinct_writable_fix_path() {
+        for model in Settings::default().models {
+            assert!(
+                !model.fix_command.trim().is_empty(),
+                "{} has no fix command",
+                model.name
+            );
+            assert!(
+                !model.fix_resume_command.trim().is_empty(),
+                "{} has no fix resume command",
+                model.name
+            );
+            assert_ne!(
+                model.command, model.fix_command,
+                "{} reuses its review command",
+                model.name
             );
         }
     }
