@@ -24,6 +24,7 @@ mod testkit;
 mod triage;
 mod ui;
 mod units;
+mod worktree;
 
 use std::path::PathBuf;
 
