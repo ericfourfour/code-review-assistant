@@ -23,6 +23,56 @@ pub struct DiffFile {
     pub hunks: Vec<Hunk>,
 }
 
+/// Decode the C-style quoting Git applies to paths containing non-ASCII or
+/// otherwise special bytes. Diff headers are line-oriented, so quoted paths
+/// are the only reliable way for Git to carry those bytes here.
+fn git_path(raw: &str) -> String {
+    let raw = raw.trim();
+    let Some(inner) = raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')) else {
+        return raw.to_string();
+    };
+    let bytes = inner.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' {
+            decoded.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if i >= bytes.len() {
+            decoded.push(b'\\');
+            break;
+        }
+        match bytes[i] {
+            b'a' => decoded.push(0x07),
+            b'b' => decoded.push(0x08),
+            b't' => decoded.push(b'\t'),
+            b'n' => decoded.push(b'\n'),
+            b'v' => decoded.push(0x0b),
+            b'f' => decoded.push(0x0c),
+            b'r' => decoded.push(b'\r'),
+            b'\\' => decoded.push(b'\\'),
+            b'"' => decoded.push(b'"'),
+            b'0'..=b'7' => {
+                let mut value = 0u8;
+                let mut digits = 0;
+                while i < bytes.len() && digits < 3 && matches!(bytes[i], b'0'..=b'7') {
+                    value = value.wrapping_mul(8).wrapping_add(bytes[i] - b'0');
+                    i += 1;
+                    digits += 1;
+                }
+                decoded.push(value);
+                continue;
+            }
+            other => decoded.push(other),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
 pub fn parse(diff: &str) -> Vec<DiffFile> {
     let mut files: Vec<DiffFile> = Vec::new();
     let mut cur_file: Option<DiffFile> = None;
@@ -46,11 +96,11 @@ pub fn parse(diff: &str) -> Vec<DiffFile> {
             }
             cur_file = None;
         } else if let Some(rest) = line.strip_prefix("+++ ") {
-            let path = rest.trim();
+            let path = git_path(rest);
             if path == "/dev/null" {
                 cur_file = None;
             } else {
-                let path = path.strip_prefix("b/").unwrap_or(path);
+                let path = path.strip_prefix("b/").unwrap_or(&path);
                 cur_file = Some(DiffFile {
                     path: path.to_string(),
                     hunks: Vec::new(),
@@ -176,5 +226,20 @@ diff --git a/gone.rs b/gone.rs
 -fn f() {}
 ";
         assert!(parse(diff).is_empty());
+    }
+
+    #[test]
+    fn decodes_git_quoted_paths_before_extension_matching() {
+        let diff = "\
+diff --git \"a/src/\\303\\251.rs\" \"b/src/\\303\\251.rs\"
+--- \"a/src/\\303\\251.rs\"
++++ \"b/src/\\303\\251.rs\"
+@@ -1 +1 @@
+-// old
++// new
+";
+        let files = parse(diff);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "src/é.rs");
     }
 }

@@ -127,8 +127,7 @@ impl CraApp {
         ui.columns(n_slots, |cols| {
             for (i, ui) in cols.iter_mut().enumerate() {
                 let name = self
-                    .settings
-                    .models
+                    .candidate_models
                     .get(i)
                     .map(|m| m.name.clone())
                     .unwrap_or_else(|| format!("model {i}"));

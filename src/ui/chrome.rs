@@ -190,7 +190,7 @@ pub fn side_panel(app: &mut CraApp, ctx: &egui::Context) {
             if app.screen == Screen::Review {
                 ui.add_space(6.0);
                 theme::section_title(ui, "MODELS");
-                for (i, slot) in app.settings.models.iter().enumerate() {
+                for (i, slot) in app.candidate_models.iter().enumerate() {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("●").color(theme::model_color(i)).monospace());
                         ui.label(RichText::new(&slot.name).monospace().small());

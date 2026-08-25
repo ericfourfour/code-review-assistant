@@ -2,7 +2,7 @@
 //! on background threads and parse their JSON verdicts.
 
 use serde::Deserialize;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
@@ -138,11 +138,26 @@ fn run_model(slot: &ModelSlot, prompt: &str, timeout: Duration) -> Result<Sugges
         }
     }
 
+    // Drain both pipes while the child runs. Waiting first can deadlock once a
+    // verbose CLI fills either OS pipe buffer and blocks before it can exit.
+    let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
+    let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
+    let stdout_thread = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut bytes);
+        bytes
+    });
+    let stderr_thread = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut bytes);
+        bytes
+    });
+
     // Poll with a deadline; kill on timeout so a hung CLI can't wedge a slot.
     let deadline = started + timeout;
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => break status,
             Ok(None) => {
                 if Instant::now() > deadline {
                     let _ = child.kill();
@@ -153,11 +168,20 @@ fn run_model(slot: &ModelSlot, prompt: &str, timeout: Duration) -> Result<Sugges
             }
             Err(e) => return Err(format!("wait: {e}")),
         }
-    }
-    let out = child.wait_with_output().map_err(|e| e.to_string())?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    };
+    let stdout_bytes = stdout_thread
+        .join()
+        .map_err(|_| "stdout reader panicked".to_string())?;
+    let stderr_bytes = stderr_thread
+        .join()
+        .map_err(|_| "stderr reader panicked".to_string())?;
+    let stdout = String::from_utf8_lossy(&stdout_bytes);
+    let stderr = String::from_utf8_lossy(&stderr_bytes);
     let latency_ms = started.elapsed().as_millis() as i64;
+
+    if !status.success() && stdout.trim().is_empty() && stderr.trim().is_empty() {
+        return Err(format!("model exited with {status}"));
+    }
 
     let raw = extract_json(&stdout)
         .or_else(|| extract_json(&stderr))

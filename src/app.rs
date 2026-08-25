@@ -8,7 +8,7 @@ use crate::db::Db;
 use crate::gitio::{self, BranchInfo, PrInfo};
 use crate::models::{self, Action, CandidateMsg, Suggestion};
 use crate::review::{self, Choice, RefKind, ReviewFile, ReviewPlan};
-use crate::settings::Settings;
+use crate::settings::{ModelSlot, Settings};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -75,6 +75,9 @@ pub struct CraApp {
     // review screen
     pub review_seq: u64,
     pub candidates: Vec<CandidateState>,
+    /// Snapshot of the models that own `candidates`. Settings can be edited
+    /// mid-review, but a result's name and co-author must never change slots.
+    pub candidate_models: Vec<ModelSlot>,
     pub chosen: Option<Choice>,
     pub editor: String,
     pub candidate_baseline: Option<String>,
@@ -126,6 +129,7 @@ impl CraApp {
             file_sel: 0,
             review_seq: 0,
             candidates: Vec::new(),
+            candidate_models: Vec::new(),
             chosen: None,
             editor: String::new(),
             candidate_baseline: None,
@@ -359,9 +363,9 @@ impl CraApp {
 
         let prompt = comments::build_prompt(&unit);
         let timeout = self.settings.model_timeout_secs;
+        self.candidate_models = self.settings.models.clone();
         self.candidates = self
-            .settings
-            .models
+            .candidate_models
             .iter()
             .map(|m| {
                 if m.enabled {
@@ -410,7 +414,11 @@ impl CraApp {
         self.editor = text.clone();
         self.candidate_baseline = Some(text);
         self.chosen = Some(Choice::Candidate(slot_idx));
-        let name = self.settings.models[slot_idx].name.clone();
+        let name = self
+            .candidate_models
+            .get(slot_idx)
+            .map(|m| m.name.clone())
+            .unwrap_or_else(|| format!("model {slot_idx}"));
         self.note("choice", &format!("picked {} ({})", name, s.action.label()));
     }
 
@@ -441,8 +449,7 @@ impl CraApp {
         let action = review::final_action(&self.editor, &self.original_display);
         let chosen_model = match &self.chosen {
             Some(Choice::Candidate(i)) => self
-                .settings
-                .models
+                .candidate_models
                 .get(*i)
                 .map(|m| (m.name.clone(), m.coauthor.clone())),
             _ => None,
@@ -482,6 +489,7 @@ impl CraApp {
         // Commit if asked and there is something to commit.
         let mut sha = None;
         let mut committed = false;
+        let mut commit_error = None;
         if commit {
             if action == Action::Keep {
                 self.note("commit", "kept original — nothing to commit");
@@ -495,9 +503,11 @@ impl CraApp {
                         sha = Some(s);
                     }
                     Err(e) => {
-                        self.review_error = Some(e.clone());
-                        self.note("error", &e);
-                        return;
+                        // `git add` may already have succeeded, and the edit is
+                        // definitely on disk. Record and advance it as an
+                        // uncommitted decision so retrying never reapplies the
+                        // unit at stale line numbers.
+                        commit_error = Some(e);
                     }
                 }
             }
@@ -542,6 +552,10 @@ impl CraApp {
                 self.screen = Screen::Summary;
                 self.note("session", "review complete");
             }
+        }
+        if let Some(e) = commit_error {
+            self.review_error = Some(e.clone());
+            self.note("error", &format!("edit saved but commit failed: {e}"));
         }
     }
 
