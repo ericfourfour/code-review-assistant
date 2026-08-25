@@ -10,10 +10,12 @@ use crate::gitio::{self, BranchInfo, PrInfo};
 use crate::models::{self, Action, CandidateMsg, Evidence, Suggestion, Turn};
 use crate::notes::Note;
 use crate::procs::{Owner, ProcHandle, ProcTable, StopReceipt};
+use crate::publish;
 use crate::review::{self, Choice, RefKind, ReviewFile, ReviewPlan};
 use crate::settings::{ModelConfig, Settings};
 use crate::triage;
 use crate::units::{self, ReviewUnit};
+use crate::worktree;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Screen {
@@ -274,6 +276,46 @@ pub enum Msg {
     WholeBranchReview(WholeBranchReviewMsg),
     Fix(models::FixMsg),
     Repo(RepoMsg),
+    Publish(Result<publish::Outcome, String>),
+}
+
+/// How far the review's commits have got towards the remote.
+pub enum PublishState {
+    Idle,
+    /// A push or a `gh pr create` is in flight. Only one at a time: both
+    /// routes move the same commits, and a second one launched over the first
+    /// would be racing it for the branch.
+    Running(&'static str),
+    Done(publish::Outcome),
+    Failed(String),
+}
+
+impl PublishState {
+    pub fn running(&self) -> bool {
+        matches!(self, PublishState::Running(_))
+    }
+}
+
+/// The stacked pull request's fields, as the reviewer edits them. Filled in
+/// from the plan the first time the summary screen sees it, and left alone
+/// afterwards so an edit survives a repaint, a failed attempt and a trip to
+/// another screen and back.
+#[derive(Default)]
+pub struct StackForm {
+    pub branch: String,
+    /// The branch the pull request targets. Prefilled from [`CraApp::stack_base`]
+    /// and editable, because what a stack should sit on is not always
+    /// derivable — a branch rescued off a detached review has no upstream to
+    /// name the thing it was built from.
+    pub base: String,
+    pub title: String,
+    pub body: String,
+    /// Put the reviewed branch back where the remote has it once the fixes
+    /// are safely on their own branch. Defaulted on when it is safe.
+    pub restore: bool,
+    /// The session the fields were filled in for, so a different review gets
+    /// its own defaults rather than the last one's.
+    filled_for: Option<i64>,
 }
 
 /// Streamed repository discovery: each repository as it is found, then one
@@ -392,6 +434,16 @@ pub struct CraApp {
     pub prs_error: Option<String>,
     pub ref_sel: usize,
     pub ref_error: Option<String>,
+    /// The isolated worktree the current review runs in, when it has one.
+    /// `None` means the reviewer's own checkout, which is where a working-tree
+    /// or staged review has to happen and where a branch already checked out
+    /// there is reviewed too. Repository *identity* is never this: the
+    /// database keys on [`RepoCtx::path`], so decisions and notes made in a
+    /// worktree belong to the repository that owns it.
+    pub review_work: Option<String>,
+    /// Something the reviewer should know about a checkout that still
+    /// worked — a detached HEAD, say. Not an error: the plan is built.
+    pub ref_note: Option<String>,
 
     // file picker
     pub plan: Option<ReviewPlan>,
@@ -498,6 +550,16 @@ pub struct CraApp {
     /// Repositories with review history, for the page's scope picker.
     pub eval_repos: Vec<String>,
 
+    // publishing a finished review
+    /// Where the review's commits stand against the remote, read when the
+    /// summary screen is opened and again after each publish. `None` means
+    /// not read yet — a review with nothing to publish still gets a state.
+    pub delivery: Option<gitio::Delivery>,
+    pub publish: PublishState,
+    /// The stacked pull request as the reviewer has filled it in so far, kept
+    /// across repaints and across a failed attempt.
+    pub stack: StackForm,
+
     pub tx: Sender<Msg>,
     pub rx: Receiver<Msg>,
 }
@@ -548,6 +610,8 @@ impl CraApp {
             prs_error: None,
             ref_sel: 0,
             ref_error: None,
+            ref_note: None,
+            review_work: None,
             plan: None,
             file_sel: 0,
             review_seq: 0,
@@ -594,6 +658,9 @@ impl CraApp {
             fix_convo: Vec::new(),
             fix_session: None,
             fix_follow_up: String::new(),
+            delivery: None,
+            publish: PublishState::Idle,
+            stack: StackForm::default(),
             tx,
             rx,
         }
@@ -791,6 +858,8 @@ impl CraApp {
             path: path.clone(),
             default_branch,
         });
+        // Another repository's review worktree is nothing to this one.
+        self.work_in_repo();
         self.note("repo", &format!("selected {path}"));
         self.load_refs();
         self.ref_sel = 0;
@@ -821,26 +890,56 @@ impl CraApp {
 
     // -- ref selection → plan ----------------------------------------------
 
+    /// Where the code under review actually sits — see [`CraApp::review_work`].
+    /// Every git command, file read, edit and model CLI runs here; only the
+    /// database is told the repository's own path.
+    pub fn work_dir(&self) -> Option<String> {
+        let repo = self.repo.as_ref()?;
+        Some(
+            self.review_work
+                .clone()
+                .unwrap_or_else(|| repo.path.clone()),
+        )
+    }
+
+    fn work_dir_or_default(&self) -> String {
+        self.work_dir().unwrap_or_default()
+    }
+
+    /// Bring the review back to the reviewer's own checkout. What is in the
+    /// worktree stays there; nothing here is reviewing it any more.
+    fn work_in_repo(&mut self) {
+        self.review_work = None;
+    }
+
     pub fn select_branch(&mut self, branch: &str) {
         let Some(repo) = &self.repo else { return };
         let path = repo.path.clone();
         let default = repo.default_branch.clone();
         let cur = gitio::current_branch(&path).unwrap_or_default();
-        if cur != branch {
-            if gitio::is_dirty(&path) {
-                self.ref_error = Some(format!(
-                    "working tree has uncommitted changes; commit/stash before switching to {branch}"
-                ));
-                return;
-            }
-            if let Err(e) = gitio::checkout(&path, branch) {
-                self.ref_error = Some(e);
-                return;
+        self.ref_note = None;
+        // Already standing on it: review it where it is, so a fix commit lands
+        // on the branch and nothing about the checkout changes. Any other
+        // branch gets a worktree of its own rather than moving a checkout the
+        // reviewer is in the middle of using.
+        if cur == branch {
+            self.work_in_repo();
+        } else {
+            match worktree::for_branch(&path, branch) {
+                Ok(ready) => {
+                    self.ref_note = Some(ready.describe(branch));
+                    self.review_work = Some(ready.path);
+                }
+                Err(e) => {
+                    self.ref_error = Some(e);
+                    return;
+                }
             }
         }
+        let work = self.work_dir_or_default();
         let base = if branch != default {
             default
-        } else if gitio::is_dirty(&path) {
+        } else if gitio::is_dirty(&work) {
             // Reviewing the default branch itself: fall back to the working-tree
             // diff when there are uncommitted changes, else review the whole
             // history so a brand-new repo still has something to show.
@@ -852,6 +951,8 @@ impl CraApp {
     }
 
     pub fn select_working_tree(&mut self) {
+        // Uncommitted work only exists in the checkout the reviewer is using.
+        self.work_in_repo();
         let name = self
             .repo
             .as_ref()
@@ -868,6 +969,7 @@ impl CraApp {
     /// Review only what `git add` has staged: the commit being prepared,
     /// judged without whatever unstaged noise sits around it.
     pub fn select_staged(&mut self) {
+        self.work_in_repo();
         let name = self
             .repo
             .as_ref()
@@ -879,39 +981,55 @@ impl CraApp {
     pub fn select_pr(&mut self, pr: &PrInfo) {
         let Some(repo) = &self.repo else { return };
         let path = repo.path.clone();
-        if gitio::is_dirty(&path) {
-            self.ref_error = Some(
-                "working tree has uncommitted changes; commit/stash before checking out a PR"
-                    .into(),
-            );
-            return;
-        }
         let gh = self.settings.gh_path.clone();
-        if let Err(e) = gitio::pr_checkout(&path, &gh, pr.number) {
-            self.ref_error = Some(e);
-            return;
+        self.ref_note = None;
+        // Someone else's branch is never worth moving the reviewer's checkout
+        // for — unless they are already on it, in which case there is nothing
+        // to move and a fix can be committed straight onto the PR.
+        if gitio::current_branch(&path).is_ok_and(|cur| cur == pr.head_ref) {
+            self.work_in_repo();
+        } else {
+            match worktree::for_pr(&path, &gh, pr.number) {
+                Ok(ready) => {
+                    self.ref_note = Some(ready.describe(&format!("PR #{}", pr.number)));
+                    self.review_work = Some(ready.path);
+                }
+                Err(e) => {
+                    self.ref_error = Some(e);
+                    return;
+                }
+            }
         }
-        self.build_plan(
-            RefKind::Pr(pr.number),
-            pr.head_ref.clone(),
-            pr.base_ref.clone(),
-        );
+        // The base has to be the one on the server, not the local branch of
+        // the same name — see [`gitio::pr_base_ref`].
+        let base = gitio::pr_base_ref(&self.work_dir_or_default(), &pr.base_ref);
+        self.build_plan(RefKind::Pr(pr.number), pr.head_ref.clone(), base);
     }
 
     fn build_plan(&mut self, kind: RefKind, ref_name: String, base: String) {
         let Some(repo) = &self.repo else { return };
+        // Two different questions: `work` is where the code is, `path` is which
+        // repository it belongs to. A review run in an isolated worktree still
+        // reads and writes its decisions under the repository's own path, so
+        // they survive the worktree and count towards the next review of it.
         let path = repo.path.clone();
-        let diff = match gitio::review_diff(&path, &base, self.settings.context_lines) {
+        let work = self.work_dir_or_default();
+        let diff = match gitio::review_diff(&work, &base, self.settings.context_lines) {
             Ok(d) => d,
             Err(e) => {
                 self.ref_error = Some(e);
                 return;
             }
         };
+        let branch_base = if base.is_empty() {
+            gitio::head_sha(&work).unwrap_or_default()
+        } else {
+            base.clone()
+        };
         let files = crate::diffparse::parse(&diff);
         let (want_comments, want_code) = (self.settings.review_comments, self.settings.review_code);
         let mut extracted = units::assemble(
-            &path,
+            &work,
             &files,
             self.settings.context_lines,
             want_comments,
@@ -930,6 +1048,42 @@ impl CraApp {
             0
         };
         if extracted.is_empty() {
+            // Every unit already judged is a *finished* review, not an error:
+            // the fix commits it made may still be sitting in the worktree
+            // with nowhere to go, and the summary screen is the only place
+            // that can send them. So it opens there, on a plan with no units
+            // and the session those commits were made in — which is what lets
+            // publishing prove the branch is safe to rewind.
+            if skipped > 0 {
+                // By name first, then by the commits themselves — a branch
+                // rescued off a detached review (see [`crate::worktree`])
+                // carries a finished session's work under a name that session
+                // never had. Only the tip is worth asking about: review
+                // commits are the newest things on the branch.
+                let session = self.db.last_session(&path, &ref_name).or_else(|| {
+                    gitio::delivery_state(&work, &ref_name, &base, &[])
+                        .unpushed
+                        .iter()
+                        .take(50)
+                        .find_map(|sha| self.db.session_for_commit(sha))
+                });
+                if let Some(session_id) = session {
+                    self.adopt_plan(ReviewPlan {
+                        session_id,
+                        ref_kind: kind,
+                        ref_name,
+                        base_ref: gitio::base_label(&base).to_string(),
+                        branch_base,
+                        files: Vec::new(),
+                        file_idx: 0,
+                        unit_idx: 0,
+                        decided_total: skipped,
+                        skipped_decided: skipped,
+                    });
+                    self.goto(Screen::Summary);
+                    return;
+                }
+            }
             let what = match (want_comments, want_code) {
                 (true, true) => "units",
                 (true, false) => "comment hunks",
@@ -937,8 +1091,12 @@ impl CraApp {
                 (false, false) => "units — both review kinds are off in settings",
             };
             self.ref_error = Some(if skipped > 0 {
+                // Only reachable with no session on record for the ref — an
+                // older database, or decisions carried over from another name.
                 format!(
-                    "nothing left to review in {} (base: {}) — all {skipped} unit(s) already                      decided. Untick \"skip decided\" in settings to review them again.",
+                    "nothing left to review in {} (base: {}) — all {skipped} unit(s) already \
+                     decided, and no review session on record to deliver. Untick \"skip \
+                     decided\" in settings to review them again.",
                     ref_name,
                     gitio::base_label(&base)
                 )
@@ -958,11 +1116,6 @@ impl CraApp {
         let session_id =
             self.db
                 .new_session(&path, &kind.label(), &ref_name, gitio::base_label(&base));
-        let branch_base = if base.is_empty() {
-            gitio::head_sha(&path).unwrap_or_default()
-        } else {
-            base.clone()
-        };
         let n_comments: usize = extracted
             .iter()
             .map(|(_, u)| u.iter().filter(|u| !u.is_code()).count())
@@ -993,13 +1146,14 @@ impl CraApp {
         self.note(
             "session",
             &format!(
-                "#{session_id} {} — {} unit(s) ({n_comments} comment, {n_code} code{already})                  in {} files",
+                "#{session_id} {} — {} unit(s) ({n_comments} comment, {n_code} code{already}) \
+                 in {} files",
                 ref_name,
                 n_comments + n_code,
                 review_files.len()
             ),
         );
-        self.plan = Some(ReviewPlan {
+        self.adopt_plan(ReviewPlan {
             session_id,
             ref_kind: kind,
             ref_name,
@@ -1011,16 +1165,30 @@ impl CraApp {
             decided_total: 0,
             skipped_decided: skipped,
         });
-        // A new plan invalidates any whole-branch review, running or done — and any
-        // prefetch: its answers were logged under the old session, and a
-        // decision made in this one must not be joined to them.
+        self.goto(Screen::FilePicker);
+    }
+
+    /// Take a freshly built plan, and clear everything the last one owned.
+    ///
+    /// A new plan invalidates any whole-branch review, running or done — and
+    /// any prefetch: its answers were logged under the old session, and a
+    /// decision made in this one must not be joined to them. The publish state
+    /// goes too, so a finished push is not still being reported over a review
+    /// of something else.
+    fn adopt_plan(&mut self, plan: ReviewPlan) {
+        self.plan = Some(plan);
         self.whole_branch_review_seq += 1;
         self.whole_branch_review.clear();
         self.findings.clear();
         self.prefetches.clear();
         self.ref_error = None;
         self.file_sel = 0;
-        self.goto(Screen::FilePicker);
+        self.publish = PublishState::Idle;
+        // Read here rather than leaving it to `goto`: a plan built while the
+        // summary is already on screen — finishing a review, then opening the
+        // same ref again — never moves screens, so `goto` returns early and
+        // the state would stay as the last plan left it.
+        self.refresh_delivery();
     }
 
     // -- review -------------------------------------------------------------
@@ -1043,6 +1211,10 @@ impl CraApp {
     /// much of a model's disagreement is noise rather than error — without it
     /// an agreement score has no scale to be read against.
     pub fn start_recheck(&mut self, ctx: &egui::Context, limit: usize) {
+        // Past decisions span the repository's history, not an isolated
+        // delivery branch, so re-check them in the source checkout.
+        self.work_in_repo();
+        self.ref_note = None;
         let repo_path = self
             .repo
             .as_ref()
@@ -1223,11 +1395,7 @@ impl CraApp {
         let prompt = self.unit_prompt(unit);
         // The CLIs are started here so the paths in the prompt resolve and the
         // rest of the codebase is within reach.
-        let repo_path = self
-            .repo
-            .as_ref()
-            .map(|r| r.path.clone())
-            .unwrap_or_default();
+        let repo_path = self.work_dir_or_default();
         let cli_home = self.cli_home(&repo_path);
         let timeout = self.settings.model_timeout_secs;
         let enabled_models: Vec<_> = self
@@ -1327,11 +1495,7 @@ impl CraApp {
         );
         // A model enabled since the prefetch started was never queried; ask it
         // now, under the adopted sequence, so every enabled model still finishes.
-        let repo_path = self
-            .repo
-            .as_ref()
-            .map(|r| r.path.clone())
-            .unwrap_or_default();
+        let repo_path = self.work_dir_or_default();
         let cli_home = self.cli_home(&repo_path);
         let timeout = self.settings.model_timeout_secs;
         let enabled_models: Vec<_> = self
@@ -1405,11 +1569,7 @@ impl CraApp {
         let seq = self.next_seq();
         let what = format!("{}:{} · prefetch", next.file(), next.start_line());
         let prompt = self.unit_prompt(&next);
-        let repo_path = self
-            .repo
-            .as_ref()
-            .map(|r| r.path.clone())
-            .unwrap_or_default();
+        let repo_path = self.work_dir_or_default();
         let cli_home = self.cli_home(&repo_path);
         let timeout = self.settings.model_timeout_secs;
         let models = self.settings.models.clone();
@@ -1598,11 +1758,7 @@ impl CraApp {
         let follow_up_id =
             self.db
                 .log_follow_up(session_id, &file, start, end, self.unit_round, &message);
-        let repo_path = self
-            .repo
-            .as_ref()
-            .map(|r| r.path.clone())
-            .unwrap_or_default();
+        let repo_path = self.work_dir_or_default();
         let cli_home = self.cli_home(&repo_path);
         let timeout = self.settings.model_timeout_secs;
         let is_code = self.current_unit().map(|u| u.is_code()).unwrap_or(false);
@@ -1861,7 +2017,7 @@ impl CraApp {
         let Some(unit) = self.current_unit() else {
             return;
         };
-        let Some(repo_path) = self.repo.as_ref().map(|r| r.path.clone()) else {
+        let Some(repo_path) = self.work_dir() else {
             return;
         };
 
@@ -2215,7 +2371,7 @@ impl CraApp {
         let Some(stale) = self.stale_unit.take() else {
             return;
         };
-        let Some(repo_path) = self.repo.as_ref().map(|r| r.path.clone()) else {
+        let Some(repo_path) = self.work_dir() else {
             return;
         };
         if stale.lines.is_empty() {
@@ -2296,7 +2452,7 @@ impl CraApp {
             self.note("branch", "a re-check does not compare an active branch");
             return;
         }
-        let Some(repo) = self.repo.as_ref().map(|r| r.path.clone()) else {
+        let Some(repo) = self.work_dir() else {
             return;
         };
         let diff = match gitio::review_diff(&repo, &plan.branch_base, self.settings.context_lines) {
@@ -2437,7 +2593,7 @@ impl CraApp {
         if plan.is_recheck() {
             return None;
         }
-        let repo = self.repo.as_ref().map(|r| r.path.clone())?;
+        let repo = self.work_dir()?;
         let base = gitio::base_from_label(&plan.base_ref);
         let diff = match gitio::review_diff(&repo, &base, self.settings.context_lines) {
             Ok(d) => d,
@@ -2575,6 +2731,204 @@ impl CraApp {
         out
     }
 
+    // -- publishing -----------------------------------------------------------
+
+    /// Read where the review's commits stand against the remote, and fill the
+    /// stacked pull request's fields in the first time this session's summary
+    /// is opened. Run on arriving at the summary screen and again after every
+    /// publish, because both routes move the very thing it is describing.
+    pub fn refresh_delivery(&mut self) {
+        let Some(work) = self.work_dir() else {
+            self.delivery = None;
+            return;
+        };
+        let Some(plan) = self.plan.as_ref() else {
+            self.delivery = None;
+            return;
+        };
+        // A re-check judges history and writes nothing, so it has nothing to
+        // deliver and the section stays off the screen entirely.
+        if plan.is_recheck() {
+            self.delivery = None;
+            return;
+        }
+        let (ref_name, base, session_id) = (
+            plan.ref_name.clone(),
+            plan.base_ref.clone(),
+            plan.session_id,
+        );
+        // The session's own commits, so the state describes the review rather
+        // than whatever this checkout happens to be sitting on.
+        let made = self.db.session_commits(session_id);
+        self.delivery = Some(gitio::delivery_state(&work, &ref_name, &base, &made));
+        self.fill_stack_form(session_id, &ref_name);
+    }
+
+    fn fill_stack_form(&mut self, session_id: i64, ref_name: &str) {
+        if self.stack.filled_for == Some(session_id) {
+            return;
+        }
+        let restore = self.restore_blocker().is_none();
+        self.stack.base = self.stack_base();
+        self.stack.branch = publish::suggested_branch(ref_name);
+        self.stack.title = format!("Review fixes for {ref_name}");
+        self.stack.body = self.stack_body();
+        self.stack.restore = restore;
+        self.stack.filled_for = Some(session_id);
+    }
+
+    /// The pull request body offered to start from: what the review did, in
+    /// the terms the summary screen already reports it in.
+    fn stack_body(&self) -> String {
+        let Some(p) = &self.plan else {
+            return String::new();
+        };
+        let (decided, committed) = self.db.decision_counts(p.session_id);
+        let mut out = format!(
+            "Fixes made while reviewing `{}` against `{}`.\n\n- {decided} unit(s) decided, \
+             {committed} committed\n",
+            p.ref_name, p.base_ref
+        );
+        let open = self.findings.iter().filter(|r| !r.dismissed).count();
+        if open > 0 {
+            out.push_str(&format!(
+                "- {open} open cross-cutting finding(s) from the whole-branch review\n"
+            ));
+        }
+        out.push_str("\nReviewed-with: code-review-assistant\n");
+        out
+    }
+
+    /// Why the reviewed branch cannot be put back where the remote has it, or
+    /// `None` when it can. Wraps the pure check with this session's commits.
+    pub fn restore_blocker(&self) -> Option<String> {
+        let state = self.delivery.as_ref()?;
+        let plan = self.plan.as_ref()?;
+        publish::restore_blocker(
+            state,
+            &plan.ref_name,
+            &self.db.session_commits(plan.session_id),
+        )
+    }
+
+    /// The branch a stacked pull request should target.
+    ///
+    /// The reviewed branch itself, when the remote has it — that is what makes
+    /// the stack a stack, and puts the fixes in front of whoever owns the
+    /// branch. When the remote has never seen it there is nothing to stack on,
+    /// so the pull request targets what the review was run against instead.
+    pub fn stack_base(&self) -> String {
+        let Some(plan) = self.plan.as_ref() else {
+            return String::new();
+        };
+        if self.delivery.as_ref().is_some_and(|d| d.upstream.is_some()) {
+            return plan.ref_name.clone();
+        }
+        let base = plan.base_ref.trim();
+        let fallback = || {
+            self.repo
+                .as_ref()
+                .map(|r| r.default_branch.clone())
+                .unwrap_or_else(|| "main".into())
+        };
+        // The pseudo-bases an uncommitted review runs against name no branch,
+        // and a remote-tracking base is a branch under another name. The
+        // remote is read from the state already in hand rather than from git:
+        // this is called on every repaint of the summary screen.
+        if base.is_empty() || base.starts_with(':') || base == gitio::EMPTY_TREE {
+            return fallback();
+        }
+        let remote = self
+            .delivery
+            .as_ref()
+            .and_then(|d| d.remote.as_deref())
+            .unwrap_or("origin");
+        base.strip_prefix(&format!("{remote}/"))
+            .unwrap_or(base)
+            .to_string()
+    }
+
+    /// Push the review's commits onto the branch that was reviewed.
+    pub fn start_push(&mut self) {
+        self.start_publish(publish::Route::Push);
+    }
+
+    /// Put the review's commits on a branch of their own and open a pull
+    /// request for them against the reviewed branch.
+    pub fn start_stacked_pr(&mut self) {
+        let route = publish::Route::Stack(publish::Stack {
+            branch: self.stack.branch.trim().to_string(),
+            base: self.stack.base.trim().to_string(),
+            title: self.stack.title.clone(),
+            body: self.stack.body.clone(),
+            restore: self.stack.restore,
+        });
+        self.start_publish(route);
+    }
+
+    /// Hand one publish to a worker thread. Pushing and opening a pull request
+    /// both talk to the network, which is slow enough that doing it on the UI
+    /// thread would freeze the window for the duration.
+    fn start_publish(&mut self, route: publish::Route) {
+        if self.publish.running() {
+            return;
+        }
+        let (Some(work), Some(plan)) = (self.work_dir(), self.plan.as_ref()) else {
+            return;
+        };
+        let Some(state) = self.delivery.clone() else {
+            return;
+        };
+        let Some(remote) = state.remote.clone() else {
+            self.publish = PublishState::Failed(
+                "this repository has no remote to publish to — add one with `git remote add`"
+                    .to_string(),
+            );
+            return;
+        };
+        let req = publish::Request {
+            dir: work,
+            gh: self.settings.gh_path.clone(),
+            remote,
+            ref_name: plan.ref_name.clone(),
+            session_commits: self.db.session_commits(plan.session_id),
+            state,
+            route,
+        };
+        let what = match req.route {
+            publish::Route::Push => "pushing",
+            publish::Route::Stack(_) => "opening the pull request",
+        };
+        self.note(
+            "publish",
+            &format!("{what} — {} commit(s)", req.state.ahead()),
+        );
+        self.publish = PublishState::Running(what);
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(Msg::Publish(publish::run(&req)));
+        });
+    }
+
+    fn handle_publish(&mut self, res: Result<publish::Outcome, String>) {
+        match res {
+            Ok(outcome) => {
+                self.note("publish", &outcome.headline);
+                for line in &outcome.detail {
+                    self.note("publish", line);
+                }
+                self.publish = PublishState::Done(outcome);
+            }
+            Err(e) => {
+                self.note("error", &format!("publish: {}", truncate(&e, 200)));
+                self.publish = PublishState::Failed(e);
+            }
+        }
+        // Both routes moved commits; what the screen says about them has to be
+        // re-read rather than left showing the state they were launched from.
+        self.refresh_delivery();
+    }
+
     // -- notes & follow-up ----------------------------------------------------
 
     /// Park the typed note on the current unit. The unit itself still gets
@@ -2703,7 +3057,7 @@ impl CraApp {
             ));
             return;
         }
-        let Some(repo) = self.repo.as_ref().map(|r| r.path.clone()) else {
+        let Some(repo) = self.work_dir() else {
             return;
         };
         if let Some(why) = self.usage_block() {
@@ -2815,7 +3169,7 @@ impl CraApp {
         let Some(session) = self.fix_session.clone() else {
             return;
         };
-        let Some(repo) = self.repo.as_ref().map(|r| r.path.clone()) else {
+        let Some(repo) = self.work_dir() else {
             return;
         };
         let command = model_config
@@ -2946,6 +3300,7 @@ impl CraApp {
                 Msg::Cand(c) => self.handle_candidate(c),
                 Msg::WholeBranchReview(m) => self.handle_whole_branch_review(m),
                 Msg::Fix(m) => self.handle_fix(m),
+                Msg::Publish(res) => self.handle_publish(res),
             }
         }
     }
@@ -3180,6 +3535,11 @@ impl CraApp {
         }
         self.leave_screen();
         self.screen = to;
+        if to == Screen::Summary {
+            // Reading it here, not per frame: it is a handful of git commands,
+            // and the summary repaints on every pointer move.
+            self.refresh_delivery();
+        }
     }
 
     /// Stop the current screen's model calls and turn them into paused ones.
@@ -3559,11 +3919,7 @@ impl CraApp {
         session: Option<String>,
         what: &str,
     ) {
-        let repo_path = self
-            .repo
-            .as_ref()
-            .map(|r| r.path.clone())
-            .unwrap_or_default();
+        let repo_path = self.work_dir_or_default();
         let cli_home = self.cli_home(&repo_path);
         let timeout = self.settings.model_timeout_secs;
         if let Some(convo) = self.convos.get_mut(idx) {
@@ -3609,9 +3965,7 @@ impl CraApp {
                 Some("that turn left no session id behind — start a new session instead".into());
             return;
         };
-        let Some(repo) = self.repo.as_ref().map(|r| r.path.clone()) else {
-            return;
-        };
+        let Some(repo) = self.work_dir() else { return };
         if let Some(why) = self.usage_block() {
             self.fix_error = Some(why);
             return;
@@ -3896,6 +4250,7 @@ impl eframe::App for CraApp {
             || self.cloning.is_some()
             || self.whole_branch_review_running()
             || self.fix_running
+            || self.publish.running()
         {
             ctx.request_repaint_after(std::time::Duration::from_millis(150));
         }
@@ -5936,8 +6291,14 @@ mod state_tests {
         assert_eq!(plan.skipped_decided, 0);
     }
 
+    /// A plan with nothing left normally reopens the finished session on the
+    /// summary — but that needs a session to reopen. Decisions are recorded
+    /// per repository, so they can outlive the ref name they were made under
+    /// (an older database, a branch since renamed). Then there is genuinely
+    /// nothing to reopen, and the message has to carry the explanation on its
+    /// own rather than leaving an empty plan looking like a lost extractor.
     #[test]
-    fn a_plan_with_nothing_left_says_so_rather_than_looking_empty() {
+    fn a_plan_with_nothing_left_and_no_session_to_reopen_says_so() {
         let mut h = Harness::new("alldecided");
         replan(&mut h);
         // One review through the whole plan: save advances to the next unit.
@@ -5947,10 +6308,17 @@ mod state_tests {
         h.app.save_and_continue(&ctx, false);
         assert_eq!(h.app.plan.as_ref().unwrap().decided_total, 2);
 
-        replan(&mut h);
+        // The same diff under a name no session was ever opened for.
+        h.app.settings.review_code = false;
+        h.app
+            .build_plan(RefKind::Branch, "renamed-since".into(), "main".into());
         let err = h.app.ref_error.as_deref().unwrap_or_default();
         assert!(err.contains("already"), "unhelpful message: {err}");
         assert!(err.contains('2'), "the message should count them: {err}");
+        assert!(
+            err.contains("no review session"),
+            "and say why it stopped here: {err}"
+        );
     }
 
     #[test]
@@ -6312,6 +6680,86 @@ mod state_tests {
 
     // -- triage order and out-of-order edits --------------------------------
 
+    /// Reviewing a branch the reviewer is not standing on must not move their
+    /// checkout: it runs in a worktree of its own, uncommitted work and all,
+    /// and the decisions it records still belong to the repository.
+    #[test]
+    fn reviewing_another_branch_leaves_the_reviewers_checkout_alone() {
+        let _root = crate::testkit::WorktreeRoot::new("wt-app");
+        let dir = TempDir::new("wt-branch");
+        let db = Db::open_at(&dir.path().join("cra.db")).expect("open test db");
+        let mut app = CraApp::with_db(db);
+        app.settings.models.clear();
+
+        let repo = TempRepo::new("wt-branch");
+        repo.write(
+            "src/lib.rs",
+            "fn safe() {
+}
+",
+        );
+        repo.commit("base");
+        repo.git(&["checkout", "-b", "feature"]);
+        repo.write(
+            "src/lib.rs",
+            "fn safe() {
+    // gentle note
+}
+",
+        );
+        repo.commit("note");
+        repo.git(&["checkout", "main"]);
+        // Work in progress that the old in-place checkout refused to move past.
+        repo.write(
+            "src/scratch.rs",
+            "fn half_written() {}
+",
+        );
+
+        app.repo = Some(RepoCtx {
+            path: repo.path(),
+            name: "test-repo".into(),
+            default_branch: "main".into(),
+        });
+        app.select_branch("feature");
+
+        assert!(app.ref_error.is_none(), "{:?}", app.ref_error);
+        assert!(app.plan.is_some(), "the branch was reviewed all the same");
+
+        // The reviewer's checkout is where they left it, dirty file included.
+        assert_eq!(gitio::current_branch(&repo.path()).unwrap(), "main");
+        assert_eq!(
+            repo.read("src/scratch.rs"),
+            "fn half_written() {}
+"
+        );
+
+        // The review is somewhere else entirely, on the branch it was asked for.
+        let work = app.work_dir().expect("a work dir");
+        assert_ne!(gitio::path_key(&work), gitio::path_key(&repo.path()));
+        assert_eq!(gitio::current_branch(&work).unwrap(), "feature");
+        let note = app.ref_note.as_deref().unwrap_or_default();
+        assert!(
+            note.contains("isolated worktree"),
+            "the reviewer is told where: {note}"
+        );
+
+        // Identity did not move with it: the session is filed under the repo.
+        let plan = app.plan.as_ref().unwrap();
+        assert!(
+            app.db.decided_units(&repo.path()).is_empty(),
+            "nothing decided yet"
+        );
+        assert!(plan.session_id > 0);
+
+        // Back to the reviewer's own tree, and the worktree is forgotten.
+        app.select_working_tree();
+        assert_eq!(
+            gitio::path_key(&app.work_dir().unwrap()),
+            gitio::path_key(&repo.path())
+        );
+    }
+
     /// The riskiest-first review visits a late-in-file unit before an earlier
     /// one; both edits still have to be applied exactly where they belong.
     #[test]
@@ -6670,6 +7118,366 @@ mod state_tests {
         h.app.open_followup();
         assert_eq!(h.app.notes.len(), 1);
         assert_eq!(h.app.notes[0].note.text, "ours");
+    }
+
+    // -- publishing -----------------------------------------------------------
+
+    /// Give the harness repository a bare remote with `feature` already on it,
+    /// so the branch under review has somewhere to go and a position to be
+    /// compared against. Returns the remote, which must be held for as long as
+    /// the test needs it.
+    fn publishable(h: &Harness) -> TempDir {
+        let remote = TempDir::new("harness-remote");
+        let path = remote.path().to_string_lossy().replace('\\', "/");
+        gitio::run(&h.repo.path(), "git", &["init", "--bare", &path]).expect("bare remote");
+        h.repo.git(&["remote", "add", "origin", &path]);
+        h.repo.git(&["push", "--set-upstream", "origin", "feature"]);
+        remote
+    }
+
+    /// A commit of this session's, as the database records one: what proves a
+    /// branch holds nothing but the review's own work.
+    fn record_commit(app: &mut CraApp, session_id: i64, sha: &str) {
+        let id = app.db.log_decision(&crate::db::DecisionRecord {
+            session_id,
+            file: "src/lib.rs",
+            line_start: 1,
+            line_end: 1,
+            original: "before",
+            action: "rewrite",
+            final_text: "after",
+            source: "human",
+            human_edited: true,
+            committed: true,
+            commit_sha: Some(sha),
+            justification: None,
+            unit_json: None,
+            blinded: false,
+        });
+        app.db.mark_committed(id, sha);
+    }
+
+    /// Landing on the summary must already know where the commits stand — the
+    /// buttons that publish them are drawn from it on the very first frame.
+    #[test]
+    fn arriving_at_the_summary_reads_where_the_review_commits_stand() {
+        let mut h = Harness::new("pub-summary");
+        let _remote = publishable(&h);
+        h.repo.write("src/lib.rs", "fn main() { /* fixed */ }\n");
+        h.repo.commit("review: fix the comment");
+
+        h.app.goto(Screen::Summary);
+        let d = h
+            .app
+            .delivery
+            .as_ref()
+            .expect("the delivery state is read on arrival");
+        assert_eq!(d.branch.as_deref(), Some("feature"));
+        assert_eq!(d.remote.as_deref(), Some("origin"));
+        assert_eq!(d.upstream.as_deref(), Some("origin/feature"));
+        assert_eq!(d.ahead(), 1, "the fix commit, and only it");
+        assert!(d.can_push());
+
+        // The stacked pull request is ready to send without being filled in.
+        assert_eq!(h.app.stack.branch, "review/feature-fixes");
+        assert!(
+            h.app.stack.title.contains("feature"),
+            "{}",
+            h.app.stack.title
+        );
+        assert!(h.app.stack.body.contains("feature"), "{}", h.app.stack.body);
+        assert_eq!(
+            h.app.stack_base(),
+            "feature",
+            "a stack sits on the reviewed branch"
+        );
+    }
+
+    /// A branch nobody has pushed cannot be stacked *on*, so the pull request
+    /// targets what the review was actually run against instead of naming a
+    /// base the server has never heard of.
+    #[test]
+    fn an_unpushed_branch_stacks_onto_the_review_base_instead() {
+        let mut h = Harness::new("pub-unpushed");
+        h.app.goto(Screen::Summary);
+        let d = h.app.delivery.as_ref().expect("state");
+        assert!(d.upstream.is_none(), "nothing was ever pushed");
+        assert!(!d.can_push(), "and there is no remote to push to");
+        assert_eq!(h.app.stack_base(), "main");
+    }
+
+    /// The restore offer is the difference between a stack and a mess, and it
+    /// is only safe when every commit it would rewind is the review's own.
+    #[test]
+    fn restoring_is_offered_only_for_commits_the_review_itself_made() {
+        let mut h = Harness::new("pub-restore-offer");
+        let _remote = publishable(&h);
+        h.repo.write("src/lib.rs", "fn main() { /* fixed */ }\n");
+        h.repo.commit("review: fix the comment");
+        let sha = h.repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+
+        h.app.goto(Screen::Summary);
+        let why = h
+            .app
+            .restore_blocker()
+            .expect("an unrecognised commit blocks it");
+        assert!(why.contains("not made by this review"), "{why}");
+
+        // The same commit, now on the record as this session's.
+        let session_id = h.app.plan.as_ref().unwrap().session_id;
+        record_commit(&mut h.app, session_id, &sha);
+        assert_eq!(h.app.db.session_commits(session_id), vec![sha]);
+        assert!(
+            h.app.restore_blocker().is_none(),
+            "the branch holds only our work"
+        );
+    }
+
+    /// Publishing is about commits, and a re-check makes none — it re-judges
+    /// history without touching the working tree.
+    #[test]
+    fn a_recheck_has_nothing_to_publish() {
+        let mut h = Harness::new("pub-recheck");
+        let _remote = publishable(&h);
+        h.app.plan.as_mut().unwrap().ref_kind = RefKind::Recheck;
+        h.app.goto(Screen::Summary);
+        assert!(
+            h.app.delivery.is_none(),
+            "no route out of a review that wrote nothing"
+        );
+    }
+
+    /// The whole way through, in the app's own terms: a fix commit in the
+    /// review's checkout, `P` on the summary, and the remote branch has it.
+    #[test]
+    fn pushing_from_the_summary_puts_the_fixes_on_the_remote_branch() {
+        let mut h = Harness::new("pub-push-app");
+        let remote = publishable(&h);
+        h.repo.write("src/lib.rs", "fn main() { /* fixed */ }\n");
+        h.repo.commit("review: fix the comment");
+        let sha = h.repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+
+        h.app.goto(Screen::Summary);
+        h.app.start_push();
+        assert!(h.app.publish.running(), "the push runs off the UI thread");
+        wait_for_publish(&mut h.app);
+
+        match &h.app.publish {
+            PublishState::Done(o) => {
+                assert!(o.headline.contains("origin/feature"), "{}", o.headline)
+            }
+            PublishState::Failed(e) => panic!("push failed: {e}"),
+            _ => panic!("the push never reported back"),
+        }
+        let on_remote = gitio::run(
+            &remote.path().to_string_lossy(),
+            "git",
+            &["rev-parse", "refs/heads/feature"],
+        )
+        .expect("remote branch");
+        assert_eq!(on_remote.trim(), sha);
+        // And the screen now describes the state the push left behind.
+        assert_eq!(h.app.delivery.as_ref().unwrap().ahead(), 0);
+    }
+
+    /// The other way out, end to end: the fixes go on a branch of their own,
+    /// `gh` is asked for a pull request into the branch that was reviewed, and
+    /// that branch is put back where the remote has it so the pull request is
+    /// the only place the fixes live.
+    #[test]
+    fn stacking_from_the_summary_proposes_the_fixes_back_to_the_reviewed_branch() {
+        let mut h = Harness::new("pub-stack-app");
+        let remote = publishable(&h);
+        let before = h
+            .repo
+            .git(&["rev-parse", "origin/feature"])
+            .trim()
+            .to_string();
+        h.repo.write("src/lib.rs", "fn main() { /* fixed */ }\n");
+        h.repo.commit("review: fix the comment");
+        let sha = h.repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+
+        let bin = TempDir::new("pub-stack-app-gh");
+        let gh = FakeCli::new(
+            &bin,
+            "gh",
+            FakeCliSpec {
+                reply: "https://github.test/o/r/pull/12\n",
+                ..Default::default()
+            },
+        );
+        h.app.settings.gh_path = gh.command();
+
+        h.app.goto(Screen::Summary);
+        let session_id = h.app.plan.as_ref().unwrap().session_id;
+        record_commit(&mut h.app, session_id, &sha);
+        assert!(
+            h.app.restore_blocker().is_none(),
+            "every unpushed commit is ours"
+        );
+        h.app.stack.restore = true;
+        h.app.start_stacked_pr();
+        wait_for_publish(&mut h.app);
+
+        match &h.app.publish {
+            PublishState::Done(o) => {
+                assert_eq!(o.url.as_deref(), Some("https://github.test/o/r/pull/12"))
+            }
+            PublishState::Failed(e) => panic!("stacking failed: {e}"),
+            _ => panic!("the publish never reported back"),
+        }
+        let argv = gh.argv_seen();
+        assert!(
+            argv.contains("--base feature"),
+            "it stacks onto the reviewed branch: {argv}"
+        );
+        assert!(argv.contains("--head review/feature-fixes"), "{argv}");
+
+        let remote_dir = remote.path().to_string_lossy().to_string();
+        let stacked = gitio::run(
+            &remote_dir,
+            "git",
+            &["rev-parse", "refs/heads/review/feature-fixes"],
+        )
+        .expect("the fixes branch is on the remote");
+        assert_eq!(stacked.trim(), sha);
+        assert_eq!(
+            gitio::run(&remote_dir, "git", &["rev-parse", "refs/heads/feature"])
+                .unwrap()
+                .trim(),
+            before,
+            "the reviewed branch on the remote was left alone"
+        );
+        assert_eq!(
+            h.repo.git(&["rev-parse", "feature"]).trim(),
+            before,
+            "and locally it is back where the remote has it"
+        );
+    }
+
+    /// A ref with every unit already decided used to dead-end at the picker
+    /// with an error. That is the state a *finished* review leaves behind, and
+    /// its fix commits may still be sitting in the worktree with nowhere to
+    /// go — so it opens the summary instead, on the session that made them.
+    #[test]
+    fn a_fully_decided_ref_reopens_on_the_summary_so_its_commits_can_be_delivered() {
+        let mut h = Harness::new("pub-reopen");
+        let _remote = publishable(&h);
+        replan(&mut h);
+        let first_session = h.app.plan.as_ref().unwrap().session_id;
+
+        // Decide everything the plan offers.
+        h.enter_with(vec![]);
+        for _ in 0..2 {
+            h.app.save_and_continue(&egui::Context::default(), false);
+        }
+        // And a fix commit, as a real review leaves behind. It touches a file
+        // of its own: rewriting src/lib.rs would take the reviewed comments
+        // out of the diff, which is a different reason for an empty plan.
+        h.repo.write("src/extra.rs", "fn extra() {}\n");
+        h.repo.commit("review: add the missing helper");
+        let sha = h.repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+        record_commit(&mut h.app, first_session, &sha);
+
+        // Selecting it again: nothing left to judge, everything left to send.
+        replan(&mut h);
+        assert!(
+            h.app.ref_error.is_none(),
+            "not an error: {:?}",
+            h.app.ref_error
+        );
+        assert_eq!(
+            h.app.screen as u8,
+            Screen::Summary as u8,
+            "it opens where publishing lives"
+        );
+
+        let plan = h.app.plan.as_ref().expect("a plan carries the session");
+        assert!(plan.nothing_left());
+        assert_eq!(
+            plan.session_id, first_session,
+            "the session its commits were made in"
+        );
+        assert_eq!(plan.reported_units(), 2, "'2 / 0' would read as a bug");
+
+        // And DELIVER is live, with the commit it is there for.
+        let d = h
+            .app
+            .delivery
+            .as_ref()
+            .expect("the delivery state is read on arrival");
+        assert_eq!(
+            d.unpushed,
+            vec![sha],
+            "the fix commit is what there is to publish"
+        );
+        assert!(d.can_push());
+        assert!(
+            h.app.restore_blocker().is_none(),
+            "reopening the session proves it is ours"
+        );
+    }
+
+    /// Rescuing a detached review's commits onto a branch is only half a
+    /// rescue if that branch cannot then be delivered. Its name belongs to no
+    /// session, so the session has to be found by the commits themselves.
+    #[test]
+    fn a_branch_rescued_from_a_detached_review_can_still_be_delivered() {
+        let mut h = Harness::new("pub-rescued");
+        let _remote = publishable(&h);
+        replan(&mut h);
+        let session = h.app.plan.as_ref().unwrap().session_id;
+        h.enter_with(vec![]);
+        for _ in 0..2 {
+            h.app.save_and_continue(&egui::Context::default(), false);
+        }
+        h.repo.write("src/extra.rs", "fn extra() {}\n");
+        h.repo.commit("review: add the missing helper");
+        let sha = h.repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+        record_commit(&mut h.app, session, &sha);
+
+        // The shape `worktree::park_stranded` leaves behind: the commits on a
+        // branch whose name no session was ever opened under.
+        let rescued = crate::publish::suggested_branch("feature");
+        h.repo.git(&["branch", &rescued]);
+        assert!(
+            h.app.db.last_session(&h.repo.path(), &rescued).is_none(),
+            "no session by name"
+        );
+
+        h.app.settings.review_code = false;
+        h.app
+            .build_plan(RefKind::Branch, rescued.clone(), "main".into());
+        assert!(
+            h.app.ref_error.is_none(),
+            "not an error: {:?}",
+            h.app.ref_error
+        );
+        assert_eq!(h.app.screen as u8, Screen::Summary as u8);
+        assert_eq!(
+            h.app.plan.as_ref().unwrap().session_id,
+            session,
+            "found by the commit, since the name could not say"
+        );
+        assert!(h.app.delivery.as_ref().is_some_and(|d| d.can_push()));
+        // Nothing derivable says what a rescued branch should target, so the
+        // base is the reviewer's to set — which is why the field is editable.
+        assert!(
+            !h.app.stack.base.is_empty(),
+            "a base is offered to start from"
+        );
+    }
+
+    fn wait_for_publish(app: &mut CraApp) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while app.publish.running() {
+            app.pump_messages();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the publish never reported back"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 }
 

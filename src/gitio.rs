@@ -172,7 +172,15 @@ pub fn default_branch(dir: &str, fallback: &str) -> String {
 pub fn pr_base_ref(dir: &str, base: &str) -> String {
     let _ = git(dir, &["fetch", "--quiet", "origin", base]);
     let remote = format!("origin/{base}");
-    match git(dir, &["rev-parse", "--verify", "--quiet", &format!("refs/remotes/{remote}")]) {
+    match git(
+        dir,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/remotes/{remote}"),
+        ],
+    ) {
         Ok(_) => remote,
         Err(_) => base.to_string(),
     }
@@ -271,7 +279,11 @@ pub fn same_path(a: &str, b: &str) -> bool {
 pub fn path_key(p: &str) -> String {
     let s = p.trim().replace('\\', "/");
     let s = s.trim_end_matches('/');
-    if cfg!(windows) { s.to_lowercase() } else { s.to_string() }
+    if cfg!(windows) {
+        s.to_lowercase()
+    } else {
+        s.to_string()
+    }
 }
 
 /// Git's well-known empty-tree object. Used as the diff base when a branch
@@ -540,7 +552,9 @@ pub fn delivery_state(
     base: &str,
     session_commits: &[String],
 ) -> Delivery {
-    let branch = current_branch(dir).ok().filter(|b| b != "HEAD" && !b.is_empty());
+    let branch = current_branch(dir)
+        .ok()
+        .filter(|b| b != "HEAD" && !b.is_empty());
     let remote = default_remote(dir, branch.as_deref());
     // The branch's configured upstream first — it is the reviewer's own answer
     // to where this branch goes. Failing that, the tracking ref for the name
@@ -570,7 +584,10 @@ pub fn delivery_state(
     };
 
     let (behind, unpushed) = match &upstream {
-        Some(u) => (commits_between(dir, &tip, u).len(), commits_between(dir, u, &tip)),
+        Some(u) => (
+            commits_between(dir, &tip, u).len(),
+            commits_between(dir, u, &tip),
+        ),
         // Never pushed: everything the review was scoped to is unpublished.
         None => (0, commits_between(dir, base, &tip)),
     };
@@ -606,13 +623,21 @@ fn newest(dir: &str, revs: &[String]) -> Option<String> {
     let mut args = vec!["rev-list", "--no-walk=sorted"];
     args.extend(revs.iter().map(String::as_str));
     let out = git(dir, &args).ok()?;
-    out.lines().map(str::trim).find(|l| !l.is_empty()).map(str::to_string)
+    out.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(str::to_string)
 }
 
 /// Every remote this repository has, in git's order.
 pub fn remotes(dir: &str) -> Vec<String> {
     git(dir, &["remote"])
-        .map(|s| s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+        .map(|s| {
+            s.lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -642,7 +667,11 @@ pub fn default_remote(dir: &str, branch: Option<&str>) -> Option<String> {
 /// The remote-tracking ref a branch is set to track, e.g. `origin/feature`.
 fn upstream_ref(dir: &str, branch: &str) -> Option<String> {
     let spec = format!("{branch}@{{upstream}}");
-    let out = git(dir, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", &spec]).ok()?;
+    let out = git(
+        dir,
+        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", &spec],
+    )
+    .ok()?;
     let out = out.trim();
     (!out.is_empty()).then(|| out.to_string())
 }
@@ -668,7 +697,12 @@ pub fn commits_between(dir: &str, from: &str, to: &str) -> Vec<String> {
         format!("{from}..{to}")
     };
     git(dir, &["rev-list", &range])
-        .map(|s| s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+        .map(|s| {
+            s.lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -680,9 +714,17 @@ pub fn commits_between(dir: &str, from: &str, to: &str) -> Vec<String> {
 /// the third case that matters: a detached review that committed its fixes,
 /// where nothing but the reflog knows where they went.
 pub fn unreferenced_head(dir: &str) -> Vec<String> {
-    git(dir, &["rev-list", "HEAD", "--not", "--branches", "--remotes"])
-        .map(|s| s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
-        .unwrap_or_default()
+    git(
+        dir,
+        &["rev-list", "HEAD", "--not", "--branches", "--remotes"],
+    )
+    .map(|s| {
+        s.lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 /// The name of some branch that contains `rev`, with any remote prefix
@@ -696,7 +738,14 @@ pub fn unreferenced_head(dir: &str) -> Vec<String> {
 pub fn branch_containing(dir: &str, rev: &str) -> Option<String> {
     let out = git(
         dir,
-        &["for-each-ref", "--contains", rev, "--format=%(refname)", "refs/heads", "refs/remotes"],
+        &[
+            "for-each-ref",
+            "--contains",
+            rev,
+            "--format=%(refname)",
+            "refs/heads",
+            "refs/remotes",
+        ],
     )
     .ok()?;
     out.lines()
@@ -803,7 +852,15 @@ pub fn pr_create(
         dir,
         gh,
         &[
-            "pr", "create", "--base", base, "--head", head, "--title", title, "--body-file",
+            "pr",
+            "create",
+            "--base",
+            base,
+            "--head",
+            head,
+            "--title",
+            title,
+            "--body-file",
             &body_file.path(),
         ],
     )?;
@@ -1081,8 +1138,10 @@ mod repo_tests {
         // left behind — exactly what a reviewer who has not pulled in a while
         // is holding when they open somebody's pull request.
         let upstream = TempRepo::new("pr-base-up");
-        upstream.write("a.txt", "one
-");
+        upstream.write(
+            "a.txt", "one
+",
+        );
         upstream.commit("first");
         let clone = TempRepo::new("pr-base-clone");
         clone.git(&["remote", "add", "origin", &upstream.path()]);
@@ -1090,12 +1149,18 @@ mod repo_tests {
         clone.git(&["reset", "--hard", "origin/main"]);
 
         // Upstream moves on, and the pull request branches from where it now is.
-        upstream.write("merged-since.txt", "landed on main
-");
+        upstream.write(
+            "merged-since.txt",
+            "landed on main
+",
+        );
         upstream.commit("second");
         upstream.git(&["checkout", "-b", "feature"]);
-        upstream.write("the-pr.txt", "the change under review
-");
+        upstream.write(
+            "the-pr.txt",
+            "the change under review
+",
+        );
         upstream.commit("the pull request");
 
         // The head is fetched, as `gh pr checkout` would; nothing updates the
@@ -1106,7 +1171,10 @@ mod repo_tests {
 
         // Diffing the stale local name drags in whatever landed on main since.
         let stale = review_diff(&clone.path(), "main", 3).unwrap();
-        assert!(stale.contains("merged-since.txt"), "expected the stale base to leak: {stale}");
+        assert!(
+            stale.contains("merged-since.txt"),
+            "expected the stale base to leak: {stale}"
+        );
 
         // The resolved base is the remote-tracking ref, and it shows the pull
         // request's own change and nothing else.
@@ -1114,14 +1182,19 @@ mod repo_tests {
         assert_eq!(base, "origin/main");
         let diff = review_diff(&clone.path(), &base, 3).unwrap();
         assert!(diff.contains("the-pr.txt"), "{diff}");
-        assert!(!diff.contains("merged-since.txt"), "the base's own commits leaked in: {diff}");
+        assert!(
+            !diff.contains("merged-since.txt"),
+            "the base's own commits leaked in: {diff}"
+        );
     }
 
     #[test]
     fn a_base_with_no_remote_tracking_ref_keeps_its_plain_name() {
         let repo = TempRepo::new("pr-base-local");
-        repo.write("a.txt", "one
-");
+        repo.write(
+            "a.txt", "one
+",
+        );
         repo.commit("first");
         assert_eq!(pr_base_ref(&repo.path(), "main"), "main");
     }

@@ -290,7 +290,10 @@ impl WorktreeRoot {
         let guard = WORKTREE_ROOT.lock().unwrap_or_else(|e| e.into_inner());
         let dir = TempDir::new(tag);
         std::env::set_var("CRA_WORKTREES", dir.path());
-        WorktreeRoot { _dir: dir, _guard: guard }
+        WorktreeRoot {
+            _dir: dir,
+            _guard: guard,
+        }
     }
 }
 

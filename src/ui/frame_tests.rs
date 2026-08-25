@@ -666,6 +666,88 @@ fn the_file_picker_lays_out_its_rows() {
     assert_eq!(frames[1], frames[2], "the picker shifted between repaints");
 }
 
+/// The summary's publish section is the widest mix of widgets on any screen —
+/// a state line, a button whose label carries a count, a collapsing form of
+/// text edits and a checkbox — and it is drawn above a scroll area that takes
+/// the rest of the window. Both states have to lay out and stay put.
+#[test]
+fn the_summary_lays_out_both_ways_out_of_a_finished_review() {
+    for (tag, behind) in [("summary-push", 0usize), ("summary-stack", 1)] {
+        let (_dir, mut app) = review_app(tag);
+        app.screen = Screen::Summary;
+        app.delivery = Some(crate::gitio::Delivery {
+            branch: Some("feature".into()),
+            remote: Some("origin".into()),
+            upstream: Some("origin/feature".into()),
+            tip: "HEAD".into(),
+            tip_branch: None,
+            unpushed: vec!["a".repeat(40), "b".repeat(40)],
+            behind,
+            dirty: true,
+        });
+        app.stack.branch = "review/feature-fixes".into();
+        app.stack.title = "Review fixes for feature".into();
+        app.stack.body = "two decisions, one commit".into();
+        let ctx = egui::Context::default();
+        crate::ui::theme::apply(&ctx);
+
+        let mut frames = Vec::new();
+        for _ in 0..3 {
+            let out = ctx.run(input(1480.0, 900.0), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    app.ui_summary(ctx, ui);
+                });
+            });
+            let clips: Vec<_> = out.shapes.iter().map(|s| s.clip_rect).collect();
+            frames.push((out.shapes.len(), format!("{clips:?}")));
+        }
+        assert!(frames[0].0 > 0, "{tag}: the summary painted nothing");
+        assert_eq!(
+            frames[1], frames[2],
+            "{tag}: the summary shifted between repaints"
+        );
+    }
+}
+
+/// A finished publish moved the commits the controls describe — after a
+/// stacked one the worktree is on a different branch entirely — so the outcome
+/// replaces them rather than sitting under a second, still-armed Push button.
+#[test]
+fn a_finished_publish_replaces_the_buttons_with_what_it_did() {
+    let (_dir, mut app) = review_app("summary-done");
+    app.screen = Screen::Summary;
+    app.delivery = Some(crate::gitio::Delivery {
+        branch: Some("review/feature-fixes".into()),
+        remote: Some("origin".into()),
+        upstream: Some("origin/feature".into()),
+        tip: "HEAD".into(),
+        tip_branch: None,
+        unpushed: vec!["a".repeat(40)],
+        behind: 0,
+        dirty: false,
+    });
+    app.publish = crate::app::PublishState::Done(crate::publish::Outcome {
+        headline: "opened a pull request from review/feature-fixes into feature".into(),
+        url: Some("https://github.test/o/r/pull/12".into()),
+        detail: vec!["put feature back at origin/feature".into()],
+    });
+    let ctx = egui::Context::default();
+    crate::ui::theme::apply(&ctx);
+
+    // `P` would start a second push of commits the stack just moved off the
+    // branch. With the outcome standing, the section offers no such key.
+    let out = ctx.run(input(1480.0, 900.0), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            app.ui_summary(ctx, ui);
+        });
+    });
+    assert!(!out.shapes.is_empty(), "the outcome painted nothing");
+    assert!(
+        matches!(app.publish, crate::app::PublishState::Done(_)),
+        "laying out the outcome must not start anything"
+    );
+}
+
 /// A call that was stopped, as a page would hold it after the reviewer walked
 /// away: a real pid, a session that can be continued, and a reason.
 fn paused_call(session: Option<&str>) -> crate::app::PausedCall {

@@ -88,7 +88,13 @@ pub fn dir_for(repo: &str) -> PathBuf {
 fn key(repo: &str) -> String {
     let name: String = gitio::repo_name(repo)
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
     format!("{name}-{:016x}", digest(&gitio::path_key(repo)))
 }
@@ -128,7 +134,11 @@ pub fn for_branch(repo: &str, branch: &str) -> Result<Ready, String> {
             None => gitio::worktree_add(repo, &path, branch)?,
         }
     }
-    Ok(Ready { path, held_by, parked })
+    Ok(Ready {
+        path,
+        held_by,
+        parked,
+    })
 }
 
 /// The review worktree for `repo`, with pull request `number` checked out in
@@ -150,7 +160,11 @@ pub fn for_pr(repo: &str, gh: &str, number: u64) -> Result<Ready, String> {
         gitio::worktree_add_detached(repo, &path, "HEAD")?;
     }
     let held_by = gitio::pr_checkout(&path, gh, number)?;
-    Ok(Ready { path, held_by, parked })
+    Ok(Ready {
+        path,
+        held_by,
+        parked,
+    })
 }
 
 /// A linked worktree carries a `.git` *file* pointing back at the repository.
@@ -219,7 +233,10 @@ fn park_stranded(path: &str) -> Result<Option<Parked>, String> {
         None => format!("review/stranded-{short}"),
     };
     gitio::create_branch(path, &name, &head)?;
-    Ok(Some(Parked { branch: name, commits: stranded.len() }))
+    Ok(Some(Parked {
+        branch: name,
+        commits: stranded.len(),
+    }))
 }
 
 #[cfg(test)]
@@ -251,7 +268,10 @@ mod tests {
         let ready = for_branch(&repo.path(), "feature").expect("worktree");
         assert!(ready.held_by.is_none(), "nothing else holds the branch");
         assert_eq!(gitio::current_branch(&ready.path).unwrap(), "feature");
-        assert_eq!(std::fs::read_to_string(Path::new(&ready.path).join("a.txt")).unwrap(), "two\n");
+        assert_eq!(
+            std::fs::read_to_string(Path::new(&ready.path).join("a.txt")).unwrap(),
+            "two\n"
+        );
 
         // The reviewer's checkout is exactly where they left it.
         assert_eq!(gitio::current_branch(&repo.path()).unwrap(), "main");
@@ -260,24 +280,40 @@ mod tests {
         // Asked again, the same directory is reused rather than piling up.
         let again = for_branch(&repo.path(), "feature").expect("reuse");
         assert_eq!(again.path, ready.path);
-        assert!(again.held_by.is_none(), "its own hold on the branch is not a conflict");
+        assert!(
+            again.held_by.is_none(),
+            "its own hold on the branch is not a conflict"
+        );
     }
 
     #[test]
     fn a_pr_review_gets_a_worktree_and_gh_is_run_inside_it() {
         let _root = WorktreeRoot::new("wt-root4");
         let repo = TempRepo::new("wt-pr");
-        repo.write("a.txt", "one
-");
+        repo.write(
+            "a.txt", "one
+",
+        );
         repo.commit("first");
 
         let bin = TempDir::new("wt-gh");
-        let gh = FakeCli::new(&bin, "gh", FakeCliSpec { exit_code: 0, ..Default::default() });
+        let gh = FakeCli::new(
+            &bin,
+            "gh",
+            FakeCliSpec {
+                exit_code: 0,
+                ..Default::default()
+            },
+        );
         let ready = for_pr(&repo.path(), &gh.command(), 3).expect("worktree");
 
         // `gh` was asked for the PR, and asked for it in the new worktree.
         assert!(ready.held_by.is_none(), "{ready:?}");
-        assert!(gh.argv_seen().contains("pr checkout 3"), "{}", gh.argv_seen());
+        assert!(
+            gh.argv_seen().contains("pr checkout 3"),
+            "{}",
+            gh.argv_seen()
+        );
         assert!(
             gitio::same_path(&gh.cwd_seen(), &ready.path),
             "{} is not {}",
@@ -308,18 +344,27 @@ mod tests {
         // checked out there; take it detached the way a held branch is.
         repo.git(&["checkout", "codex/cd"]);
         let ready = for_branch(&repo.path(), "codex/cd").expect("worktree");
-        assert!(ready.held_by.is_some(), "the repo holds the branch, so this is detached");
+        assert!(
+            ready.held_by.is_some(),
+            "the repo holds the branch, so this is detached"
+        );
         assert_eq!(gitio::current_branch(&ready.path).unwrap(), "HEAD");
 
         // A fix commit, made where nothing will keep it.
         std::fs::write(Path::new(&ready.path).join("a.txt"), "fixed\n").unwrap();
         gitio::stage_and_commit(&ready.path, "a.txt", "review(code): fix it").expect("commit");
         let fix = gitio::head_sha(&ready.path).expect("sha");
-        assert!(gitio::unreferenced_head(&ready.path).contains(&fix), "nothing holds it yet");
+        assert!(
+            gitio::unreferenced_head(&ready.path).contains(&fix),
+            "nothing holds it yet"
+        );
 
         // Reviewing something else re-points the worktree over those commits.
         let next = for_branch(&repo.path(), "other").expect("worktree");
-        let parked = next.parked.as_ref().expect("the commits were saved, not dropped");
+        let parked = next
+            .parked
+            .as_ref()
+            .expect("the commits were saved, not dropped");
         assert_eq!(parked.commits, 1);
         // Named for what they are fixes *for*, which is the name the stacked
         // pull request would give them too — so stacking them later finds the
@@ -353,10 +398,16 @@ mod tests {
         assert_eq!(gitio::current_branch(&ready.path).unwrap(), "feature");
         std::fs::write(Path::new(&ready.path).join("a.txt"), "fixed\n").unwrap();
         gitio::stage_and_commit(&ready.path, "a.txt", "review(code): fix it").expect("commit");
-        assert!(gitio::unreferenced_head(&ready.path).is_empty(), "the branch holds them");
+        assert!(
+            gitio::unreferenced_head(&ready.path).is_empty(),
+            "the branch holds them"
+        );
 
         let next = for_branch(&repo.path(), "other").expect("worktree");
-        assert!(next.parked.is_none(), "nothing to save — feature still points at the fix");
+        assert!(
+            next.parked.is_none(),
+            "nothing to save — feature still points at the fix"
+        );
         assert_eq!(
             repo.git(&["rev-parse", "feature"]).trim().len(),
             40,
@@ -372,10 +423,17 @@ mod tests {
         repo.commit("first");
         // The reviewer's own checkout counts: git will not hand `main` out twice.
         let ready = for_branch(&repo.path(), "main").expect("worktree");
-        let held = ready.held_by.clone().expect("the repository itself holds main");
+        let held = ready
+            .held_by
+            .clone()
+            .expect("the repository itself holds main");
         assert!(gitio::same_path(&held, &repo.path()), "{held}");
         assert_eq!(gitio::current_branch(&ready.path).unwrap(), "HEAD");
-        assert!(ready.describe("main").contains("detached"), "{}", ready.describe("main"));
+        assert!(
+            ready.describe("main").contains("detached"),
+            "{}",
+            ready.describe("main")
+        );
     }
 
     #[test]

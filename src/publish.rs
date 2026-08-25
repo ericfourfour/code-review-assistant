@@ -30,7 +30,6 @@ pub enum Route {
     Stack(Stack),
 }
 
-
 /// A stacked pull request as the reviewer filled it in.
 pub struct Stack {
     /// The branch to create for the fixes.
@@ -104,7 +103,11 @@ pub fn restore_blocker(
     if state.dirty {
         return Some("the review worktree has uncommitted changes".to_string());
     }
-    let outside = state.unpushed.iter().filter(|s| !session_commits.iter().any(|c| c == *s)).count();
+    let outside = state
+        .unpushed
+        .iter()
+        .filter(|s| !session_commits.iter().any(|c| c == *s))
+        .count();
     if outside > 0 {
         return Some(format!(
             "{outside} of the {} commit(s) on {ref_name} were not made by this review",
@@ -124,10 +127,20 @@ pub fn restore_blocker(
 pub fn suggested_branch(ref_name: &str) -> String {
     let slug: String = ref_name
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '/' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '/' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
     let slug = slug.trim_matches(['-', '/']).to_string();
-    let slug = if slug.is_empty() { "review".to_string() } else { slug };
+    let slug = if slug.is_empty() {
+        "review".to_string()
+    } else {
+        slug
+    };
     format!("review/{slug}-fixes")
 }
 
@@ -161,12 +174,21 @@ fn push(req: &Request) -> Result<Outcome, String> {
     let set_upstream = req.state.upstream.is_none()
         && req.state.branch.as_deref() == Some(&req.ref_name)
         && req.state.tip == "HEAD";
-    gitio::push_branch(&req.dir, &req.remote, &req.ref_name, set_upstream, &req.state.tip)?;
+    gitio::push_branch(
+        &req.dir,
+        &req.remote,
+        &req.ref_name,
+        set_upstream,
+        &req.state.tip,
+    )?;
 
     let n = req.state.ahead();
     let mut detail = Vec::new();
     if set_upstream {
-        detail.push(format!("{} now tracks {}/{}", req.ref_name, req.remote, req.ref_name));
+        detail.push(format!(
+            "{} now tracks {}/{}",
+            req.ref_name, req.remote, req.ref_name
+        ));
     }
     if req.state.dirty {
         detail.push(
@@ -174,10 +196,7 @@ fn push(req: &Request) -> Result<Outcome, String> {
         );
     }
     Ok(Outcome {
-        headline: format!(
-            "pushed {n} commit(s) to {}/{}",
-            req.remote, req.ref_name
-        ),
+        headline: format!("pushed {n} commit(s) to {}/{}", req.remote, req.ref_name),
         url: None,
         detail,
     })
@@ -213,14 +232,18 @@ fn stack(req: &Request, stack: &Stack) -> Result<Outcome, String> {
     // branch the first attempt already made, so a branch that is already
     // exactly where this one would go is reused rather than refused.
     if gitio::branch_exists(&req.dir, name) {
-        let at = gitio::run(&req.dir, "git", &["rev-parse", name])?.trim().to_string();
+        let at = gitio::run(&req.dir, "git", &["rev-parse", name])?
+            .trim()
+            .to_string();
         if at != head {
             return Err(format!(
                 "{name} already exists and points somewhere else ({}) — pick another name",
                 &at[..8.min(at.len())]
             ));
         }
-        detail.push(format!("reused the existing branch {name}, already at these commits"));
+        detail.push(format!(
+            "reused the existing branch {name}, already at these commits"
+        ));
     } else {
         gitio::create_branch(&req.dir, name, &head)?;
         detail.push(format!("created {name} at {}", &head[..8.min(head.len())]));
@@ -234,7 +257,11 @@ fn stack(req: &Request, stack: &Stack) -> Result<Outcome, String> {
         }
         return Err(e);
     }
-    detail.push(format!("pushed {} commit(s) to {}/{name}", req.state.ahead(), req.remote));
+    detail.push(format!(
+        "pushed {} commit(s) to {}/{name}",
+        req.state.ahead(),
+        req.remote
+    ));
 
     if stack.restore {
         match restore_blocker(&req.state, &req.ref_name, &req.session_commits) {
@@ -353,7 +380,11 @@ mod tests {
 
         let d = gitio::delivery_state(&repo.path(), "feature", "main", &shas);
         assert_eq!(d.tip, fix, "the review's own commit is the tip to publish");
-        assert_eq!(d.tip_branch.as_deref(), Some("review/feature-fixes"), "and it says where");
+        assert_eq!(
+            d.tip_branch.as_deref(),
+            Some("review/feature-fixes"),
+            "and it says where"
+        );
         assert_eq!(d.unpushed, vec![fix.clone()]);
         assert!(d.can_push());
 
@@ -424,7 +455,11 @@ mod tests {
             route: Route::Push,
         };
         let out = run(&req).expect("push");
-        assert!(out.headline.contains("2 commit(s) to origin/feature"), "{}", out.headline);
+        assert!(
+            out.headline.contains("2 commit(s) to origin/feature"),
+            "{}",
+            out.headline
+        );
         assert!(out.url.is_none());
 
         // The remote really has them, and the local branch is level again.
@@ -468,7 +503,10 @@ mod tests {
         let gh = FakeCli::new(
             &bin,
             "gh",
-            FakeCliSpec { reply: "https://github.test/o/r/pull/7\n", ..Default::default() },
+            FakeCliSpec {
+                reply: "https://github.test/o/r/pull/7\n",
+                ..Default::default()
+            },
         );
         let req = Request {
             dir: repo.path(),
@@ -491,13 +529,20 @@ mod tests {
         // The fixes are on the remote under their own name, and the reviewed
         // branch on the remote has not moved.
         let remote_dir = remote.path().to_string_lossy().to_string();
-        let stacked =
-            gitio::run(&remote_dir, "git", &["rev-parse", "refs/heads/review/feature-fixes"])
-                .expect("stacked branch on the remote");
+        let stacked = gitio::run(
+            &remote_dir,
+            "git",
+            &["rev-parse", "refs/heads/review/feature-fixes"],
+        )
+        .expect("stacked branch on the remote");
         assert_eq!(stacked.trim(), shas[0]);
         let reviewed = gitio::run(&remote_dir, "git", &["rev-parse", "refs/heads/feature"])
             .expect("reviewed branch");
-        assert_ne!(reviewed.trim(), shas[0], "the reviewed branch was not pushed");
+        assert_ne!(
+            reviewed.trim(),
+            shas[0],
+            "the reviewed branch was not pushed"
+        );
 
         let argv = gh.argv_seen();
         assert!(argv.contains("pr create"), "{argv}");
@@ -516,7 +561,10 @@ mod tests {
         let gh = FakeCli::new(
             &bin,
             "gh",
-            FakeCliSpec { reply: "https://github.test/o/r/pull/3\n", ..Default::default() },
+            FakeCliSpec {
+                reply: "https://github.test/o/r/pull/3\n",
+                ..Default::default()
+            },
         );
         let body = "Fixes made while reviewing `feature`.\n\n- 2 unit(s) decided\n";
         let req = Request {
@@ -536,8 +584,14 @@ mod tests {
         };
         run(&req).expect("stack");
         let argv = gh.argv_seen();
-        assert!(argv.contains("--body-file"), "the body is passed by path: {argv}");
-        assert!(!argv.contains("unit(s) decided"), "and not on the command line: {argv}");
+        assert!(
+            argv.contains("--body-file"),
+            "the body is passed by path: {argv}"
+        );
+        assert!(
+            !argv.contains("unit(s) decided"),
+            "and not on the command line: {argv}"
+        );
     }
 
     /// Restoring is the difference between a stack and a mess: without it the
@@ -546,12 +600,18 @@ mod tests {
     #[test]
     fn restoring_rewinds_the_reviewed_branch_once_the_fixes_are_pushed() {
         let (repo, _remote, shas) = with_remote("pub-restore", 2);
-        let before = repo.git(&["rev-parse", "origin/feature"]).trim().to_string();
+        let before = repo
+            .git(&["rev-parse", "origin/feature"])
+            .trim()
+            .to_string();
         let bin = TempDir::new("pub-restore-gh");
         let gh = FakeCli::new(
             &bin,
             "gh",
-            FakeCliSpec { reply: "https://github.test/o/r/pull/8\n", ..Default::default() },
+            FakeCliSpec {
+                reply: "https://github.test/o/r/pull/8\n",
+                ..Default::default()
+            },
         );
         let req = Request {
             dir: repo.path(),
@@ -569,11 +629,22 @@ mod tests {
             }),
         };
         let out = run(&req).expect("stack");
-        assert!(out.detail.iter().any(|d| d.contains("put feature back")), "{:?}", out.detail);
-        assert_eq!(repo.git(&["rev-parse", "feature"]).trim(), before, "feature is back");
+        assert!(
+            out.detail.iter().any(|d| d.contains("put feature back")),
+            "{:?}",
+            out.detail
+        );
+        assert_eq!(
+            repo.git(&["rev-parse", "feature"]).trim(),
+            before,
+            "feature is back"
+        );
         // Nothing was lost: the fixes are on the branch the worktree now holds.
         assert_eq!(repo.git(&["rev-parse", "HEAD"]).trim(), shas[0]);
-        assert_eq!(gitio::current_branch(&repo.path()).unwrap(), "review/feature-fixes");
+        assert_eq!(
+            gitio::current_branch(&repo.path()).unwrap(),
+            "review/feature-fixes"
+        );
     }
 
     #[test]
@@ -585,7 +656,10 @@ mod tests {
         let mine = &shas[1..];
         let why = restore_blocker(&d, "feature", mine).expect("must refuse");
         assert!(why.contains("not made by this review"), "{why}");
-        assert!(restore_blocker(&d, "feature", &shas).is_none(), "all ours is fine");
+        assert!(
+            restore_blocker(&d, "feature", &shas).is_none(),
+            "all ours is fine"
+        );
     }
 
     /// A branch the remote has never seen has no position to be put back to,
@@ -613,7 +687,10 @@ mod tests {
     #[test]
     fn a_pr_head_ref_becomes_a_branch_name_git_will_take() {
         assert_eq!(suggested_branch("feature"), "review/feature-fixes");
-        assert_eq!(suggested_branch("user:their branch"), "review/user-their-branch-fixes");
+        assert_eq!(
+            suggested_branch("user:their branch"),
+            "review/user-their-branch-fixes"
+        );
         assert_eq!(suggested_branch(""), "review/review-fixes");
     }
 
@@ -624,7 +701,10 @@ mod tests {
         let gh = FakeCli::new(
             &bin,
             "gh",
-            FakeCliSpec { reply: "https://github.test/o/r/pull/9\n", ..Default::default() },
+            FakeCliSpec {
+                reply: "https://github.test/o/r/pull/9\n",
+                ..Default::default()
+            },
         );
         repo.git(&["branch", "review/feature-fixes"]);
         let req = Request {
@@ -643,7 +723,11 @@ mod tests {
             }),
         };
         let out = run(&req).expect("stack");
-        assert!(out.detail.iter().any(|d| d.contains("reused")), "{:?}", out.detail);
+        assert!(
+            out.detail.iter().any(|d| d.contains("reused")),
+            "{:?}",
+            out.detail
+        );
     }
 
     #[test]
