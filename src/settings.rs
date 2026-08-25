@@ -12,8 +12,9 @@ use crate::db::Db;
 pub struct ModelSlot {
     pub name: String,
     pub command: String,
-    /// `Name <email>` used in the Co-authored-by trailer when this model's
-    /// suggestion is picked.
+    /// Optional `Name <email>` used in the Co-authored-by trailer when this
+    /// model's suggestion is picked. Empty records model provenance without
+    /// claiming a GitHub identity.
     pub coauthor: String,
     pub enabled: bool,
 }
@@ -51,7 +52,11 @@ impl Default for Settings {
                 ModelSlot {
                     name: "agy".into(),
                     command: "agy -p {prompt}".into(),
-                    coauthor: "Antigravity <antigravity@google.com>".into(),
+                    // Google does not publish a GitHub co-author identity for
+                    // Antigravity. The old antigravity@google.com placeholder
+                    // is associated with an unrelated GitHub user, so rely on
+                    // the agy provenance trailer instead.
+                    coauthor: String::new(),
                     enabled: true,
                 },
             ],
@@ -68,9 +73,20 @@ const KEY: &str = "settings";
 
 impl Settings {
     pub fn load(db: &Db) -> Settings {
-        db.get_setting(KEY)
+        let mut settings: Settings = db
+            .get_setting(KEY)
             .and_then(|v| serde_json::from_str(&v).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        settings.remove_unsafe_coauthors();
+        settings
+    }
+
+    fn remove_unsafe_coauthors(&mut self) {
+        for model in &mut self.models {
+            if model.coauthor.trim() == "Antigravity <antigravity@google.com>" {
+                model.coauthor.clear();
+            }
+        }
     }
 
     pub fn save(&self, db: &Db) {
@@ -92,5 +108,42 @@ impl Settings {
             .filter(|(_, m)| m.enabled)
             .map(|(i, m)| (i, m.clone()))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn antigravity_does_not_claim_an_unrelated_github_identity() {
+        let settings = Settings::default();
+        let agy = settings
+            .models
+            .iter()
+            .find(|model| model.name == "agy")
+            .unwrap();
+        assert!(agy.coauthor.is_empty());
+    }
+
+    #[test]
+    fn old_antigravity_placeholder_identity_is_removed() {
+        let mut settings = Settings::default();
+        let agy = settings
+            .models
+            .iter_mut()
+            .find(|model| model.name == "agy")
+            .unwrap();
+        agy.coauthor = "Antigravity <antigravity@google.com>".into();
+
+        settings.remove_unsafe_coauthors();
+
+        assert!(settings
+            .models
+            .iter()
+            .find(|model| model.name == "agy")
+            .unwrap()
+            .coauthor
+            .is_empty());
     }
 }

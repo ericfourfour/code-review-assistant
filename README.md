@@ -73,7 +73,7 @@ review(comments): rewrite comment in src/lib.rs:42
 
 Reviewed-with: code-review-assistant
 Comment-provenance: claude | claude+human-edited | human-authored
-Co-authored-by: Claude <noreply@anthropic.com>     (when a model's suggestion was picked)
+Co-authored-by: Claude <noreply@anthropic.com>     (when a co-author identity is configured)
 ```
 
 If you edit a picked suggestion, provenance becomes `<model>+human-edited` (co-author kept);

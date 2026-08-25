@@ -30,7 +30,7 @@ impl CraApp {
                 ui.label(theme::dim("on"));
                 ui.label(theme::dim("name"));
                 ui.label(theme::dim("command template"));
-                ui.label(theme::dim("co-author (Name <email>)"));
+                ui.label(theme::dim("co-author (optional Name <email>)"));
                 ui.label(theme::dim(""));
                 ui.label(theme::dim("hotkey"));
                 ui.end_row();

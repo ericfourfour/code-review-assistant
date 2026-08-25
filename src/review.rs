@@ -250,7 +250,9 @@ pub fn commit_message(
         provenance.source_str()
     ));
     if let Provenance::Model { coauthor, .. } = provenance {
-        msg.push_str(&format!("Co-authored-by: {coauthor}\n"));
+        if !coauthor.trim().is_empty() {
+            msg.push_str(&format!("Co-authored-by: {coauthor}\n"));
+        }
     }
     msg
 }
@@ -310,6 +312,18 @@ mod tests {
         assert!(msg.contains("Reviewed-with: code-review-assistant"));
         assert!(msg.contains("Comment-provenance: claude+human-edited"));
         assert!(msg.contains("Co-authored-by: Claude <noreply@anthropic.com>"));
+    }
+
+    #[test]
+    fn commit_message_keeps_provenance_without_an_unset_coauthor() {
+        let prov = Provenance::Model {
+            name: "agy".into(),
+            coauthor: String::new(),
+            edited: false,
+        };
+        let msg = commit_message(&unit(), Action::Rewrite, &prov, Some("clearer"));
+        assert!(msg.contains("Comment-provenance: agy"), "{msg}");
+        assert!(!msg.contains("Co-authored-by:"), "{msg}");
     }
 
     #[test]

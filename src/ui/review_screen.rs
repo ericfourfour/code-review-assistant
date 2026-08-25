@@ -292,7 +292,9 @@ impl CraApp {
             ui.label(theme::dim("provenance:"));
             ui.label(RichText::new(provenance.source_str()).monospace().small());
             if let review::Provenance::Model { coauthor, .. } = &provenance {
-                ui.label(theme::dim(&format!("· Co-authored-by: {coauthor}")));
+                if !coauthor.trim().is_empty() {
+                    ui.label(theme::dim(&format!("· Co-authored-by: {coauthor}")));
+                }
             }
         });
 
