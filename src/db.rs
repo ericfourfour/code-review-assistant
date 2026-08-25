@@ -149,6 +149,9 @@ pub struct AgreementRow {
     pub blinded: bool,
 }
 
+#[cfg(test)]
+pub type SuggestionLink = (String, Option<String>, Option<i64>, Option<i64>);
+
 fn db_path() -> PathBuf {
     if let Ok(p) = std::env::var("CRA_DB") {
         return PathBuf::from(p);
@@ -906,7 +909,7 @@ impl Db {
     /// Every suggestion's conversation coordinates, oldest first:
     /// (file, action, follow_up_id, round).
     #[cfg(test)]
-    pub fn suggestion_links(&self) -> Vec<(String, Option<String>, Option<i64>, Option<i64>)> {
+    pub fn suggestion_links(&self) -> Vec<SuggestionLink> {
         let Ok(mut stmt) = self
             .conn
             .prepare("SELECT file, action, follow_up_id, round FROM suggestions ORDER BY id ASC")
