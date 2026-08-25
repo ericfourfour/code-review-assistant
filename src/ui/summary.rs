@@ -168,7 +168,7 @@ recorded and yours to dismiss — nothing is edited.",
                                     ui.label(theme::dim(
                                         &snap.clock(self.settings.model_timeout_secs.saturating_mul(2)),
                                     ));
-                                    if let Some(a) = snap.activity_line() {
+                                    if let Some(a) = snap.activity_line(false) {
                                         ui.label(theme::dim(&a));
                                     }
                                 }
@@ -180,7 +180,7 @@ recorded and yours to dismiss — nothing is edited.",
                                 }
                                 WholeBranchReviewState::Paused(p) => {
                                     theme::badge(ui, "PAUSED", theme::WARN);
-                                    ui.label(theme::dim(&p.line()));
+                                    ui.label(theme::dim(&p.line(true)));
                                 }
                                 WholeBranchReviewState::Idle => {}
                             }
@@ -196,7 +196,14 @@ recorded and yours to dismiss — nothing is edited.",
         let mut rerun: Option<(usize, bool)> = None;
         for (i, state) in self.whole_branch_review.iter().enumerate() {
             let WholeBranchReviewState::Paused(call) = state else { continue };
-            match crate::ui::procs_panel::paused_row(ui, call, &self.settings, "↻ Run again") {
+            // The branch pass is never blinded — its findings are attributed by
+            // name on this very screen — so the card shows everything.
+            let view = crate::ui::procs_panel::PausedView {
+                name: &call.model,
+                identifying: true,
+                restart_label: "↻ Run again",
+            };
+            match crate::ui::procs_panel::paused_row(ui, call, &self.settings, view) {
                 crate::ui::procs_panel::PausedAction::Resume => rerun = Some((i, true)),
                 crate::ui::procs_panel::PausedAction::Restart => rerun = Some((i, false)),
                 crate::ui::procs_panel::PausedAction::None => {}

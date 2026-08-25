@@ -146,8 +146,15 @@ impl ProcSnapshot {
 
     /// The activity worth a label: the last recognisable step, else how much
     /// the CLI has printed, else nothing (it has been silent so far).
-    pub fn activity_line(&self) -> Option<String> {
-        if !self.activity.is_empty() {
+    ///
+    /// `blinded` drops the step itself and leaves the count. The step names
+    /// the vendor whatever it says — a tool call spelled with claude's
+    /// argument names, a shell command in codex's argv style, a path only one
+    /// of them would open — so on a review card with the model's identity
+    /// hidden it answers the question the blinding is there to withhold. What
+    /// is left is proof of life, which is all such a card needs.
+    pub fn activity_line(&self, blinded: bool) -> Option<String> {
+        if !blinded && !self.activity.is_empty() {
             return Some(self.activity.clone());
         }
         (self.lines > 0).then(|| format!("{} line(s) of output", self.lines))
@@ -347,6 +354,9 @@ impl ProcTable {
 pub struct StopReceipt {
     pub owner: Owner,
     pub model: String,
+    /// Index into the settings model list, so a caller that has to name this
+    /// model under blinding can resolve the same stand-in its card uses.
+    pub model_index: usize,
     pub what: String,
     /// The pid as it was when the stop was asked for. Held by value because
     /// the point of a receipt is to name the process that was killed, and that
@@ -363,14 +373,15 @@ impl StopReceipt {
     }
 
     /// The line the reviewer reads: what was killed, and whether the kill has
-    /// landed yet.
-    pub fn line(&self) -> String {
+    /// landed yet. `name` is what to call the model, which under blinding is
+    /// its stand-in rather than the name in settings.
+    pub fn line(&self, name: &str) -> String {
         let pid = match self.pid {
             Some(pid) => format!("pid {pid}"),
             None => "no pid (it had not started)".to_string(),
         };
         let state = if self.confirmed() { "terminated" } else { "terminating…" };
-        format!("{} · {} · {pid} {state}", self.model, self.what)
+        format!("{name} · {} · {pid} {state}", self.what)
     }
 }
 
@@ -554,6 +565,7 @@ impl ProcTable {
             out.push(StopReceipt {
                 owner: row.owner,
                 model: row.model.clone(),
+                model_index: row.model_index,
                 what: row.what.clone(),
                 pid: snap.pid,
                 session: snap.session,
@@ -712,14 +724,19 @@ mod tests {
         assert_eq!(receipts.len(), 1);
         assert_eq!(receipts[0].pid, Some(4242));
         assert!(!receipts[0].confirmed(), "nothing has killed anything yet");
-        assert!(receipts[0].line().contains("pid 4242 terminating"), "{}", receipts[0].line());
+        let line = receipts[0].line("claude");
+        assert!(line.contains("pid 4242 terminating"), "{line}");
         assert_eq!(handle.snapshot().state, RunState::Stopping);
         assert!(handle.stop_requested(), "the worker's poll loop reads this");
 
         // The worker kills the child and writes the outcome back.
         handle.ended(Ended::Cancelled("left the review screen".into()), usage(10, Some(0.5)));
         assert!(receipts[0].confirmed());
-        assert!(receipts[0].line().contains("pid 4242 terminated"), "{}", receipts[0].line());
+        let line = receipts[0].line("model A");
+        assert!(line.contains("pid 4242 terminated"), "{line}");
+        // Named by whatever the caller passes, so a blinded card's stand-in
+        // reaches the banner instead of the name in settings.
+        assert!(line.starts_with("model A"), "{line}");
     }
 
     /// A stop raised before the CLI has a pid still has to land, or a model
@@ -864,10 +881,13 @@ mod tests {
         let snap = live.snapshot();
         assert_eq!(snap.lines, 2, "blank lines are not output");
         assert_eq!(snap.activity, "Grep RETRY_LIMIT");
-        assert_eq!(snap.activity_line().unwrap(), "Grep RETRY_LIMIT");
+        assert_eq!(snap.activity_line(false).unwrap(), "Grep RETRY_LIMIT");
+        // Blinded, the step goes: which tool a CLI reaches for, and how it
+        // spells the call, is a name by another route.
+        assert_eq!(snap.activity_line(true).unwrap(), "2 line(s) of output");
         // Output with no recognisable step in it still shows proof of life.
         let quiet = ProcHandle::new();
         quiet.on_line("warming up");
-        assert_eq!(quiet.snapshot().activity_line().unwrap(), "1 line(s) of output");
+        assert_eq!(quiet.snapshot().activity_line(false).unwrap(), "1 line(s) of output");
     }
 }

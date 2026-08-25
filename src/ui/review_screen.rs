@@ -253,12 +253,17 @@ impl CraApp {
                             Some(CandidateState::Pending(live)) => {
                                 ui.spinner();
                                 let snap = live.snapshot();
-                                ui.label(theme::dim(&format!(
-                                    "thinking… {} · {}",
-                                    snap.clock(self.settings.model_timeout_secs),
-                                    snap.pid_label()
-                                )));
-                                if let Some(a) = snap.activity_line() {
+                                // No pid while blinded: it is printed beside
+                                // the model's real name in the process ledger
+                                // and in the stop banner, so a card carrying
+                                // it answers the question the blinding is
+                                // there to withhold.
+                                let clock = snap.clock(self.settings.model_timeout_secs);
+                                ui.label(theme::dim(&match hidden {
+                                    true => format!("thinking… {clock}"),
+                                    false => format!("thinking… {clock} · {}", snap.pid_label()),
+                                }));
+                                if let Some(a) = snap.activity_line(hidden) {
                                     ui.label(theme::dim(&a));
                                 }
                             }
@@ -380,8 +385,15 @@ impl CraApp {
                         Some(CandidateState::Paused(call)) => {
                             // The card the reviewer comes back to. Nothing has
                             // been restarted for them, and the two ways forward
-                            // are spelled out rather than guessed at.
-                            match procs_panel::paused_row(ui, call, &self.settings, "↻ Ask again") {
+                            // are spelled out rather than guessed at. Blinded,
+                            // it withholds the pid, the session and the spend:
+                            // each is printed beside the real name elsewhere.
+                            let view = procs_panel::PausedView {
+                                name: &name,
+                                identifying: !hidden,
+                                restart_label: "↻ Ask again",
+                            };
+                            match procs_panel::paused_row(ui, call, &self.settings, view) {
                                 procs_panel::PausedAction::Resume => resume = Some(i),
                                 procs_panel::PausedAction::Restart => restart = Some(i),
                                 procs_panel::PausedAction::None => {}
@@ -800,7 +812,11 @@ impl CraApp {
                                             "waiting… {}",
                                             snap.clock(self.settings.model_timeout_secs)
                                         )));
-                                        if let Some(a) = snap.activity_line() {
+                                        // This window is opened on purpose and
+                                        // already carries the model's name and
+                                        // its whole transcript, so there is
+                                        // nothing here left to blind.
+                                        if let Some(a) = snap.activity_line(false) {
                                             ui.label(theme::dim(&a));
                                         }
                                     } else {
