@@ -204,6 +204,12 @@ pub struct Settings {
     /// them from round one instead of waiting to be corrected per unit.
     #[serde(default = "default_true")]
     pub send_profile: bool,
+    /// The preamble body sent in place of the mined one. Empty — the default —
+    /// keeps the mined text, which stays current as follow-ups accumulate; a
+    /// written one is sent verbatim under the same header until it is cleared.
+    /// Ignored entirely when `send_profile` is off.
+    #[serde(default)]
+    pub reviewer_preferences: String,
     /// Query the models for the next unit while the current one is being
     /// decided. Deciding takes minutes and the models seconds, so by the time
     /// the review advances the verdicts are usually already in.
@@ -324,6 +330,7 @@ impl Default for Settings {
             triage_order: true,
             skip_decided: true,
             send_profile: true,
+            reviewer_preferences: String::new(),
             prefetch_next: true,
             defer_unanimous_keeps: true,
             schema_version: SCHEMA_VERSION,

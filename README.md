@@ -155,6 +155,13 @@ polite unanimous "keep", the reviewer pushes back ("say *why*, not *what*"), and
 verdicts flip — a correction that used to be paid for again on every unit, one follow-up
 round at a time. The preamble moves it to round one.
 
+The mined text is a default, not a verdict on you. Settings → preferences shows the block in
+an editable box: **fill from history** drops the mined words in for you to correct, and
+anything left in the box is sent verbatim under the same header instead of the mined block —
+useful when a follow-up you typed at one unit reads narrower than the rule you actually meant
+to stand. Empty the box and mining resumes, staying current as you review; untick the
+checkbox and no preamble is sent at all.
+
 ## Decisions stick
 
 A unit you have already ruled on does not come back. When a plan is built, every unit the

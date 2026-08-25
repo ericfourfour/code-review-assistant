@@ -373,7 +373,7 @@ hidden; one that only exists on GitHub is cloned into the clone directory when o
             ui.label(theme::dim("preferences"));
             ui.checkbox(
                 &mut self.settings.send_profile,
-                "send your standing preferences (mined from past follow-ups and verdicts) with every prompt",
+                "send your standing preferences — the text below, or the mined default — with every prompt",
             );
             ui.end_row();
             ui.label(theme::dim("prefetch"));
@@ -389,6 +389,50 @@ hidden; one that only exists on GitHub is cloned into the clone directory when o
             );
             ui.end_row();
         });
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label(theme::dim("preferences text"));
+            let mined = crate::profile::mined(&self.db);
+            if ui
+                .add_enabled(
+                    mined.is_some(),
+                    egui::Button::new("fill from history").small(),
+                )
+                .on_hover_text("copy what would be mined right now into the box, to edit")
+                .on_disabled_hover_text("no follow-ups or verdicts to mine yet")
+                .clicked()
+            {
+                if let Some(m) = mined {
+                    self.settings.reviewer_preferences = m.trim_end().to_string();
+                }
+            }
+            if ui
+                .add_enabled(
+                    !self.settings.reviewer_preferences.is_empty(),
+                    egui::Button::new("clear").small(),
+                )
+                .on_hover_text("go back to the mined text, which keeps itself current")
+                .clicked()
+            {
+                self.settings.reviewer_preferences.clear();
+            }
+        });
+        ui.add(
+            egui::TextEdit::multiline(&mut self.settings.reviewer_preferences)
+                .desired_width(f32::INFINITY)
+                .desired_rows(6)
+                .hint_text("(empty — the block is distilled from your follow-ups and verdict mix)")
+                .font(egui::TextStyle::Monospace),
+        );
+        ui.label(theme::dim(&format!(
+            "Sent under a \"{}\" header at the top of every review prompt. What you write here \
+replaces the mined block outright — mining quotes follow-ups you typed at one unit under one \
+disagreement, which is not always the rule you meant to stand. Fill from history to start from \
+those words and edit them; clear the box to go back to the mined text, which keeps itself \
+current as you review. The checkbox above still switches the whole block off.",
+            crate::profile::HEADER
+        )));
+
         ui.label(theme::dim(
             "Blind review also shuffles the candidates per comment. Every review is also a \
 labelled example, and knowing which model wrote which suggestion while you choose biases that \
