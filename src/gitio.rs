@@ -195,6 +195,9 @@ pub fn base_label(base: &str) -> &str {
 
 /// Inverse of [`base_label`], so a plan (which stores the label) can re-run
 /// the diff it was built from.
+// The expanded-workflows layer consumes this helper. Keep this stack layer
+// independently lint-clean before that caller is introduced.
+#[allow(dead_code)]
 pub fn base_from_label(label: &str) -> String {
     match label {
         "HEAD" => String::new(),

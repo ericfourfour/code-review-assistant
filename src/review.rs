@@ -649,6 +649,7 @@ mod tests {
         let entry = PendingDecision {
             file: "src/lib.rs".into(),
             line: 2,
+            kind: UnitKind::Comment,
             action: Action::Rewrite,
             provenance: Provenance::Model {
                 name: "agy".into(),
