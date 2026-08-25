@@ -15,6 +15,7 @@ mod models;
 mod notes;
 mod procs;
 mod profile;
+mod publish;
 mod review;
 mod scopes;
 mod settings;
