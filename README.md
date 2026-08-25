@@ -4,7 +4,7 @@ A local assistant for reviewing code changes.
 
 ## Installation
 
-Each command installs the latest release as `code-review-assistant` and makes it available on `PATH`.
+Install the latest binary release for your platform:
 
 ### Linux x86_64
 
