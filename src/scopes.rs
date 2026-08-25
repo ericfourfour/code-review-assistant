@@ -62,7 +62,10 @@ fn grammar_for(path: &str) -> Option<(Grammar, tree_sitter::Language)> {
 /// still something a reviewer has to read, and it reads better coloured.
 fn highlight_only(path: &str) -> Option<(tree_sitter::Language, &'static str)> {
     Some(match extension(path).as_str() {
-        "yaml" | "yml" => (tree_sitter_yaml::LANGUAGE.into(), tree_sitter_yaml::HIGHLIGHTS_QUERY),
+        "yaml" | "yml" => (
+            tree_sitter_yaml::LANGUAGE.into(),
+            tree_sitter_yaml::HIGHLIGHTS_QUERY,
+        ),
         _ => return None,
     })
 }

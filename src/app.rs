@@ -97,21 +97,29 @@ impl PausedCall {
             })
     }
 
-    /// The one-line state a paused card shows.
-    pub fn line(&self) -> String {
+    /// The one-line state a paused card shows. `identifying` is false on a
+    /// blinded card, where the pid is withheld — see [`crate::ui::procs_panel::PausedView`].
+    pub fn line(&self, identifying: bool) -> String {
+        let ran = format!("paused after {}s", self.ran_for.as_secs());
+        if !identifying {
+            return ran;
+        }
         let pid = match self.pid {
             Some(pid) => format!("pid {pid} terminated"),
             None => "no process was running".to_string(),
         };
-        format!("paused after {}s · {pid}", self.ran_for.as_secs())
+        format!("{ran} · {pid}")
     }
 
     /// The session as a human reads it — short enough for a card, whole
-    /// enough to match against what the CLI itself lists.
-    pub fn session_line(&self) -> String {
-        match &self.session {
-            Some(id) => format!("session {id}"),
-            None => "no session id — the CLI reports one only when it finishes".to_string(),
+    /// enough to match against what the CLI itself lists. On a blinded card
+    /// the id itself is withheld and only the answer the reviewer needs — can
+    /// this be picked up again — is given.
+    pub fn session_line(&self, identifying: bool) -> String {
+        match (&self.session, identifying) {
+            (Some(id), true) => format!("session {id}"),
+            (Some(_), false) => "the conversation is still open".to_string(),
+            (None, _) => "no session id — the CLI reports one only when it finishes".to_string(),
         }
     }
 }
@@ -1684,6 +1692,23 @@ impl CraApp {
                 .map(|m| m.name.clone())
                 .unwrap_or_else(|| format!("model {idx}"))
         }
+    }
+
+    /// What to call a model in a view the reviewer did not open on purpose:
+    /// the stop banner, which appears by itself after a navigation.
+    ///
+    /// The candidate cards deliberately carry no pid, session or activity
+    /// while blinded, so nothing pairs them with a ledger row by identifier.
+    /// The banner is the remaining hole: with one call left running it names
+    /// exactly one model beside exactly one paused card, and that is a pairing
+    /// however carefully the card itself is written. Views the reviewer opens
+    /// deliberately — the process ledger, the prompt inspector — keep the real
+    /// names, as the inspector always has.
+    pub fn unbidden_model_label(&self, owner: Owner, model_index: usize, model: &str) -> String {
+        if owner != Owner::Review || !self.names_hidden() {
+            return model.to_string();
+        }
+        self.model_display(model_index)
     }
 
     /// What to call model `idx` in prose — activity lines, follow-up echoes.
@@ -3489,13 +3514,13 @@ impl CraApp {
             model_config,
             command,
             prompt,
-            Some(session.clone()),
+            Some(session),
             &call.what,
         );
-        self.note(
-            "procs",
-            &format!("resumed {} on session {session}", call.model),
-        );
+        // Neither the name nor the session id while blinded: the id is printed
+        // beside the real name in the process ledger.
+        let label = self.model_display(idx);
+        self.note("procs", &format!("resumed {label} on its open session"));
     }
 
     /// Ask a model the current unit again from a new session — what is on
@@ -3515,9 +3540,9 @@ impl CraApp {
         self.sessions[idx] = session.clone();
         let prompt = self.unit_prompt(&unit);
         let what = format!("{}:{} · verdict", unit.file(), unit.start_line());
-        let name = model_config.name.clone();
         self.spawn_one(ctx, idx, model_config, command, prompt, session, &what);
-        self.note("procs", &format!("restarted {name} on a new session"));
+        let label = self.model_display(idx);
+        self.note("procs", &format!("restarted {label} on a new session"));
     }
 
     /// Start one model on the current unit, replacing whatever card it had.
@@ -3797,7 +3822,10 @@ impl CraApp {
             round: self.unit_round,
             stopped: true,
         });
-        self.note("procs", &format!("{} {reason}", c.model));
+        // Named by display position while blinded, like every other line
+        // this log carries about a model.
+        let label = self.model_display(c.model_index);
+        self.note("procs", &format!("{label} {reason}"));
     }
 
     pub fn open_settings(&mut self) {

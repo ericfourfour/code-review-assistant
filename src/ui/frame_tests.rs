@@ -788,6 +788,55 @@ fn the_process_ledger_lays_out_every_state() {
     assert!(app.show_procs, "the window closed itself");
 }
 
+/// Blinding hides which model produced which candidate so the verdict is not
+/// chosen for its author. A paused card carries the identifiers the process
+/// ledger and the stop banner print beside the real name — pid, session id,
+/// spend — so on a blinded card every one of them has to be withheld, or the
+/// blinding is undone by a lookup.
+#[test]
+fn a_blinded_paused_card_gives_away_no_identifier() {
+    let call = paused_call(Some("2f9a1c44-0000"));
+
+    // Unblinded, the card is the full account of what was stopped.
+    let named = call.line(true);
+    assert!(named.contains("pid 31337"), "{named}");
+    assert!(
+        call.session_line(true).contains("2f9a1c44-0000"),
+        "{}",
+        call.session_line(true)
+    );
+
+    // Blinded, none of it survives — and what is left still answers the two
+    // questions the reviewer has: was it stopped, and can it be picked up.
+    let blinded = call.line(false);
+    assert!(blinded.contains("paused after 42s"), "{blinded}");
+    assert!(
+        !blinded.contains("31337"),
+        "the pid is a lookup away from the name: {blinded}"
+    );
+    let session = call.session_line(false);
+    assert!(
+        !session.contains("2f9a1c44"),
+        "the session id names the model too: {session}"
+    );
+    assert!(
+        session.contains("still open"),
+        "the reviewer still needs to know it can resume: {session}"
+    );
+
+    // The same rule for the live card: a tool call or a shell command is
+    // spelled differently by every vendor, so a blinded card counts output
+    // rather than describing it.
+    let handle = crate::procs::ProcHandle::new();
+    handle.on_line(
+        "{\"type\":\"assistant\",\"message\":{\"content\":[\
+{\"type\":\"tool_use\",\"name\":\"Read\",\"input\":{\"file_path\":\"src/config.rs\"}}]}}",
+    );
+    let snap = handle.snapshot();
+    assert_eq!(snap.activity_line(false).unwrap(), "Read src/config.rs");
+    assert_eq!(snap.activity_line(true).unwrap(), "1 line(s) of output");
+}
+
 /// The paused card is what the reviewer comes back to. Both of its offers have
 /// to be drawn, and the one that cannot work has to be the disabled one.
 #[test]
@@ -824,14 +873,14 @@ fn a_paused_card_offers_resume_only_when_there_is_a_session() {
         "there is nothing to continue"
     );
     assert!(
-        without.session_line().contains("no session id"),
+        without.session_line(true).contains("no session id"),
         "{}",
-        without.session_line()
+        without.session_line(true)
     );
     assert!(
-        with_session.line().contains("pid 31337 terminated"),
+        with_session.line(true).contains("pid 31337 terminated"),
         "{}",
-        with_session.line()
+        with_session.line(true)
     );
 
     app.candidates = vec![crate::app::CandidateState::Paused(with_session)];

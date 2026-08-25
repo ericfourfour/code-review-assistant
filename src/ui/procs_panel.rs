@@ -20,6 +20,27 @@ use crate::procs::RunState;
 use crate::settings::Settings;
 use crate::ui::theme;
 
+/// How much of a paused call a page may show.
+///
+/// The review screen's cards are blinded until a choice is made, and a paused
+/// card would otherwise carry exactly the identifiers that the process ledger
+/// and the stop banner print beside the model's real name — its pid, its
+/// session id, what it spent. Any one of them turns a blinded card back into
+/// a named one by lookup, so a blinded view withholds all three and names the
+/// model the way its card is named.
+///
+/// What survives blinding is what the reviewer actually needs from the card:
+/// that the call was stopped, how long it had run, why, and whether the
+/// conversation can be picked up again.
+pub struct PausedView<'a> {
+    /// What to call the model: its own name, or its blinded stand-in.
+    pub name: &'a str,
+    /// Whether the pid, the session id and the spend may be shown.
+    pub identifying: bool,
+    /// Wording for the ask-again button, which differs per page.
+    pub restart_label: &'a str,
+}
+
 /// What the reviewer asked of a paused call.
 #[derive(PartialEq, Eq)]
 pub enum PausedAction {
@@ -42,6 +63,13 @@ pub fn nav_notice(app: &mut CraApp, ctx: &egui::Context) {
     let settled = notice.all_confirmed();
     let mut dismiss = false;
     let mut go_back: Option<crate::app::Screen> = None;
+    // Resolved before the panel borrows the notice, and resolved through the
+    // app so a blinded review's models are named the way their cards are.
+    let names: Vec<String> = notice
+        .receipts
+        .iter()
+        .map(|r| app.unbidden_model_label(r.owner, r.model_index, &r.model))
+        .collect();
 
     egui::TopBottomPanel::top("nav_notice").show(ctx, |ui| {
         ui.horizontal_wrapped(|ui| {
@@ -71,7 +99,7 @@ pub fn nav_notice(app: &mut CraApp, ctx: &egui::Context) {
                 }
             });
         });
-        for r in &notice.receipts {
+        for (r, name) in notice.receipts.iter().zip(&names) {
             ui.horizontal_wrapped(|ui| {
                 let done = r.confirmed();
                 ui.label(
@@ -79,7 +107,7 @@ pub fn nav_notice(app: &mut CraApp, ctx: &egui::Context) {
                         .monospace()
                         .color(if done { theme::TEXT_DIM } else { theme::WARN }),
                 );
-                ui.label(RichText::new(r.line()).monospace().small());
+                ui.label(RichText::new(r.line(name)).monospace().small());
                 ui.label(theme::dim(&format!("({})", r.owner.label())));
                 match &r.session {
                     Some(id) => {
@@ -112,6 +140,14 @@ pub fn nav_notice(app: &mut CraApp, ctx: &egui::Context) {
 }
 
 /// The process ledger, opened from the top bar.
+///
+/// This one names models outright, blinded review or not, exactly as the
+/// prompt inspector beside it does. Blinding governs the surface the reviewer
+/// judges from — the cards, the side panel, the activity log, the banner that
+/// appears unasked — so that a verdict is not chosen for its author. A window
+/// the reviewer opens on purpose to ask which process is which is not that
+/// surface, and answering it with stand-ins would make the ledger useless for
+/// the thing it exists to do.
 pub fn window(app: &mut CraApp, ctx: &egui::Context) {
     if !app.show_procs {
         return;
@@ -249,7 +285,7 @@ pub fn window(app: &mut CraApp, ctx: &egui::Context) {
                         ui.horizontal_wrapped(|ui| {
                             ui.label(RichText::new("    ").monospace().small());
                             ui.label(theme::dim(&row.what));
-                            if let Some(a) = snap.activity_line() {
+                            if let Some(a) = snap.activity_line(false) {
                                 ui.label(theme::dim(&format!("· {a}")));
                             }
                         });
@@ -318,7 +354,7 @@ pub fn paused_row(
     ui: &mut egui::Ui,
     call: &PausedCall,
     settings: &Settings,
-    restart_label: &str,
+    view: PausedView,
 ) -> PausedAction {
     let mut action = PausedAction::None;
     let resumable = call.resumable(settings);
@@ -329,20 +365,23 @@ pub fn paused_row(
         .show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 theme::badge(ui, "PAUSED", theme::WARN);
-                ui.label(RichText::new(&call.model).monospace().small());
-                ui.label(theme::dim(&call.line()));
+                ui.label(RichText::new(view.name).monospace().small());
+                ui.label(theme::dim(&call.line(view.identifying)));
             });
             ui.horizontal_wrapped(|ui| {
                 ui.label(theme::dim(&call.reason));
                 if !call.what.is_empty() {
                     ui.label(theme::dim(&format!("· {}", call.what)));
                 }
-                if !call.usage.is_silent() {
+                // Spend is as good as a name: the models differ by an order of
+                // magnitude, and the figure is printed beside the real one in
+                // the ledger.
+                if view.identifying && !call.usage.is_silent() {
                     ui.label(RichText::new(spend_label(&call.usage)).monospace().small());
                 }
             });
-            ui.horizontal_wrapped(|ui| match &call.session {
-                Some(id) => {
+            ui.horizontal_wrapped(|ui| match (&call.session, view.identifying) {
+                (Some(id), true) => {
                     ui.label(theme::dim("session"));
                     ui.label(
                         RichText::new(short(id))
@@ -352,8 +391,8 @@ pub fn paused_row(
                     )
                     .on_hover_text(format!("session {id}"));
                 }
-                None => {
-                    ui.label(theme::dim(&call.session_line()));
+                _ => {
+                    ui.label(theme::dim(&call.session_line(view.identifying)));
                 }
             });
             ui.horizontal_wrapped(|ui| {
@@ -373,7 +412,7 @@ pub fn paused_row(
                     action = PausedAction::Resume;
                 }
                 if ui
-                    .button(restart_label)
+                    .button(view.restart_label)
                     .on_hover_text("starts a new conversation and pays for the work again")
                     .clicked()
                 {
