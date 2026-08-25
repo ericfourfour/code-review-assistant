@@ -86,7 +86,10 @@ impl CraApp {
                         (None, Some(s)) => format!("gh:{s}  (cloned when opened)"),
                         (None, None) => String::new(),
                     };
-                    (format!("{:<30} {:>5}  {}", r.name, age, place), "exclude (X)")
+                    (
+                        format!("{:<30} {:>5}  {}", r.name, age, place),
+                        "exclude (X)",
+                    )
                 }
             })
             .collect();
@@ -120,22 +123,24 @@ impl CraApp {
         }
 
         ui.add_space(8.0);
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            if n_recent > 0 {
-                theme::section_title(ui, "RECENT REPOSITORIES");
-                for i in 0..n_recent {
-                    self.picker_row(ui, i, &labels[i], &mut open, &mut drop_row);
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if n_recent > 0 {
+                    theme::section_title(ui, "RECENT REPOSITORIES");
+                    for (i, label) in labels.iter().enumerate().take(n_recent) {
+                        self.picker_row(ui, i, label, &mut open, &mut drop_row);
+                    }
+                    ui.add_space(8.0);
                 }
-                ui.add_space(8.0);
-            }
-            self.discovered_header(ui, hidden_old, hidden_excluded);
-            for i in n_recent..n {
-                self.picker_row(ui, i, &labels[i], &mut open, &mut drop_row);
-            }
-            if n == n_recent && !self.scanning_local && !self.scanning_gh {
-                ui.label(theme::dim("nothing discovered — enter a path above"));
-            }
-        });
+                self.discovered_header(ui, hidden_old, hidden_excluded);
+                for (i, label) in labels.iter().enumerate().take(n).skip(n_recent) {
+                    self.picker_row(ui, i, label, &mut open, &mut drop_row);
+                }
+                if n == n_recent && !self.scanning_local && !self.scanning_gh {
+                    ui.label(theme::dim("nothing discovered — enter a path above"));
+                }
+            });
 
         if let Some(i) = drop_row {
             match rows.get(i) {

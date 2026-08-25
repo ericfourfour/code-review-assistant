@@ -9,8 +9,15 @@ use crate::review::{self, Choice};
 use crate::ui::{code, theme};
 
 const NUM_KEYS: [Key; 9] = [
-    Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5,
-    Key::Num6, Key::Num7, Key::Num8, Key::Num9,
+    Key::Num1,
+    Key::Num2,
+    Key::Num3,
+    Key::Num4,
+    Key::Num5,
+    Key::Num6,
+    Key::Num7,
+    Key::Num8,
+    Key::Num9,
 ];
 
 impl CraApp {
@@ -76,9 +83,14 @@ impl CraApp {
         let is_code = unit.is_code();
         ui.horizontal(|ui| {
             ui.label(
-                RichText::new(format!("{}:{}-{}", unit.file(), unit.start_line(), unit.end_line()))
-                    .monospace()
-                    .strong(),
+                RichText::new(format!(
+                    "{}:{}-{}",
+                    unit.file(),
+                    unit.start_line(),
+                    unit.end_line()
+                ))
+                .monospace()
+                .strong(),
             );
             theme::badge(ui, unit.lang(), theme::ACCENT);
             theme::badge(
@@ -95,7 +107,10 @@ impl CraApp {
                 egui::Color32::from_gray(120)
             };
             ui.label(
-                RichText::new(format!("risk {}", risk.score)).small().strong().color(risk_color),
+                RichText::new(format!("risk {}", risk.score))
+                    .small()
+                    .strong()
+                    .color(risk_color),
             )
             .on_hover_text(risk.reasons.join("\n"));
             if let Some(p) = &self.plan {
@@ -208,16 +223,27 @@ impl CraApp {
                 // does not give the model away either.
                 let color = theme::model_color(if hidden { pos } else { i });
                 let frame = egui::Frame::group(ui.style())
-                    .fill(if is_chosen { theme::RAISED } else { theme::PANEL })
+                    .fill(if is_chosen {
+                        theme::RAISED
+                    } else {
+                        theme::PANEL
+                    })
                     .stroke(egui::Stroke::new(
                         if is_chosen { 2.0_f32 } else { 1.0_f32 },
-                        if is_chosen { color } else { egui::Color32::from_gray(50) },
+                        if is_chosen {
+                            color
+                        } else {
+                            egui::Color32::from_gray(50)
+                        },
                     ))
                     .inner_margin(egui::Margin::same(6.0));
                 frame.show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(
-                            RichText::new(format!("[{}]", pos + 1)).monospace().strong().color(color),
+                            RichText::new(format!("[{}]", pos + 1))
+                                .monospace()
+                                .strong()
+                                .color(color),
                         );
                         ui.label(RichText::new(&name).strong().color(color));
                         if !hidden {
@@ -228,7 +254,10 @@ impl CraApp {
                                 .filter(|v| !v.is_empty())
                             {
                                 ui.label(
-                                    RichText::new(variant).monospace().small().color(theme::TEXT_DIM),
+                                    RichText::new(variant)
+                                        .monospace()
+                                        .small()
+                                        .color(theme::TEXT_DIM),
                                 );
                             }
                             if let Some(Some(id)) = self.sessions.get(i) {
@@ -256,7 +285,9 @@ impl CraApp {
                                     ui.label(theme::dim(&a));
                                 }
                             }
-                            Some(CandidateState::Failed(_)) => theme::badge(ui, "ERROR", theme::BAD),
+                            Some(CandidateState::Failed(_)) => {
+                                theme::badge(ui, "ERROR", theme::BAD)
+                            }
                             _ => {
                                 ui.label(theme::dim("disabled"));
                             }
@@ -288,8 +319,10 @@ impl CraApp {
                                         (Action::Keep, true) => "(approve — sound as written)",
                                         (Action::Delete, false) => "(delete this comment)",
                                         (Action::Delete, true) => "(delete these lines)",
-                                        (Action::Flag, _) => "(flagged — no replacement proposed; \
-                                                              the concern above is the verdict)",
+                                        (Action::Flag, _) => {
+                                            "(flagged — no replacement proposed; \
+                                                              the concern above is the verdict)"
+                                        }
                                         (Action::Rewrite, _) => "",
                                     };
                                     if stand_in.is_empty() {
@@ -322,9 +355,8 @@ impl CraApp {
                                         } else {
                                             format!("{}:{}", ev.file, ev.lines)
                                         };
-                                        let resp = ui.small_button(
-                                            RichText::new(label).monospace().small(),
-                                        );
+                                        let resp = ui
+                                            .small_button(RichText::new(label).monospace().small());
                                         let resp = if ev.note.trim().is_empty() {
                                             resp
                                         } else {
@@ -352,7 +384,11 @@ impl CraApp {
                                 {
                                     ask_one = Some(i);
                                 }
-                                if ui.button("🗎").on_hover_text("show the prompt/transcript").clicked() {
+                                if ui
+                                    .button("🗎")
+                                    .on_hover_text("show the prompt/transcript")
+                                    .clicked()
+                                {
                                     show_prompt = Some(i);
                                 }
                             });
@@ -360,10 +396,17 @@ impl CraApp {
                         Some(CandidateState::Failed(e)) => {
                             ui.label(RichText::new(crate::app::truncate(e, 220)).color(theme::BAD));
                             ui.horizontal(|ui| {
-                                if ui.add_enabled(can_ask, egui::Button::new("↩ ask")).clicked() {
+                                if ui
+                                    .add_enabled(can_ask, egui::Button::new("↩ ask"))
+                                    .clicked()
+                                {
                                     ask_one = Some(i);
                                 }
-                                if ui.button("🗎").on_hover_text("show the prompt/transcript").clicked() {
+                                if ui
+                                    .button("🗎")
+                                    .on_hover_text("show the prompt/transcript")
+                                    .clicked()
+                                {
                                     show_prompt = Some(i);
                                 }
                             });
@@ -403,8 +446,8 @@ impl CraApp {
                 resp.request_focus();
                 self.focus_follow_up = false;
             }
-            let submitted = resp.lost_focus()
-                && ctx.input(|i| i.key_pressed(Key::Enter) && !i.modifiers.shift);
+            let submitted =
+                resp.lost_focus() && ctx.input(|i| i.key_pressed(Key::Enter) && !i.modifiers.shift);
             ask_all = send_all || submitted;
         });
         if let Some(i) = ask_one {
@@ -445,8 +488,8 @@ impl CraApp {
                 resp.request_focus();
                 self.focus_note = false;
             }
-            let submitted = resp.lost_focus()
-                && ctx.input(|i| i.key_pressed(Key::Enter) && !i.modifiers.shift);
+            let submitted =
+                resp.lost_focus() && ctx.input(|i| i.key_pressed(Key::Enter) && !i.modifiers.shift);
             leave = leave || submitted;
         });
         if leave {
@@ -481,7 +524,11 @@ impl CraApp {
                 let ui = &mut cols[0];
                 ui.horizontal(|ui| {
                     theme::section_title(ui, "ORIGINAL");
-                    let keep_label = if is_code { "approve as-is [K]" } else { "keep [K]" };
+                    let keep_label = if is_code {
+                        "approve as-is [K]"
+                    } else {
+                        "keep [K]"
+                    };
                     if ui.small_button(keep_label).clicked() {
                         keep_clicked = true;
                     }
@@ -594,10 +641,24 @@ impl CraApp {
                 return;
             }
             ui.separator();
-            if ui.button(if is_code { "Approve as-is [K]" } else { "Keep original [K]" }).clicked() {
+            if ui
+                .button(if is_code {
+                    "Approve as-is [K]"
+                } else {
+                    "Keep original [K]"
+                })
+                .clicked()
+            {
                 self.choose_keep();
             }
-            if ui.button(if is_code { "Delete lines [D]" } else { "Delete [D]" }).clicked() {
+            if ui
+                .button(if is_code {
+                    "Delete lines [D]"
+                } else {
+                    "Delete [D]"
+                })
+                .clicked()
+            {
                 self.choose_delete();
             }
             if ui.button("Re-run models [R]").clicked() {
@@ -640,7 +701,9 @@ impl CraApp {
     /// model says it read, so the human can weigh the verdict against the
     /// same context — not the model's paraphrase of it.
     pub(crate) fn evidence_window(&mut self, ctx: &egui::Context) {
-        let Some(ev) = self.show_evidence.clone() else { return };
+        let Some(ev) = self.show_evidence.clone() else {
+            return;
+        };
         let mut open = true;
         egui::Window::new(format!("evidence · {}", ev.file))
             .id(egui::Id::new("evidence_window"))
@@ -664,7 +727,10 @@ impl CraApp {
                         // worth knowing when weighing the verdict.
                         ui.colored_label(
                             theme::BAD,
-                            format!("could not read {} — the model may have misreported it ({e})", ev.file),
+                            format!(
+                                "could not read {} — the model may have misreported it ({e})",
+                                ev.file
+                            ),
                         );
                         return;
                     }
@@ -693,7 +759,11 @@ impl CraApp {
                     .skip(view_lo)
                     .map(|(i, line)| {
                         let in_range = i >= lo && i <= hi;
-                        let base = if in_range { theme::CODE } else { theme::CODE_CTX };
+                        let base = if in_range {
+                            theme::CODE
+                        } else {
+                            theme::CODE_CTX
+                        };
                         let row = code::Line::code(*line, base)
                             .gutter(format!("{:>5}| ", i + 1), theme::GUTTER);
                         if in_range {
@@ -703,9 +773,11 @@ impl CraApp {
                         }
                     })
                     .collect();
-                egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
-                    code::show(ui, &ev.file, &rows);
-                });
+                egui::ScrollArea::both()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        code::show(ui, &ev.file, &rows);
+                    });
             });
         if !open {
             self.show_evidence = None;
@@ -715,7 +787,9 @@ impl CraApp {
     /// Floating inspector for exactly what was piped to a model CLI and what
     /// it printed back, including every follow-up turn.
     fn prompt_window(&mut self, ctx: &egui::Context) {
-        let Some(model_index) = self.show_prompt else { return };
+        let Some(model_index) = self.show_prompt else {
+            return;
+        };
         let name = self
             .settings
             .models
@@ -764,7 +838,7 @@ impl CraApp {
                             if t.reply.is_empty() {
                                 ui.horizontal(|ui| {
                                     ui.spinner();
-                // The running turn: the same live view
+                                    // The running turn: the same live view
                                     // the candidate row shows.
                                     if let Some(CandidateState::Pending(live)) =
                                         self.candidates.get(model_index)
@@ -782,7 +856,9 @@ impl CraApp {
                                     }
                                 });
                             } else {
-                                ui.label(RichText::new(&t.reply).monospace().color(theme::TEXT_DIM));
+                                ui.label(
+                                    RichText::new(&t.reply).monospace().color(theme::TEXT_DIM),
+                                );
                             }
                             ui.add_space(8.0);
                         }
@@ -797,7 +873,7 @@ impl CraApp {
 /// What to assume the pane overhead is before a frame has measured it.
 /// Deliberately generous: too large only makes the first frame's panes short,
 /// where too small would let them push the buttons off the screen — and the
-    /// real figure arrives before anyone can read either.
+/// real figure arrives before anyone can read either.
 const FIRST_FRAME_OVERHEAD: f32 = 160.0;
 
 /// How much height the ORIGINAL and FINAL panes get: whatever is left once
@@ -859,7 +935,12 @@ fn context_rows(context: &str) -> Vec<code::Line> {
 /// error they have to interpret.
 fn evidence_range(spec: &str, len: usize) -> (usize, usize) {
     let last = len.saturating_sub(1);
-    let parse = |s: &str| s.trim().trim_start_matches(['L', 'l']).parse::<usize>().ok();
+    let parse = |s: &str| {
+        s.trim()
+            .trim_start_matches(['L', 'l'])
+            .parse::<usize>()
+            .ok()
+    };
     let spec = spec.trim();
     let (a, b) = match spec.split_once(['-', ':']) {
         Some((a, b)) => (parse(a), parse(b)),
@@ -923,8 +1004,16 @@ mod tests {
         assert_eq!(evidence_range("12-40", 100), (11, 39));
         assert_eq!(evidence_range("12", 100), (11, 11));
         assert_eq!(evidence_range("L12-L40", 100), (11, 39));
-        assert_eq!(evidence_range("40-12", 100), (39, 39), "a backwards range never inverts");
-        assert_eq!(evidence_range("90-200", 100), (89, 99), "clamped to the file");
+        assert_eq!(
+            evidence_range("40-12", 100),
+            (39, 39),
+            "a backwards range never inverts"
+        );
+        assert_eq!(
+            evidence_range("90-200", 100),
+            (89, 99),
+            "clamped to the file"
+        );
         assert_eq!(evidence_range("", 100), (0, 39), "no range shows the top");
         assert_eq!(evidence_range("garbage", 10), (0, 9));
     }

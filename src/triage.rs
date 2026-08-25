@@ -25,27 +25,76 @@ const RISK_RULES: &[RiskRule] = &[
     RiskRule {
         label: "security-sensitive terms",
         points: 15,
-        terms: &["passw", "secret", "credential", "api_key", "apikey", "private_key",
-                   "authent", "authoriz", "permission", "crypt", "certif"],
+        terms: &[
+            "passw",
+            "secret",
+            "credential",
+            "api_key",
+            "apikey",
+            "private_key",
+            "authent",
+            "authoriz",
+            "permission",
+            "crypt",
+            "certif",
+        ],
     },
     RiskRule {
         label: "concurrency",
         points: 12,
-        terms: &["mutex", "rwlock", ".lock(", "atomic", "thread", "spawn", "channel",
-                   "semaphore", "concurren", "race "],
+        terms: &[
+            "mutex",
+            "rwlock",
+            ".lock(",
+            "atomic",
+            "thread",
+            "spawn",
+            "channel",
+            "semaphore",
+            "concurren",
+            "race ",
+        ],
     },
     RiskRule {
         label: "panics or unsafe code",
         points: 12,
-        terms: &["unsafe", ".unwrap(", ".expect(", "panic!", "unimplemented!", "todo!",
-                   "unreachable!", "assert!", "raise ", "throw "],
+        terms: &[
+            "unsafe",
+            ".unwrap(",
+            ".expect(",
+            "panic!",
+            "unimplemented!",
+            "todo!",
+            "unreachable!",
+            "assert!",
+            "raise ",
+            "throw ",
+        ],
     },
     RiskRule {
         label: "external effects",
         points: 10,
-        terms: &["subprocess", "command", "exec(", "system(", "eval(", "shell",
-                   "sql", "query(", "http", "request(", "socket", "std::fs", "os.remove",
-                   "unlink", "rmdir", "delete", "truncate", "drop table", "migrat"],
+        terms: &[
+            "subprocess",
+            "command",
+            "exec(",
+            "system(",
+            "eval(",
+            "shell",
+            "sql",
+            "query(",
+            "http",
+            "request(",
+            "socket",
+            "std::fs",
+            "os.remove",
+            "unlink",
+            "rmdir",
+            "delete",
+            "truncate",
+            "drop table",
+            "migrat",
+        ],
     },
     RiskRule {
         label: "unfinished-work markers",
@@ -68,7 +117,9 @@ fn is_test_path(path: &str) -> bool {
 
 fn is_doc_path(path: &str) -> bool {
     let p = path.to_ascii_lowercase();
-    [".md", ".markdown", ".rst", ".txt", ".adoc"].iter().any(|ext| p.ends_with(ext))
+    [".md", ".markdown", ".rst", ".txt", ".adoc"]
+        .iter()
+        .any(|ext| p.ends_with(ext))
 }
 pub fn assess(unit: &ReviewUnit) -> Risk {
     let mut score: u32 = 0;
@@ -83,7 +134,12 @@ pub fn assess(unit: &ReviewUnit) -> Risk {
         ReviewUnit::Code(u) => {
             add(&mut score, &mut reasons, 25, "code change".into());
             if u.scope.is_none() {
-                add(&mut score, &mut reasons, 8, "no enclosing scope found".into());
+                add(
+                    &mut score,
+                    &mut reasons,
+                    8,
+                    "no enclosing scope found".into(),
+                );
             }
         }
     }
@@ -94,21 +150,40 @@ pub fn assess(unit: &ReviewUnit) -> Risk {
     };
     let size_pts = (2 * changed as u32).min(20);
     if size_pts > 0 {
-        add(&mut score, &mut reasons, size_pts, format!("{changed} changed line(s)"));
+        add(
+            &mut score,
+            &mut reasons,
+            size_pts,
+            format!("{changed} changed line(s)"),
+        );
     }
 
     // Removed lines appear in the context as `-` rows; deleting code is a
     // classic place for a regression to hide.
-    let removed = unit.context().lines().filter(|l| l.starts_with('-')).count();
+    let removed = unit
+        .context()
+        .lines()
+        .filter(|l| l.starts_with('-'))
+        .count();
     if removed > 0 {
         let pts = (3 * removed as u32).min(12);
-        add(&mut score, &mut reasons, pts, format!("removes {removed} line(s)"));
+        add(
+            &mut score,
+            &mut reasons,
+            pts,
+            format!("removes {removed} line(s)"),
+        );
     }
 
     let unit_text = unit.raw_lines().join("\n").to_ascii_lowercase();
     for rule in RISK_RULES {
         if rule.terms.iter().any(|term| unit_text.contains(term)) {
-            add(&mut score, &mut reasons, rule.points, rule.label.to_string());
+            add(
+                &mut score,
+                &mut reasons,
+                rule.points,
+                rule.label.to_string(),
+            );
         }
     }
 
@@ -120,7 +195,10 @@ pub fn assess(unit: &ReviewUnit) -> Risk {
         reasons.push("halved: test code".into());
     }
 
-    Risk { score: score.min(100), reasons }
+    Risk {
+        score: score.min(100),
+        reasons,
+    }
 }
 
 pub fn order_riskiest_first(files: &mut Vec<(String, Vec<ReviewUnit>)>) {
@@ -130,15 +208,15 @@ pub fn order_riskiest_first(files: &mut Vec<(String, Vec<ReviewUnit>)>) {
             let mut scored: Vec<(u32, ReviewUnit)> =
                 units.into_iter().map(|u| (assess(&u).score, u)).collect();
             scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.start_line().cmp(&b.1.start_line())));
-            
+
             let file_risk = scored.first().map(|s| s.0).unwrap_or(0);
             let sorted_units = scored.into_iter().map(|(_, u)| u).collect();
-            
+
             (file_risk, (name, sorted_units))
         })
         .collect();
-    
-    file_scores.sort_by(|a, b| b.0.cmp(&a.0));
+
+    file_scores.sort_by_key(|a| std::cmp::Reverse(a.0));
     files.extend(file_scores.into_iter().map(|(_, f)| f));
 }
 #[cfg(test)]
@@ -156,13 +234,21 @@ mod tests {
             end_line: line,
             raw_lines: vec![text.to_string()],
             indent,
-            style: CommentStyle::Line { prefix: "//".into() },
+            style: CommentStyle::Line {
+                prefix: "//".into(),
+            },
             context: String::new(),
             hunk_header: String::new(),
             has_added: true,
         })
     }
-    fn code(file: &str, line: u32, lines: &[&str], scope: Option<&str>, context: &str) -> ReviewUnit {
+    fn code(
+        file: &str,
+        line: u32,
+        lines: &[&str],
+        scope: Option<&str>,
+        context: &str,
+    ) -> ReviewUnit {
         ReviewUnit::Code(CodeUnit {
             file: file.into(),
             lang: "Rust".into(),
@@ -190,8 +276,16 @@ mod tests {
         ));
         assert!(plain_code.score > plain_comment.score);
         assert!(scary_code.score > plain_code.score);
-        assert!(scary_code.reasons.iter().any(|r| r.contains("unsafe")), "{:?}", scary_code.reasons);
-        assert!(scary_code.reasons.iter().any(|r| r.contains("concurrency")), "{:?}", scary_code.reasons);
+        assert!(
+            scary_code.reasons.iter().any(|r| r.contains("unsafe")),
+            "{:?}",
+            scary_code.reasons
+        );
+        assert!(
+            scary_code.reasons.iter().any(|r| r.contains("concurrency")),
+            "{:?}",
+            scary_code.reasons
+        );
     }
     #[test]
     fn removals_and_missing_scope_raise_the_score() {
@@ -202,10 +296,22 @@ mod tests {
             None,
             ">    5| keep();\n-     | gone();\n",
         ));
-        let without = assess(&code("src/a.rs", 5, &["    keep();"], Some("fn f"), ">    5| keep();\n"));
+        let without = assess(&code(
+            "src/a.rs",
+            5,
+            &["    keep();"],
+            Some("fn f"),
+            ">    5| keep();\n",
+        ));
         assert!(with_removal.score > without.score);
-        assert!(with_removal.reasons.iter().any(|r| r.contains("removes 1 line")));
-        assert!(with_removal.reasons.iter().any(|r| r.contains("no enclosing scope")));
+        assert!(with_removal
+            .reasons
+            .iter()
+            .any(|r| r.contains("removes 1 line")));
+        assert!(with_removal
+            .reasons
+            .iter()
+            .any(|r| r.contains("no enclosing scope")));
     }
 
     #[test]
@@ -215,20 +321,43 @@ mod tests {
         let prose = &["This guards secrets with a mutex; unsafe code panics on TODO."];
         let doc = assess(&code("README.md", 1, prose, None, ""));
         let src = assess(&code("src/vault.rs", 1, prose, None, ""));
-        assert!(doc.score < src.score / 2, "doc {} vs code {}", doc.score, src.score);
-        assert!(doc.reasons.iter().any(|r| r.contains("documentation")), "{:?}", doc.reasons);
+        assert!(
+            doc.score < src.score / 2,
+            "doc {} vs code {}",
+            doc.score,
+            src.score
+        );
+        assert!(
+            doc.reasons.iter().any(|r| r.contains("documentation")),
+            "{:?}",
+            doc.reasons
+        );
     }
     #[test]
     fn test_files_are_halved_and_the_score_is_bounded() {
-        let prod = assess(&code("src/auth.rs", 1, &["    check_password(secret);"], Some("fn f"), ""));
-        let test = assess(&code("tests/auth.rs", 1, &["    check_password(secret);"], Some("fn f"), ""));
+        let prod = assess(&code(
+            "src/auth.rs",
+            1,
+            &["    check_password(secret);"],
+            Some("fn f"),
+            "",
+        ));
+        let test = assess(&code(
+            "tests/auth.rs",
+            1,
+            &["    check_password(secret);"],
+            Some("fn f"),
+            "",
+        ));
         assert_eq!(test.score, prod.score / 2);
         assert!(test.reasons.iter().any(|r| r.contains("test code")));
 
         let everything = assess(&code(
             "src/kitchen.rs",
             1,
-            &["unsafe passw mutex subprocess todo fixme; ".repeat(30).as_str()],
+            &["unsafe passw mutex subprocess todo fixme; "
+                .repeat(30)
+                .as_str()],
             None,
             &"-     | gone\n".repeat(10),
         ));
@@ -248,7 +377,10 @@ mod tests {
         let mut files = vec![
             (
                 "src/a_mild.rs".to_string(),
-                vec![comment("src/a_mild.rs", 2, "// a"), comment("src/a_mild.rs", 9, "// b")],
+                vec![
+                    comment("src/a_mild.rs", 2, "// a"),
+                    comment("src/a_mild.rs", 9, "// b"),
+                ],
             ),
             (
                 "src/z_mild.rs".to_string(),
@@ -258,13 +390,25 @@ mod tests {
                 "src/hot.rs".to_string(),
                 vec![
                     comment("src/hot.rs", 3, "// note"),
-                    code("src/hot.rs", 40, &["    unsafe { go(); }"], Some("fn f"), ""),
+                    code(
+                        "src/hot.rs",
+                        40,
+                        &["    unsafe { go(); }"],
+                        Some("fn f"),
+                        "",
+                    ),
                 ],
             ),
         ];
         order_riskiest_first(&mut files);
-        assert_eq!(files[0].0, "src/hot.rs", "the file with the riskiest unit leads");
-        assert!(files[0].1[0].is_code(), "within a file, the risky code unit leads");
+        assert_eq!(
+            files[0].0, "src/hot.rs",
+            "the file with the riskiest unit leads"
+        );
+        assert!(
+            files[0].1[0].is_code(),
+            "within a file, the risky code unit leads"
+        );
         assert_eq!(files[0].1[1].start_line(), 3);
         // Equal-score files stay in original diff order.
         assert_eq!(files[1].0, "src/a_mild.rs");

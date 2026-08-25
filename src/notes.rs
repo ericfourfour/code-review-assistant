@@ -62,7 +62,12 @@ path below is relative to it. Line numbers and excerpts are from review time —
 files may have shifted since, so find the code, don't trust the numbers.\n",
     );
     for (i, n) in notes.iter().enumerate() {
-        out.push_str(&format!("\n--- note {} · {} ---\n{}\n", i + 1, n.locus(), n.text.trim()));
+        out.push_str(&format!(
+            "\n--- note {} · {} ---\n{}\n",
+            i + 1,
+            n.locus(),
+            n.text.trim()
+        ));
         if !n.excerpt.trim().is_empty() {
             out.push_str("The code the note was written on, as it stood then:\n");
             for line in n.excerpt.lines() {
@@ -93,19 +98,31 @@ mod tests {
 
     #[test]
     fn locus_collapses_single_line_ranges() {
-        assert_eq!(note(1, "src/a.rs", 12, 18, "", "").locus(), "src/a.rs:12-18");
+        assert_eq!(
+            note(1, "src/a.rs", 12, 18, "", "").locus(),
+            "src/a.rs:12-18"
+        );
         assert_eq!(note(1, "src/a.rs", 12, 12, "", "").locus(), "src/a.rs:12");
     }
 
     #[test]
     fn the_fix_prompt_carries_every_note_in_order_with_its_code() {
         let notes = vec![
-            note(1, "src/a.rs", 10, 12, "This retry loop appears in four files — extract it.", "    retry();"),
+            note(
+                1,
+                "src/a.rs",
+                10,
+                12,
+                "This retry loop appears in four files — extract it.",
+                "    retry();",
+            ),
             note(2, "src/b.rs", 5, 5, "Error type swallows the cause.", ""),
         ];
         let p = build_fix_prompt("Fix these.", &notes);
         assert!(p.starts_with("Fix these."));
-        let n1 = p.find("note 1 · src/a.rs:10-12").expect("first note present");
+        let n1 = p
+            .find("note 1 · src/a.rs:10-12")
+            .expect("first note present");
         let n2 = p.find("note 2 · src/b.rs:5").expect("second note present");
         assert!(n1 < n2, "notes must keep review order");
         assert!(p.contains("extract it."));

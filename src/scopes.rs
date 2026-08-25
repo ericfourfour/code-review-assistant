@@ -105,7 +105,7 @@ impl ParsedFile {
     /// scope. Errors in the source degrade to smaller answers, never wrong
     /// ones — tree-sitter always produces a tree.
     pub fn scope_for(&self, target0: usize) -> Option<Scope> {
-    // Start matching past the indentation: at column 0 an indented `def` line
+        // Start matching past the indentation: at column 0 an indented `def` line
         // resolves to the *enclosing* block, not the definition on the line.
         let column = self
             .lines
@@ -151,7 +151,10 @@ impl ParsedFile {
             .map(|l| l.len() - l.trim_start().len())
             .unwrap_or(0);
         let point = Point { row: row0, column };
-        let mut node = self.tree.root_node().descendant_for_point_range(point, point)?;
+        let mut node = self
+            .tree
+            .root_node()
+            .descendant_for_point_range(point, point)?;
         loop {
             if self.is_definition(&node) && node.start_position().row == row0 {
                 let start = self.attached_start(&node);
@@ -196,7 +199,7 @@ impl ParsedFile {
                     self.collect_spans(child, lo0, hi0, max_len, depth + 1, &mut inner);
                     if inner.len() >= 2 {
                         let first_inner = inner[0].0;
-                        if first_inner > start && start <= hi0 && first_inner - 1 >= lo0 {
+                        if first_inner > start && start <= hi0 && first_inner > lo0 {
                             out.push((start, first_inner - 1));
                         }
                         out.extend(inner);
@@ -515,10 +518,22 @@ mod tests {
     fn attachment_above_answers_only_for_a_definitions_own_first_line() {
         let src = "use x;\n\n/// Doc one.\n/// Doc two.\nstruct S {\n    a: u32,\n}\n\nfn bare() {\n    work();\n}\n";
         let p = parsed("a.rs", src);
-        assert_eq!(p.attachment_above(4), Some(2), "the struct's doc run starts two rows up");
+        assert_eq!(
+            p.attachment_above(4),
+            Some(2),
+            "the struct's doc run starts two rows up"
+        );
         assert_eq!(p.attachment_above(8), None, "fn bare has nothing attached");
-        assert_eq!(p.attachment_above(5), None, "a body line is not a definition top");
-        assert_eq!(p.attachment_above(2), None, "the comment itself claims nothing");
+        assert_eq!(
+            p.attachment_above(5),
+            None,
+            "a body line is not a definition top"
+        );
+        assert_eq!(
+            p.attachment_above(2),
+            None,
+            "the comment itself claims nothing"
+        );
         assert_eq!(p.attachment_above(0), None, "a use is not a definition");
     }
 

@@ -90,7 +90,12 @@ fn lang_fallback(path: &str) -> String {
     }
 }
 
-fn units_in_file(repo: &str, f: &DiffFile, context_lines: usize, new_side: NewSide) -> Vec<CodeUnit> {
+fn units_in_file(
+    repo: &str,
+    f: &DiffFile,
+    context_lines: usize,
+    new_side: NewSide,
+) -> Vec<CodeUnit> {
     let spec = crate::comments::lang_for(&f.path);
     let lang = spec
         .as_ref()
@@ -130,16 +135,20 @@ fn units_in_file(repo: &str, f: &DiffFile, context_lines: usize, new_side: NewSi
         NewSide::Head => crate::gitio::file_at_head(repo, &f.path),
         NewSide::Index => crate::gitio::file_at_index(repo, &f.path),
     };
-    let full: Option<Vec<String>> =
-        full_src.as_ref().map(|c| c.lines().map(|s| s.to_string()).collect());
+    let full: Option<Vec<String>> = full_src
+        .as_ref()
+        .map(|c| c.lines().map(|s| s.to_string()).collect());
     // One real parse per file; every semantic question below goes through it.
-    let parsed: Option<crate::scopes::ParsedFile> =
-        full_src.as_deref().and_then(|src| crate::scopes::parse(&f.path, src));
+    let parsed: Option<crate::scopes::ParsedFile> = full_src
+        .as_deref()
+        .and_then(|src| crate::scopes::parse(&f.path, src));
 
     let mut units = Vec::new();
     for hunk in &f.hunks {
         let span: Vec<u32> = hunk.lines.iter().filter_map(|l| l.new_lineno).collect();
-        let (Some(&first_new), Some(&last_new)) = (span.first(), span.last()) else { continue };
+        let (Some(&first_new), Some(&last_new)) = (span.first(), span.last()) else {
+            continue;
+        };
 
         // Positions worth reviewing: added lines that are code, plus an
         // review position for every run of removed code. A removal directly replaced
@@ -178,7 +187,10 @@ fn units_in_file(repo: &str, f: &DiffFile, context_lines: usize, new_side: NewSi
                 let removal_position = if cursor >= first_new {
                     cursor
                 } else {
-                    hunk.lines.get(idx).and_then(|n| n.new_lineno).unwrap_or(first_new)
+                    hunk.lines
+                        .get(idx)
+                        .and_then(|n| n.new_lineno)
+                        .unwrap_or(first_new)
                 };
                 positions.insert(removal_position.clamp(first_new, last_new));
             }
@@ -220,7 +232,10 @@ fn units_in_file(repo: &str, f: &DiffFile, context_lines: usize, new_side: NewSi
                     let att = att0 as u32 + 1;
                     let floor = units.last().map(|u: &CodeUnit| u.end_line + 1).unwrap_or(1);
                     let carried = (att..rs).all(|no| {
-                        match (new_text.get(&no), full.as_ref().and_then(|f| f.get(no as usize - 1))) {
+                        match (
+                            new_text.get(&no),
+                            full.as_ref().and_then(|f| f.get(no as usize - 1)),
+                        ) {
                             (Some(a), Some(b)) => a == b,
                             _ => false,
                         }
@@ -230,10 +245,11 @@ fn units_in_file(repo: &str, f: &DiffFile, context_lines: usize, new_side: NewSi
                     }
                 }
             }
-            let raw_lines: Vec<String> = match (rs..=re).map(|no| new_text.get(&no).cloned()).collect() {
-                Some(lines) => lines,
-                None => continue, // hole in the diff — should not happen
-            };
+            let raw_lines: Vec<String> =
+                match (rs..=re).map(|no| new_text.get(&no).cloned()).collect() {
+                    Some(lines) => lines,
+                    None => continue, // hole in the diff — should not happen
+                };
             let changed_lines: Vec<u32> = added.range(rs..=re).copied().collect();
             let (scope, context) = context_for(
                 full.as_deref(),
@@ -398,7 +414,9 @@ fn split_region(
     if e - s < MAX_REGION_LINES {
         return vec![region];
     }
-    blank_split(region, &|no| new_text.get(&no).is_some_and(|t| t.trim().is_empty()))
+    blank_split(region, &|no| {
+        new_text.get(&no).is_some_and(|t| t.trim().is_empty())
+    })
 }
 
 /// One window per definition the region spans, or `None` when that comes to a
@@ -416,8 +434,7 @@ fn semantic_split(
     region: (u32, u32),
 ) -> Option<Vec<(u32, u32)>> {
     let (s, e) = region;
-    let items =
-        parsed.definition_spans(s as usize - 1, e as usize - 1, MAX_REGION_LINES as usize);
+    let items = parsed.definition_spans(s as usize - 1, e as usize - 1, MAX_REGION_LINES as usize);
     // (start, end, is a definition rather than the gap before one)
     let mut segs: Vec<(u32, u32, bool)> = Vec::new();
     let mut cursor = s;
@@ -449,8 +466,16 @@ fn semantic_split(
         return None; // nothing here to separate from anything else
     }
 
-    let is_blank = |no: u32| full.get(no as usize - 1).is_some_and(|t| t.trim().is_empty());
-    Some(windows.into_iter().flat_map(|w| blank_split(w, &is_blank)).collect())
+    let is_blank = |no: u32| {
+        full.get(no as usize - 1)
+            .is_some_and(|t| t.trim().is_empty())
+    };
+    Some(
+        windows
+            .into_iter()
+            .flat_map(|w| blank_split(w, &is_blank))
+            .collect(),
+    )
 }
 
 /// Blank-line splitting, the last resort: windows of at most the cap, each
@@ -519,12 +544,18 @@ fn context_for(
             let mid = (rs + re) / 2;
             if let Some(scope) = parsed.scope_for(mid as usize - 1) {
                 let start0 = scope.start0.min(rs as usize - 1);
-                let end0 = scope.end0.max(re as usize - 1).min(full.len().saturating_sub(1));
+                let end0 = scope
+                    .end0
+                    .max(re as usize - 1)
+                    .min(full.len().saturating_sub(1));
                 if end0 - start0 < MAX_SCOPE_LINES {
                     let numbered: Vec<(u32, &str)> = (start0..=end0)
                         .map(|i| (i as u32 + 1, full[i].as_str()))
                         .collect();
-                    return (Some(scope.header), render(&numbered, region, added, removals));
+                    return (
+                        Some(scope.header),
+                        render(&numbered, region, added, removals),
+                    );
                 }
             }
         }
@@ -652,7 +683,11 @@ diff --git a/src/main.rs b/src/main.rs
         let out = extract_one(&dir.path().to_string_lossy(), RS_DIFF);
         assert_eq!(out.len(), 1);
         let units = &out[0].1;
-        assert_eq!(units.len(), 1, "both added lines share a scope and a cluster");
+        assert_eq!(
+            units.len(),
+            1,
+            "both added lines share a scope and a cluster"
+        );
         let u = &units[0];
         assert_eq!(u.scope.as_deref(), Some("fn main()"));
         // The region is the changed cluster (code lines only start it, but the
@@ -684,9 +719,21 @@ diff --git a/src/main.rs b/src/main.rs
         );
         // Built line by line: the blank context line must be a single space,
         // which a literal here would invite editors to trim away.
-        let diff = ["diff --git a/src/lib.rs b/src/lib.rs", "--- a/src/lib.rs", "+++ b/src/lib.rs",
-            "@@ -1,5 +1,7 @@", " fn a() {", "+    one();", " }", " ", " fn b() {", "+    two();", " }", ""]
-            .join("\n");
+        let diff = [
+            "diff --git a/src/lib.rs b/src/lib.rs",
+            "--- a/src/lib.rs",
+            "+++ b/src/lib.rs",
+            "@@ -1,5 +1,7 @@",
+            " fn a() {",
+            "+    one();",
+            " }",
+            " ",
+            " fn b() {",
+            "+    two();",
+            " }",
+            "",
+        ]
+        .join("\n");
         let out = extract_one(&dir.path().to_string_lossy(), &diff);
         let units = &out[0].1;
         assert_eq!(units.len(), 2, "two changed functions, two units");
@@ -718,16 +765,36 @@ diff --git a/src/main.rs b/src/main.rs
         );
         // Built line by line: the blank context line must be a single space,
         // which a literal here would invite editors to trim away.
-        let diff = ["diff --git a/src/lib.rs b/src/lib.rs", "--- a/src/lib.rs", "+++ b/src/lib.rs",
-            "@@ -1,8 +1,8 @@", " use x;", " ", " /// Doc one.", " /// Doc two.", "-struct Bucket {",
-            "+struct Rule {", "     b: u32,", "-    needles: u32,", "+    terms: u32,", " }", ""]
-            .join("\n");
+        let diff = [
+            "diff --git a/src/lib.rs b/src/lib.rs",
+            "--- a/src/lib.rs",
+            "+++ b/src/lib.rs",
+            "@@ -1,8 +1,8 @@",
+            " use x;",
+            " ",
+            " /// Doc one.",
+            " /// Doc two.",
+            "-struct Bucket {",
+            "+struct Rule {",
+            "     b: u32,",
+            "-    needles: u32,",
+            "+    terms: u32,",
+            " }",
+            "",
+        ]
+        .join("\n");
         let out = extract_one(&dir.path().to_string_lossy(), &diff);
         let units = &out[0].1;
         assert_eq!(units.len(), 1);
         let u = &units[0];
-        assert_eq!(u.start_line, 3, "the attached doc run belongs to the region");
-        assert_eq!(u.raw_lines.first().map(|s| s.as_str()), Some("/// Doc one."));
+        assert_eq!(
+            u.start_line, 3,
+            "the attached doc run belongs to the region"
+        );
+        assert_eq!(
+            u.raw_lines.first().map(|s| s.as_str()),
+            Some("/// Doc one.")
+        );
         assert_eq!(u.scope.as_deref(), Some("struct Rule"));
         // The docs are region lines now, not merely context.
         assert!(u.context.contains(">    3| /// Doc one."), "{}", u.context);
@@ -765,7 +832,10 @@ diff --git a/config.conf b/config.conf
         let out = extract_one(&dir.path().to_string_lossy(), diff);
         assert_eq!(out.len(), 1);
         let u = &out[0].1[0];
-        assert!(u.scope.is_none(), "no scope detection for unknown languages");
+        assert!(
+            u.scope.is_none(),
+            "no scope detection for unknown languages"
+        );
         assert_eq!((u.start_line, u.end_line), (2, 2));
         assert_eq!(u.lang, "conf");
         assert!(u.context.contains(">    2| b = 2"), "{}", u.context);
@@ -791,7 +861,11 @@ diff --git a/src/main.rs b/src/main.rs
         // Represented by the line the removal followed; nothing was added.
         assert_eq!((u.start_line, u.end_line), (2, 2));
         assert!(u.changed_lines.is_empty());
-        assert!(u.context.contains("-     | ") && u.context.contains("gone();"), "{}", u.context);
+        assert!(
+            u.context.contains("-     | ") && u.context.contains("gone();"),
+            "{}",
+            u.context
+        );
     }
 
     #[test]
@@ -817,9 +891,8 @@ diff --git a/src/main.rs b/src/main.rs
         let body: String = (1..=30).map(|i| format!("line{i}();\n")).collect();
         write(&dir, "a.js", &body);
         // Two additions 20 lines apart inside one big hunk.
-        let mut diff = String::from(
-            "diff --git a/a.js b/a.js\n--- a/a.js\n+++ b/a.js\n@@ -1,28 +1,30 @@\n",
-        );
+        let mut diff =
+            String::from("diff --git a/a.js b/a.js\n--- a/a.js\n+++ b/a.js\n@@ -1,28 +1,30 @@\n");
         for i in 1..=30 {
             let origin = if i == 3 || i == 25 { "+" } else { " " };
             diff.push_str(&format!("{origin}line{i}();\n"));
@@ -851,8 +924,9 @@ diff --git a/src/main.rs b/src/main.rs
 
     fn added_file_diff(path: &str, body: &str) -> String {
         let n = body.lines().count();
-        let mut diff =
-            format!("diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -0,0 +1,{n} @@\n");
+        let mut diff = format!(
+            "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -0,0 +1,{n} @@\n"
+        );
         for line in body.lines() {
             diff.push_str(&format!("+{line}\n"));
         }
@@ -889,12 +963,17 @@ pub fn assess(path: &str) -> Risk {
             "the point is that this splits without being oversized"
         );
         write(&dir, "src/triage.rs", body);
-        let out = extract_one(&dir.path().to_string_lossy(), &added_file_diff("src/triage.rs", body));
+        let out = extract_one(
+            &dir.path().to_string_lossy(),
+            &added_file_diff("src/triage.rs", body),
+        );
         let units = &out[0].1;
         assert_windows(units);
         let lines: Vec<&str> = body.lines().collect();
-        let starts: Vec<&str> =
-            units.iter().map(|u| lines[u.start_line as usize - 1].trim()).collect();
+        let starts: Vec<&str> = units
+            .iter()
+            .map(|u| lines[u.start_line as usize - 1].trim())
+            .collect();
         assert_eq!(
             starts,
             vec![
@@ -910,7 +989,10 @@ pub fn assess(path: &str) -> Risk {
         // a hunk window covering half the file. Only the imports above the
         // first one have no definition to be judged against.
         let scopes: Vec<Option<&String>> = units.iter().map(|u| u.scope.as_ref()).collect();
-        assert!(scopes[0].is_none(), "the import block is not inside a definition");
+        assert!(
+            scopes[0].is_none(),
+            "the import block is not inside a definition"
+        );
         assert!(scopes[1..].iter().all(|s| s.is_some()), "{scopes:?}");
     }
 
@@ -921,7 +1003,12 @@ pub fn assess(path: &str) -> Risk {
         let dir = TempDir::new("onedef");
         write(&dir, "src/main.rs", RS_FILE);
         let out = extract_one(&dir.path().to_string_lossy(), RS_DIFF);
-        assert_eq!(out[0].1.len(), 1, "{:?}", out[0].1.iter().map(|u| u.start_line).collect::<Vec<_>>());
+        assert_eq!(
+            out[0].1.len(),
+            1,
+            "{:?}",
+            out[0].1.iter().map(|u| u.start_line).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -938,14 +1025,21 @@ pub fn assess(path: &str) -> Risk {
             body.push_str("}\n\n");
         }
         write(&dir, "src/gen.rs", &body);
-        let out = extract_one(&dir.path().to_string_lossy(), &added_file_diff("src/gen.rs", &body));
+        let out = extract_one(
+            &dir.path().to_string_lossy(),
+            &added_file_diff("src/gen.rs", &body),
+        );
         let units = &out[0].1;
-        assert!(units.len() >= 2, "{} lines must split", body.lines().count());
+        assert!(
+            units.len() >= 2,
+            "{} lines must split",
+            body.lines().count()
+        );
         assert_windows(units);
         let lines: Vec<&str> = body.lines().collect();
         for u in &units[1..] {
             let first = lines[u.start_line as usize - 1].trim();
-        // Every section starts at a definition top (doc line or fn header) —
+            // Every section starts at a definition top (doc line or fn header) —
             // never mid-function, even though blank lines exist inside none
             // and between all of them.
             assert!(
@@ -971,7 +1065,10 @@ pub fn assess(path: &str) -> Risk {
         }
         body.push_str("}\n");
         write(&dir, "src/s.rs", &body);
-        let out = extract_one(&dir.path().to_string_lossy(), &added_file_diff("src/s.rs", &body));
+        let out = extract_one(
+            &dir.path().to_string_lossy(),
+            &added_file_diff("src/s.rs", &body),
+        );
         let units = &out[0].1;
         assert!(units.len() >= 3, "the impl is bigger than one window");
         assert_windows(units);
@@ -979,12 +1076,18 @@ pub fn assess(path: &str) -> Risk {
         // The impl's own header line is a window of its own, not the tail of
         // the struct above it.
         let header = lines[units[1].start_line as usize - 1].trim();
-        assert!(header.starts_with("impl S"), "expected the impl header: {header:?}");
+        assert!(
+            header.starts_with("impl S"),
+            "expected the impl header: {header:?}"
+        );
         for u in &units[2..] {
             let first = lines[u.start_line as usize - 1].trim();
             // The impl itself is over the cap, so the split must descend to
             // its methods rather than falling back to blank lines.
-            assert!(first.starts_with("fn m"), "window starts mid-method: {first:?}");
+            assert!(
+                first.starts_with("fn m"),
+                "window starts mid-method: {first:?}"
+            );
         }
     }
 
@@ -1000,14 +1103,20 @@ pub fn assess(path: &str) -> Risk {
             body.push('\n');
         }
         write(&dir, "svc.py", &body);
-        let out = extract_one(&dir.path().to_string_lossy(), &added_file_diff("svc.py", &body));
+        let out = extract_one(
+            &dir.path().to_string_lossy(),
+            &added_file_diff("svc.py", &body),
+        );
         let units = &out[0].1;
         assert!(units.len() >= 2);
         assert_windows(units);
         let lines: Vec<&str> = body.lines().collect();
         for u in &units[1..] {
             let first = lines[u.start_line as usize - 1].trim();
-            assert!(first.starts_with("def "), "window starts mid-def: {first:?}");
+            assert!(
+                first.starts_with("def "),
+                "window starts mid-def: {first:?}"
+            );
         }
     }
 
@@ -1024,13 +1133,19 @@ pub fn assess(path: &str) -> Risk {
             }
         }
         write(&dir, "big.js", &body);
-        let mut diff = String::from("diff --git a/big.js b/big.js\n--- a/big.js\n+++ b/big.js\n@@ -0,0 +1,300 @@\n");
+        let mut diff = String::from(
+            "diff --git a/big.js b/big.js\n--- a/big.js\n+++ b/big.js\n@@ -0,0 +1,300 @@\n",
+        );
         for line in body.lines() {
             diff.push_str(&format!("+{line}\n"));
         }
         let out = extract_one(&dir.path().to_string_lossy(), &diff);
         let units = &out[0].1;
-        assert!(units.len() >= 3, "300 added lines should not be one unit: {}", units.len());
+        assert!(
+            units.len() >= 3,
+            "300 added lines should not be one unit: {}",
+            units.len()
+        );
         let lines: Vec<&str> = body.lines().collect();
         for (i, u) in units.iter().enumerate() {
             let len = u.end_line - u.start_line + 1;
@@ -1039,7 +1154,10 @@ pub fn assess(path: &str) -> Risk {
             if i > 0 {
                 // The cut lands at a blank line, which then belongs to no
                 // window: only blank lines may sit in the gap.
-                assert!(u.start_line > units[i - 1].end_line, "windows must stay ordered");
+                assert!(
+                    u.start_line > units[i - 1].end_line,
+                    "windows must stay ordered"
+                );
                 assert!(
                     (units[i - 1].end_line + 1..u.start_line)
                         .all(|no| lines[no as usize - 1].trim().is_empty()),
@@ -1053,7 +1171,11 @@ pub fn assess(path: &str) -> Risk {
             );
         }
         assert_eq!(units.first().unwrap().start_line, 1);
-        assert_eq!(units.last().unwrap().end_line, 299, "the last content line ends the last window");
+        assert_eq!(
+            units.last().unwrap().end_line,
+            299,
+            "the last content line ends the last window"
+        );
     }
 
     #[test]
@@ -1088,7 +1210,10 @@ diff --git a/src/main.rs b/src/main.rs
 ";
         let out = extract_one(&dir.path().to_string_lossy(), diff);
         let u = &out[0].1[0];
-        assert!(u.scope.is_none(), "a {MAX_SCOPE_LINES}+ line scope is not an excerpt");
+        assert!(
+            u.scope.is_none(),
+            "a {MAX_SCOPE_LINES}+ line scope is not an excerpt"
+        );
         assert!(u.context.contains(">  302| "), "{}", u.context);
     }
 
@@ -1113,11 +1238,17 @@ diff --git a/src/main.rs b/src/main.rs
         }
         body.push_str("}\n");
         write(&dir, "src/lib.rs", &body);
-        let out = extract_one(&dir.path().to_string_lossy(), &added_file_diff("src/lib.rs", &body));
+        let out = extract_one(
+            &dir.path().to_string_lossy(),
+            &added_file_diff("src/lib.rs", &body),
+        );
         let units = &out[0].1;
         assert_windows(units);
         let lines: Vec<&str> = body.lines().collect();
-        let cfg_line = 1 + lines.iter().position(|l| l.trim() == "#[cfg(test)]").unwrap() as u32;
+        let cfg_line = 1 + lines
+            .iter()
+            .position(|l| l.trim() == "#[cfg(test)]")
+            .unwrap() as u32;
         for u in units {
             assert!(
                 u.end_line < cfg_line || u.start_line >= cfg_line,
@@ -1128,9 +1259,17 @@ diff --git a/src/main.rs b/src/main.rs
         }
         // The module's preamble is its own unit: cfg attribute through the
         // `use` lines, ending before the first test.
-        let pre = units.iter().find(|u| u.start_line == cfg_line).expect("preamble unit");
-        assert!(lines[pre.end_line as usize].trim().is_empty() || lines[pre.end_line as usize].trim().starts_with("#[test]"),
-            "the preamble must stop before the first test: {}-{}", pre.start_line, pre.end_line);
+        let pre = units
+            .iter()
+            .find(|u| u.start_line == cfg_line)
+            .expect("preamble unit");
+        assert!(
+            lines[pre.end_line as usize].trim().is_empty()
+                || lines[pre.end_line as usize].trim().starts_with("#[test]"),
+            "the preamble must stop before the first test: {}-{}",
+            pre.start_line,
+            pre.end_line
+        );
     }
 
     /// The dogfooding failure this guards: reviewing a branch (whose diff's
@@ -1155,18 +1294,28 @@ diff --git a/src/main.rs b/src/main.rs
         repo.write("src/lib.rs", &body);
         repo.commit("tests");
         // An uncommitted edit above the module shifts every line on disk.
-        repo.write("src/lib.rs", &format!("// wip\n// wip\n// wip\n// wip\n{body}"));
+        repo.write(
+            "src/lib.rs",
+            &format!("// wip\n// wip\n// wip\n// wip\n{body}"),
+        );
 
         let diff = added_file_diff("src/lib.rs", &body);
         let files = crate::diffparse::parse(&diff);
         let out = extract(&repo.path(), &files, 12, NewSide::Head);
         let units = &out[0].1;
         assert_windows(units);
-        assert!(units.len() >= 8, "one unit per test case, not one wall: {}", units.len());
+        assert!(
+            units.len() >= 8,
+            "one unit per test case, not one wall: {}",
+            units.len()
+        );
         let lines: Vec<&str> = body.lines().collect();
         for u in &units[1..] {
             let first = lines[u.start_line as usize - 1].trim();
-            assert!(first.starts_with("#[test]"), "window starts mid-test: {first:?}");
+            assert!(
+                first.starts_with("#[test]"),
+                "window starts mid-test: {first:?}"
+            );
             assert!(u.scope.is_some(), "each test judged in its own scope");
         }
 

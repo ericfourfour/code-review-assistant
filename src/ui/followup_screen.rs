@@ -57,7 +57,11 @@ right is where their fate is read.",
                     .show(ui, |ui| {
                         for row in self.notes.iter_mut() {
                             egui::Frame::group(ui.style())
-                                .fill(if row.checked { theme::RAISED } else { theme::PANEL })
+                                .fill(if row.checked {
+                                    theme::RAISED
+                                } else {
+                                    theme::PANEL
+                                })
                                 .stroke(egui::Stroke::new(
                                     1.0_f32,
                                     if row.checked {
@@ -158,7 +162,7 @@ right is where their fate is read.",
                     let current = self
                         .settings
                         .models
-                            .get(self.selected_fix_model_index)
+                        .get(self.selected_fix_model_index)
                         .map(|m| m.name.clone())
                         .unwrap_or_else(|| "—".into());
                     egui::ComboBox::from_id_salt("fix_model_pick")
@@ -166,7 +170,7 @@ right is where their fate is read.",
                         .show_ui(ui, |ui| {
                             for (idx, name) in &model_options {
                                 ui.selectable_value(
-                            &mut self.selected_fix_model_index,
+                                    &mut self.selected_fix_model_index,
                                     *idx,
                                     RichText::new(name).monospace(),
                                 );
@@ -205,7 +209,9 @@ right is where their fate is read.",
                     }
                 });
                 if model_options.is_empty() {
-                    ui.label(theme::dim("no models enabled — enable one in settings (Ctrl+,)"));
+                    ui.label(theme::dim(
+                        "no models enabled — enable one in settings (Ctrl+,)",
+                    ));
                 }
                 ui.add_space(4.0);
 
@@ -223,7 +229,9 @@ right is where their fate is read.",
                         .show(ui, |ui| {
                             for (i, t) in self.fix_convo.iter().enumerate() {
                                 theme::section_title(ui, &format!("SENT — turn {}", i + 1));
-                                ui.label(RichText::new(&t.prompt).monospace().color(theme::TEXT_DIM));
+                                ui.label(
+                                    RichText::new(&t.prompt).monospace().color(theme::TEXT_DIM),
+                                );
                                 ui.add_space(4.0);
                                 theme::section_title(ui, &format!("RECEIVED — turn {}", i + 1));
                                 if t.reply.is_empty() {
@@ -271,9 +279,7 @@ right is where their fate is read.",
                                 ),
                         );
                         let submitted = resp.lost_focus()
-                            && ctx.input(|i| {
-                                i.key_pressed(egui::Key::Enter) && !i.modifiers.shift
-                            });
+                            && ctx.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
                         send = clicked || submitted;
                     });
                 }

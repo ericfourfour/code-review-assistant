@@ -53,8 +53,16 @@ impl CraApp {
             let total: usize = p.files.iter().map(|f| f.total_lines).sum();
             ui.horizontal(|ui| {
                 ui.label(theme::dim("diff"));
-                ui.label(RichText::new(format!("+{added}")).small().color(theme::ADDED));
-                ui.label(RichText::new(format!("−{removed}")).small().color(theme::REMOVED));
+                ui.label(
+                    RichText::new(format!("+{added}"))
+                        .small()
+                        .color(theme::ADDED),
+                );
+                ui.label(
+                    RichText::new(format!("−{removed}"))
+                        .small()
+                        .color(theme::REMOVED),
+                );
                 ui.label(theme::dim(&format!(
                     " ·  {to_review} line(s) to review{}",
                     match total {
@@ -66,7 +74,12 @@ impl CraApp {
         }
         // Say what is missing and why, or a plan shortened by past decisions
         // looks like an extractor that lost things.
-        if let Some(n) = self.plan.as_ref().map(|p| p.skipped_decided).filter(|n| *n > 0) {
+        if let Some(n) = self
+            .plan
+            .as_ref()
+            .map(|p| p.skipped_decided)
+            .filter(|n| *n > 0)
+        {
             ui.label(theme::dim(&format!(
                 "{n} more unit(s) already decided in this repository and left out"
             )));
@@ -83,7 +96,12 @@ impl CraApp {
                         path: f.path.clone(),
                         comments: f.units.len() - code,
                         code,
-                        risk: f.units.iter().map(|u| crate::triage::assess(u).score).max().unwrap_or(0),
+                        risk: f
+                            .units
+                            .iter()
+                            .map(|u| crate::triage::assess(u).score)
+                            .max()
+                            .unwrap_or(0),
                         decided: f.decided,
                         line_changes: f.line_changes,
                         review_lines: f.review_lines(),
@@ -91,17 +109,19 @@ impl CraApp {
                     }
                 })
                 .collect();
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                for (i, row) in rows.iter().enumerate() {
-                    let resp = ui.selectable_label(i == self.file_sel, row.job(ui));
-                    if resp.clicked() {
-                        self.file_sel = i;
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for (i, row) in rows.iter().enumerate() {
+                        let resp = ui.selectable_label(i == self.file_sel, row.job(ui));
+                        if resp.clicked() {
+                            self.file_sel = i;
+                        }
+                        if resp.double_clicked() {
+                            start_at = Some(i);
+                        }
                     }
-                    if resp.double_clicked() {
-                        start_at = Some(i);
-                    }
-                }
-            });
+                });
         } else {
             ui.label(theme::dim("no plan — pick a branch or PR first"));
         }
@@ -134,7 +154,15 @@ impl Row {
         let mut job = LayoutJob::default();
         job.wrap.max_width = f32::INFINITY;
         let mut push = |text: String, color: Color32| {
-            job.append(&text, 0.0, TextFormat { font_id: font.clone(), color, ..Default::default() })
+            job.append(
+                &text,
+                0.0,
+                TextFormat {
+                    font_id: font.clone(),
+                    color,
+                    ..Default::default()
+                },
+            )
         };
 
         let text = ui.visuals().text_color();

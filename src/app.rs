@@ -5,7 +5,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 
 use crate::db::Db;
 use crate::discover::{self, DiscoveredRepo};
-use crate::findings::{self, WholeBranchReviewMsg, Finding};
+use crate::findings::{self, Finding, WholeBranchReviewMsg};
 use crate::gitio::{self, BranchInfo, PrInfo};
 use crate::models::{self, Action, CandidateMsg, Evidence, Suggestion, Turn};
 use crate::notes::Note;
@@ -98,7 +98,9 @@ impl Prefetch {
 
     /// Every model that was queried has replied.
     pub fn complete(&self) -> bool {
-        self.spawned.iter().all(|&i| self.replies.get(i).is_some_and(|r| r.is_some()))
+        self.spawned
+            .iter()
+            .all(|&i| self.replies.get(i).is_some_and(|r| r.is_some()))
     }
 
     /// Every reply is in and every one of them says keep. A failed model is
@@ -126,10 +128,20 @@ pub enum Msg {
 /// Streamed repository discovery: each repository as it is found, then one
 /// `Done` per source so the picker knows when the spinner can stop.
 pub enum RepoMsg {
-    Found { seq: u64, repo: DiscoveredRepo },
-    Done { seq: u64, source: RepoSource, err: Option<String> },
+    Found {
+        seq: u64,
+        repo: DiscoveredRepo,
+    },
+    Done {
+        seq: u64,
+        source: RepoSource,
+        err: Option<String>,
+    },
     /// A `gh repo clone` finished; `Ok` carries the new checkout's path.
-    Cloned { slug: String, result: Result<String, String> },
+    Cloned {
+        slug: String,
+        result: Result<String, String>,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -143,7 +155,10 @@ pub enum WholeBranchReviewState {
     Idle,
     /// Running; the handle is the live view updated by the worker thread.
     Pending(models::LiveHandle),
-    Done { n: usize, latency_ms: i64 },
+    Done {
+        n: usize,
+        latency_ms: i64,
+    },
     Failed(String),
 }
 
@@ -453,8 +468,11 @@ impl CraApp {
             discover::scan_local(&root, discover::MAX_DEPTH, |repo| {
                 let _ = tx.send(Msg::Repo(RepoMsg::Found { seq, repo }));
             });
-            let _ =
-                tx.send(Msg::Repo(RepoMsg::Done { seq, source: RepoSource::Local, err: None }));
+            let _ = tx.send(Msg::Repo(RepoMsg::Done {
+                seq,
+                source: RepoSource::Local,
+                err: None,
+            }));
         });
 
         let tx = self.tx.clone();
@@ -464,8 +482,11 @@ impl CraApp {
                 for repo in repos {
                     let _ = tx.send(Msg::Repo(RepoMsg::Found { seq, repo }));
                 }
-                let _ = tx
-                    .send(Msg::Repo(RepoMsg::Done { seq, source: RepoSource::GitHub, err: None }));
+                let _ = tx.send(Msg::Repo(RepoMsg::Done {
+                    seq,
+                    source: RepoSource::GitHub,
+                    err: None,
+                }));
             }
             Err(e) => {
                 let _ = tx.send(Msg::Repo(RepoMsg::Done {
@@ -488,7 +509,8 @@ impl CraApp {
                 // Also into the visible list, so results appear as they are
                 // found instead of when the whole scan completes.
                 discover::merge(&mut self.discovered, repo);
-                self.discovered.sort_by_key(|r| std::cmp::Reverse(r.last_update));
+                self.discovered
+                    .sort_by_key(|r| std::cmp::Reverse(r.last_update));
             }
             RepoMsg::Done { seq, source, err } => {
                 if seq != self.repo_scan_seq {
@@ -508,7 +530,8 @@ impl CraApp {
                     // The fresh list replaces the merged view: a repository
                     // deleted since the cache was built drops out here.
                     self.discovered = std::mem::take(&mut self.scan_fresh);
-                    self.discovered.sort_by_key(|r| std::cmp::Reverse(r.last_update));
+                    self.discovered
+                        .sort_by_key(|r| std::cmp::Reverse(r.last_update));
                     self.repo_cache_at = chrono::Utc::now().timestamp();
                     discover::save_cache(&self.db, &self.discovered, self.repo_cache_at);
                     self.note(
@@ -548,7 +571,10 @@ impl CraApp {
             dir => dir.to_string(),
         };
         let name = slug.rsplit('/').next().unwrap_or(&slug).to_string();
-        let dest = std::path::Path::new(&root).join(&name).to_string_lossy().to_string();
+        let dest = std::path::Path::new(&root)
+            .join(&name)
+            .to_string_lossy()
+            .to_string();
         if std::path::Path::new(&dest).exists() {
             if gitio::is_git_repo(&dest) {
                 self.select_repo(dest);
@@ -673,7 +699,8 @@ impl CraApp {
         let path = repo.path.clone();
         if gitio::is_dirty(&path) {
             self.ref_error = Some(
-                "working tree has uncommitted changes; commit/stash before checking out a PR".into(),
+                "working tree has uncommitted changes; commit/stash before checking out a PR"
+                    .into(),
             );
             return;
         }
@@ -682,7 +709,11 @@ impl CraApp {
             self.ref_error = Some(e);
             return;
         }
-        self.build_plan(RefKind::Pr(pr.number), pr.head_ref.clone(), pr.base_ref.clone());
+        self.build_plan(
+            RefKind::Pr(pr.number),
+            pr.head_ref.clone(),
+            pr.base_ref.clone(),
+        );
     }
 
     fn build_plan(&mut self, kind: RefKind, ref_name: String, base: String) {
@@ -696,8 +727,7 @@ impl CraApp {
             }
         };
         let files = crate::diffparse::parse(&diff);
-        let (want_comments, want_code) =
-            (self.settings.review_comments, self.settings.review_code);
+        let (want_comments, want_code) = (self.settings.review_comments, self.settings.review_code);
         let mut extracted = units::assemble(
             &path,
             &files,
@@ -755,8 +785,10 @@ impl CraApp {
             .iter()
             .map(|(_, u)| u.iter().filter(|u| !u.is_code()).count())
             .sum();
-        let n_code: usize =
-            extracted.iter().map(|(_, u)| u.iter().filter(|u| u.is_code()).count()).sum();
+        let n_code: usize = extracted
+            .iter()
+            .map(|(_, u)| u.iter().filter(|u| u.is_code()).count())
+            .sum();
         // Measurements for the picker: what the diff did to each file, and how
         // big the file is that it did it to. Taken here because this is the
         // only place that holds both the parsed diff and the checkout.
@@ -847,9 +879,10 @@ impl CraApp {
         for entry in corpus.entries {
             match files.iter_mut().find(|f| f.path == entry.unit.file()) {
                 Some(f) => f.units.push(entry.unit),
-                None => {
-                    files.push(ReviewFile::new(entry.unit.file().to_string(), vec![entry.unit]))
-                }
+                None => files.push(ReviewFile::new(
+                    entry.unit.file().to_string(),
+                    vec![entry.unit],
+                )),
             }
         }
         let n_units: usize = files.iter().map(|f| f.units.len()).sum();
@@ -911,7 +944,8 @@ impl CraApp {
         self.stale_unit = None;
 
         let Some((unit, file, line)) = self.plan.as_ref().and_then(|p| {
-            p.current().map(|(_, u)| (u.clone(), u.file().to_string(), u.start_line()))
+            p.current()
+                .map(|(_, u)| (u.clone(), u.file().to_string(), u.start_line()))
         }) else {
             self.prefetches.clear();
             self.screen = Screen::Summary;
@@ -966,7 +1000,11 @@ impl CraApp {
         let prompt = self.unit_prompt(unit);
         // The CLIs are started here so the paths in the prompt resolve and the
         // rest of the codebase is within reach.
-        let repo_path = self.repo.as_ref().map(|r| r.path.clone()).unwrap_or_default();
+        let repo_path = self
+            .repo
+            .as_ref()
+            .map(|r| r.path.clone())
+            .unwrap_or_default();
         let cli_home = self.cli_home(&repo_path);
         let timeout = self.settings.model_timeout_secs;
         let enabled_models: Vec<_> = self
@@ -981,7 +1019,10 @@ impl CraApp {
             if session.is_some() {
                 self.sessions[idx] = session;
             }
-            self.convos[idx].push(Turn { prompt: prompt.clone(), reply: String::new() });
+            self.convos[idx].push(Turn {
+                prompt: prompt.clone(),
+                reply: String::new(),
+            });
             let live = models::LiveHandle::new();
             self.candidates[idx] = CandidateState::Pending(live.clone());
             let tx = self.tx.clone();
@@ -1012,17 +1053,22 @@ impl CraApp {
         self.sessions = pf.sessions.clone();
         let mut arrived = 0usize;
         for &idx in &pf.spawned {
-            let Some(model) = self.candidate_models.get(idx) else { continue };
+            let Some(model) = self.candidate_models.get(idx) else {
+                continue;
+            };
             let reply = pf.replies.get_mut(idx).and_then(|r| r.take());
             let turn_reply = match &reply {
                 Some(r) => reply_text(&r.result, &r.raw),
                 None => String::new(),
             };
             if let Some(convo) = self.convos.get_mut(idx) {
-                convo.push(Turn { prompt: pf.prompt.clone(), reply: turn_reply });
+                convo.push(Turn {
+                    prompt: pf.prompt.clone(),
+                    reply: turn_reply,
+                });
             }
             let Some(r) = reply else {
-        // Still running: show it as pending with the prefetch's own
+                // Still running: show it as pending with the prefetch's own
                 // live view, so the clock reads from the real start.
                 if let Some(c) = self.candidates.get_mut(idx) {
                     let live = pf.lives.get(idx).cloned().flatten().unwrap_or_default();
@@ -1047,11 +1093,18 @@ impl CraApp {
         }
         self.note(
             "review",
-            &format!("{file}:{line} — prefetched, {arrived}/{} answer(s) already in", pf.spawned.len()),
+            &format!(
+                "{file}:{line} — prefetched, {arrived}/{} answer(s) already in",
+                pf.spawned.len()
+            ),
         );
         // A model enabled since the prefetch started was never queried; ask it
         // now, under the adopted sequence, so every enabled model still finishes.
-        let repo_path = self.repo.as_ref().map(|r| r.path.clone()).unwrap_or_default();
+        let repo_path = self
+            .repo
+            .as_ref()
+            .map(|r| r.path.clone())
+            .unwrap_or_default();
         let cli_home = self.cli_home(&repo_path);
         let timeout = self.settings.model_timeout_secs;
         let enabled_models: Vec<_> = self
@@ -1072,7 +1125,10 @@ impl CraApp {
                 }
             }
             if let Some(convo) = self.convos.get_mut(idx) {
-                convo.push(Turn { prompt: pf.prompt.clone(), reply: String::new() });
+                convo.push(Turn {
+                    prompt: pf.prompt.clone(),
+                    reply: String::new(),
+                });
             }
             let live = models::LiveHandle::new();
             if let Some(c) = self.candidates.get_mut(idx) {
@@ -1104,7 +1160,9 @@ impl CraApp {
         if !self.settings.prefetch_next {
             return;
         }
-        let Some(next) = self.plan.as_ref().and_then(|p| p.peek_next()).cloned() else { return };
+        let Some(next) = self.plan.as_ref().and_then(|p| p.peek_next()).cloned() else {
+            return;
+        };
         if self.prefetches.iter().any(|p| p.is_for(&next)) {
             return;
         }
@@ -1114,7 +1172,11 @@ impl CraApp {
         let session_id = self.plan.as_ref().map(|p| p.session_id).unwrap_or(0);
         let seq = self.next_seq();
         let prompt = self.unit_prompt(&next);
-        let repo_path = self.repo.as_ref().map(|r| r.path.clone()).unwrap_or_default();
+        let repo_path = self
+            .repo
+            .as_ref()
+            .map(|r| r.path.clone())
+            .unwrap_or_default();
         let cli_home = self.cli_home(&repo_path);
         let timeout = self.settings.model_timeout_secs;
         let models = self.settings.models.clone();
@@ -1122,7 +1184,12 @@ impl CraApp {
         let mut sessions = vec![None; n];
         let mut spawned = Vec::new();
         let mut lives: Vec<Option<models::LiveHandle>> = vec![None; n];
-        for (idx, model) in models.iter().cloned().enumerate().filter(|(_, m)| m.enabled) {
+        for (idx, model) in models
+            .iter()
+            .cloned()
+            .enumerate()
+            .filter(|(_, m)| m.enabled)
+        {
             let (command, session) = opening_command(&model);
             if session.is_some() {
                 sessions[idx] = session;
@@ -1180,7 +1247,10 @@ impl CraApp {
             return;
         }
         loop {
-            let Some(unit) = self.plan.as_ref().and_then(|p| p.current().map(|(_, u)| u.clone()))
+            let Some(unit) = self
+                .plan
+                .as_ref()
+                .and_then(|p| p.current().map(|(_, u)| u.clone()))
             else {
                 return;
             };
@@ -1213,11 +1283,9 @@ impl CraApp {
     /// write it is not fatal: the CLI falls back to its own defaults, which is
     /// how it behaved before this existed.
     fn cli_home(&mut self, repo: &str) -> String {
-        let wanted = self
-            .settings
-            .enabled_models()
-            .iter()
-            .any(|(_, m)| m.command.contains("{cli_home}") || m.resume_command.contains("{cli_home}"));
+        let wanted = self.settings.enabled_models().iter().any(|(_, m)| {
+            m.command.contains("{cli_home}") || m.resume_command.contains("{cli_home}")
+        });
         if !wanted {
             return String::new();
         }
@@ -1260,8 +1328,7 @@ impl CraApp {
             Some(i) => vec![i],
             None => (0..self.candidates.len()).collect(),
         };
-        let targets: Vec<usize> =
-            targets.into_iter().filter(|&i| self.can_ask(i)).collect();
+        let targets: Vec<usize> = targets.into_iter().filter(|&i| self.can_ask(i)).collect();
         if targets.is_empty() {
             self.review_error =
                 Some("no model has a resumable session ready for a follow-up yet".into());
@@ -1274,8 +1341,13 @@ impl CraApp {
         let session_id = self.plan.as_ref().map(|p| p.session_id).unwrap_or(0);
         self.unit_round += 1;
         let follow_up_id =
-            self.db.log_follow_up(session_id, &file, start, end, self.unit_round, &message);
-        let repo_path = self.repo.as_ref().map(|r| r.path.clone()).unwrap_or_default();
+            self.db
+                .log_follow_up(session_id, &file, start, end, self.unit_round, &message);
+        let repo_path = self
+            .repo
+            .as_ref()
+            .map(|r| r.path.clone())
+            .unwrap_or_default();
         let cli_home = self.cli_home(&repo_path);
         let timeout = self.settings.model_timeout_secs;
         let is_code = self.current_unit().map(|u| u.is_code()).unwrap_or(false);
@@ -1289,7 +1361,10 @@ impl CraApp {
             };
             let command = model_config.resume_command.replace("{session}", &session);
             let prompt = models::followup_prompt(&message, is_code);
-            self.convos[idx].push(Turn { prompt: prompt.clone(), reply: String::new() });
+            self.convos[idx].push(Turn {
+                prompt: prompt.clone(),
+                reply: String::new(),
+            });
             let live = models::LiveHandle::new();
             self.candidates[idx] = CandidateState::Pending(live.clone());
             if let Some(p) = self.pending_follow_up.get_mut(idx) {
@@ -1318,8 +1393,15 @@ impl CraApp {
         // as much of a tell as which one answered.
         let order = self.candidate_order();
         sent.sort_by_key(|i| order.iter().position(|s| s == i).unwrap_or(*i));
-        let who = sent.iter().map(|&i| self.model_display(i)).collect::<Vec<_>>().join(", ");
-        self.note("follow-up", &format!("asked {who}: {}", truncate(&message, 80)));
+        let who = sent
+            .iter()
+            .map(|&i| self.model_display(i))
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.note(
+            "follow-up",
+            &format!("asked {who}: {}", truncate(&message, 80)),
+        );
     }
 
     /// Display position -> model index for the current comment. Identity when
@@ -1357,12 +1439,18 @@ impl CraApp {
     /// Resolves the display position itself so log text honours blinding the
     /// same way the candidate cards do.
     pub fn model_display(&self, idx: usize) -> String {
-        let pos = self.candidate_order().iter().position(|&s| s == idx).unwrap_or(idx);
+        let pos = self
+            .candidate_order()
+            .iter()
+            .position(|&s| s == idx)
+            .unwrap_or(idx);
         self.model_label(idx, pos)
     }
 
     pub fn current_unit(&self) -> Option<ReviewUnit> {
-        self.plan.as_ref().and_then(|p| p.current().map(|(_, u)| u.clone()))
+        self.plan
+            .as_ref()
+            .and_then(|p| p.current().map(|(_, u)| u.clone()))
     }
 
     pub fn choose_candidate(&mut self, model_index: usize) {
@@ -1373,7 +1461,9 @@ impl CraApp {
             return;
         };
         let s = s.clone();
-        let Some(unit) = self.current_unit() else { return };
+        let Some(unit) = self.current_unit() else {
+            return;
+        };
         let text = match s.action {
             // A flag proposes no text: picking it endorses the concern, and
             // the unit's lines stay as they are.
@@ -1389,7 +1479,10 @@ impl CraApp {
         let name = self.model_display(model_index);
         self.note(
             "choice",
-            &format!("picked {name} ({})", units::action_label(s.action, unit.kind())),
+            &format!(
+                "picked {name} ({})",
+                units::action_label(s.action, unit.kind())
+            ),
         );
     }
 
@@ -1433,7 +1526,7 @@ impl CraApp {
 
     /// Commit the entry's file with a message covering it plus every decision
     /// still pending on the same file — otherwise a batch of `Save and
-            /// Continue`s would be included in one commit whose message only covers the
+    /// Continue`s would be included in one commit whose message only covers the
     /// decision that happened to trigger it. Returns the commit sha, or
     /// records the error (the caller abandons the save) and returns None.
     fn commit_decision(
@@ -1442,8 +1535,12 @@ impl CraApp {
         entry: review::PendingDecision,
     ) -> Option<String> {
         let file = entry.file.clone();
-        let (ids, mut entries): (Vec<i64>, Vec<review::PendingDecision>) =
-            self.pending.iter().filter(|(_, p)| p.file == file).cloned().unzip();
+        let (ids, mut entries): (Vec<i64>, Vec<review::PendingDecision>) = self
+            .pending
+            .iter()
+            .filter(|(_, p)| p.file == file)
+            .cloned()
+            .unzip();
         entries.push(entry);
         let msg = review::commit_message_batch(&entries);
         match gitio::stage_and_commit(repo_path, &file, &msg) {
@@ -1476,8 +1573,12 @@ impl CraApp {
     /// tree, validates it if a check command is configured, logs the
     /// decision, optionally commits, then advances.
     pub fn save_and_continue(&mut self, ctx: &egui::Context, commit: bool) {
-        let Some(unit) = self.current_unit() else { return };
-        let Some(repo_path) = self.repo.as_ref().map(|r| r.path.clone()) else { return };
+        let Some(unit) = self.current_unit() else {
+            return;
+        };
+        let Some(repo_path) = self.repo.as_ref().map(|r| r.path.clone()) else {
+            return;
+        };
 
         let action = self.current_action();
         let chosen_model = match &self.chosen {
@@ -1493,7 +1594,9 @@ impl CraApp {
         };
         let mut provenance = review::derive_provenance(
             &self.chosen,
-            chosen_model.as_ref().map(|(n, c, _, _)| (n.as_str(), c.as_str())),
+            chosen_model
+                .as_ref()
+                .map(|(n, c, _, _)| (n.as_str(), c.as_str())),
             &self.editor,
             self.candidate_baseline.as_deref(),
             &self.original_display,
@@ -1510,8 +1613,9 @@ impl CraApp {
                 };
             }
         }
-        let model_info: Option<(String, String)> =
-            chosen_model.as_ref().map(|(_, _, model, effort)| (model.clone(), effort.clone()));
+        let model_info: Option<(String, String)> = chosen_model
+            .as_ref()
+            .map(|(_, _, model, effort)| (model.clone(), effort.clone()));
         let justification = match &self.chosen {
             Some(Choice::Candidate(i)) => match self.candidates.get(*i) {
                 Some(CandidateState::Ready(s)) => Some(s.justification.clone()),
@@ -1537,9 +1641,8 @@ impl CraApp {
         if makes_edit {
             let Some(plan) = &self.plan else { return };
             let file = &plan.files[plan.file_idx];
-            let expected_start0 = (unit.start_line() as i64 - 1
-                + file.offset_for(unit.start_line()))
-            .max(0) as usize;
+            let expected_start0 =
+                (unit.start_line() as i64 - 1 + file.offset_for(unit.start_line())).max(0) as usize;
             // Where the edit was actually applied — the revert below must aim here,
             // not at where the plan thought the unit was.
             let mut applied_start0 = expected_start0;
@@ -1557,18 +1660,19 @@ impl CraApp {
                         unit.raw_lines(),
                         expected_start0,
                     ) {
-                        Ok(review::CurrentUnitLocation::Moved(start0)) => match review::splice_lines(
-                            &repo_path,
-                            unit.file(),
-                            start0,
-                            unit.raw_lines(),
-                            &new_lines,
-                        ) {
-                            Ok(d) => {
-                                delta = d;
-                                drift = start0 as i64 - expected_start0 as i64;
-                                applied_start0 = start0;
-                                self.note(
+                        Ok(review::CurrentUnitLocation::Moved(start0)) => {
+                            match review::splice_lines(
+                                &repo_path,
+                                unit.file(),
+                                start0,
+                                unit.raw_lines(),
+                                &new_lines,
+                            ) {
+                                Ok(d) => {
+                                    delta = d;
+                                    drift = start0 as i64 - expected_start0 as i64;
+                                    applied_start0 = start0;
+                                    self.note(
                                     "relocate",
                                     &format!(
                                         "{}:{} drifted {drift:+} line(s) on disk — edit relocated at line {}",
@@ -1577,13 +1681,14 @@ impl CraApp {
                                         start0 + 1
                                     ),
                                 );
+                                }
+                                Err(e) => {
+                                    self.review_error = Some(e.clone());
+                                    self.note("error", &e);
+                                    return;
+                                }
                             }
-                            Err(e) => {
-                                self.review_error = Some(e.clone());
-                                self.note("error", &e);
-                                return;
-                            }
-                        },
+                        }
                         Ok(review::CurrentUnitLocation::Changed(stale)) => {
                             self.stale_unit = Some(stale);
                             self.review_error = Some(first_err.clone());
@@ -1693,7 +1798,10 @@ impl CraApp {
         } else if commit && action == Action::Keep {
             self.note("commit", "kept original — nothing to commit");
         } else if commit && action == Action::Flag {
-            self.note("commit", "flag recorded — nothing changed, nothing to commit");
+            self.note(
+                "commit",
+                "flag recorded — nothing changed, nothing to commit",
+            );
         }
 
         let session_id = self.plan.as_ref().map(|p| p.session_id).unwrap_or(0);
@@ -1724,7 +1832,13 @@ impl CraApp {
         }
         self.note(
             "decision",
-            &format!("{} {}:{} ({})", action.as_str(), unit.file(), unit.start_line(), provenance.source_str()),
+            &format!(
+                "{} {}:{} ({})",
+                action.as_str(),
+                unit.file(),
+                unit.start_line(),
+                provenance.source_str()
+            ),
         );
 
         if let Some(plan) = &mut self.plan {
@@ -1734,9 +1848,13 @@ impl CraApp {
                 // external edit and here that the review has yet to visit will
                 // relocate themselves if this correction is not enough.
                 if drift != 0 {
-                    plan.files[plan.file_idx].edits.push((unit.start_line(), drift));
+                    plan.files[plan.file_idx]
+                        .edits
+                        .push((unit.start_line(), drift));
                 }
-                plan.files[plan.file_idx].edits.push((unit.start_line(), delta));
+                plan.files[plan.file_idx]
+                    .edits
+                    .push((unit.start_line(), delta));
             }
             plan.files[plan.file_idx].decided += 1;
             plan.decided_total += 1;
@@ -1787,12 +1905,19 @@ impl CraApp {
     /// lines that no longer exist, so the only honest path is a fresh review
     /// of the new text.
     pub fn reload_stale_unit(&mut self, ctx: &egui::Context) {
-        let Some(stale) = self.stale_unit.take() else { return };
-        let Some(repo_path) = self.repo.as_ref().map(|r| r.path.clone()) else { return };
+        let Some(stale) = self.stale_unit.take() else {
+            return;
+        };
+        let Some(repo_path) = self.repo.as_ref().map(|r| r.path.clone()) else {
+            return;
+        };
         if stale.lines.is_empty() {
             // The region is gone from the file entirely — nothing to review.
             self.review_error = None;
-            self.note("reload", "the unit's lines are gone from disk — skipping it");
+            self.note(
+                "reload",
+                "the unit's lines are gone from disk — skipping it",
+            );
             self.skip_unit(ctx);
             return;
         }
@@ -1800,8 +1925,12 @@ impl CraApp {
         let end_line = stale.start0 as u32 + stale.lines.len() as u32;
         let (file_rel, old_start) = {
             let Some(plan) = &mut self.plan else { return };
-            let Some(file) = plan.files.get_mut(plan.file_idx) else { return };
-            let Some(unit) = file.units.get_mut(plan.unit_idx) else { return };
+            let Some(file) = plan.files.get_mut(plan.file_idx) else {
+                return;
+            };
+            let Some(unit) = file.units.get_mut(plan.unit_idx) else {
+                return;
+            };
             let context =
                 review::disk_context(&repo_path, unit.file(), stale.start0, stale.lines.len(), 6);
             let old_start = unit.start_line();
@@ -1811,8 +1940,10 @@ impl CraApp {
             // remains.
             match unit {
                 ReviewUnit::Comment(u) => {
-                    u.indent =
-                        stale.lines[0].chars().take_while(|c| c.is_whitespace()).collect();
+                    u.indent = stale.lines[0]
+                        .chars()
+                        .take_while(|c| c.is_whitespace())
+                        .collect();
                     u.start_line = start_line;
                     u.end_line = end_line;
                     u.raw_lines = stale.lines;
@@ -1877,8 +2008,9 @@ impl CraApp {
         );
         self.whole_branch_review_seq += 1;
         self.findings.clear();
-        self.whole_branch_review =
-            (0..self.settings.models.len()).map(|_| WholeBranchReviewState::Idle).collect();
+        self.whole_branch_review = (0..self.settings.models.len())
+            .map(|_| WholeBranchReviewState::Idle)
+            .collect();
         let cli_home = self.cli_home(&repo);
         // Reviewing the whole branch takes longer than reviewing one unit.
         let timeout = self.settings.model_timeout_secs.saturating_mul(2);
@@ -1886,7 +2018,9 @@ impl CraApp {
         for (idx, model) in self.settings.enabled_models() {
             // One-shot: no follow-ups, so a `{session}` model just gets a
             // fresh id, exactly as the evaluation replay does.
-            let command = model.command.replace("{session}", &uuid::Uuid::new_v4().to_string());
+            let command = model
+                .command
+                .replace("{session}", &uuid::Uuid::new_v4().to_string());
             let live = models::LiveHandle::new();
             self.whole_branch_review[idx] = WholeBranchReviewState::Pending(live.clone());
             let tx = self.tx.clone();
@@ -1909,19 +2043,30 @@ impl CraApp {
         }
         if launched == 0 {
             self.whole_branch_review.clear();
-            self.note("branch", "no models enabled — nothing to run the whole-branch review with");
+            self.note(
+                "branch",
+                "no models enabled — nothing to run the whole-branch review with",
+            );
             return;
         }
-        self.note("branch", &format!("whole-branch review started — {launched} model(s) reading the branch"));
+        self.note(
+            "branch",
+            &format!("whole-branch review started — {launched} model(s) reading the branch"),
+        );
     }
 
     pub fn whole_branch_review_running(&self) -> bool {
-        self.whole_branch_review.iter().any(|s| matches!(s, WholeBranchReviewState::Pending(_)))
+        self.whole_branch_review
+            .iter()
+            .any(|s| matches!(s, WholeBranchReviewState::Pending(_)))
     }
 
     fn handle_whole_branch_review(&mut self, m: WholeBranchReviewMsg) {
         if m.seq != self.whole_branch_review_seq {
-            self.db.log("stale", &format!("discarded late whole-branch review from {}", m.model));
+            self.db.log(
+                "stale",
+                &format!("discarded late whole-branch review from {}", m.model),
+            );
             return;
         }
         let session_id = self.plan.as_ref().map(|p| p.session_id).unwrap_or(0);
@@ -1953,17 +2098,31 @@ impl CraApp {
                     });
                 }
                 // High first; equal severities keep arrival order via the id.
-                self.findings.sort_by_key(|r| (r.finding.severity_rank(), r.id));
+                self.findings
+                    .sort_by_key(|r| (r.finding.severity_rank(), r.id));
                 if let Some(s) = self.whole_branch_review.get_mut(m.model_index) {
-                    *s = WholeBranchReviewState::Done { n, latency_ms: m.latency_ms };
+                    *s = WholeBranchReviewState::Done {
+                        n,
+                        latency_ms: m.latency_ms,
+                    };
                 }
-                self.note("branch", &format!("{} reported {n} finding(s) ({} ms)", m.model, m.latency_ms));
+                self.note(
+                    "branch",
+                    &format!("{} reported {n} finding(s) ({} ms)", m.model, m.latency_ms),
+                );
             }
             Err(e) => {
                 if let Some(s) = self.whole_branch_review.get_mut(m.model_index) {
                     *s = WholeBranchReviewState::Failed(e.clone());
                 }
-                self.note("branch", &format!("{} whole-branch review failed: {}", m.model, truncate(&e, 120)));
+                self.note(
+                    "branch",
+                    &format!(
+                        "{} whole-branch review failed: {}",
+                        m.model,
+                        truncate(&e, 120)
+                    ),
+                );
             }
         }
     }
@@ -1989,7 +2148,11 @@ impl CraApp {
             let f = &row.finding;
             out.push_str(&format!(
                 "- **[{}]** {} _({})_\n  {}\n",
-                if f.severity.trim().is_empty() { "?" } else { f.severity.trim() },
+                if f.severity.trim().is_empty() {
+                    "?"
+                } else {
+                    f.severity.trim()
+                },
                 f.title.trim(),
                 row.model,
                 f.detail.trim().replace('\n', "\n  ")
@@ -2012,8 +2175,12 @@ impl CraApp {
         if text.is_empty() {
             return;
         }
-        let Some(unit) = self.current_unit() else { return };
-        let Some(repo) = self.repo.as_ref().map(|r| r.path.clone()) else { return };
+        let Some(unit) = self.current_unit() else {
+            return;
+        };
+        let Some(repo) = self.repo.as_ref().map(|r| r.path.clone()) else {
+            return;
+        };
         let session_id = self.plan.as_ref().map(|p| p.session_id).unwrap_or(0);
         let excerpt = unit.raw_lines().join("\n");
         self.db.log_note(
@@ -2028,25 +2195,45 @@ impl CraApp {
         self.note_input.clear();
         self.note(
             "note",
-            &format!("parked for follow-up: {}:{} — {}", unit.file(), unit.start_line(), truncate(&text, 60)),
+            &format!(
+                "parked for follow-up: {}:{} — {}",
+                unit.file(),
+                unit.start_line(),
+                truncate(&text, 60)
+            ),
         );
     }
 
     /// Load the backlog and switch to the follow-up screen. Only open notes
     /// come back: resolved and dismissed ones are done being seen.
     pub fn open_followup(&mut self) {
-        let Some(repo) = self.repo.as_ref().map(|r| r.path.clone()) else { return };
+        let Some(repo) = self.repo.as_ref().map(|r| r.path.clone()) else {
+            return;
+        };
         self.notes = self
             .db
             .open_notes(&repo)
             .into_iter()
-            .map(|note| NoteRow { note, checked: false })
+            .map(|note| NoteRow {
+                note,
+                checked: false,
+            })
             .collect();
         if self.fix_prompt.trim().is_empty() {
             self.fix_prompt = crate::notes::default_preamble().to_string();
         }
-        if !self.settings.models.get(self.selected_fix_model_index).is_some_and(|m| m.enabled) {
-            self.selected_fix_model_index = self.settings.enabled_models().first().map(|(i, _)| *i).unwrap_or(0);
+        if !self
+            .settings
+            .models
+            .get(self.selected_fix_model_index)
+            .is_some_and(|m| m.enabled)
+        {
+            self.selected_fix_model_index = self
+                .settings
+                .enabled_models()
+                .first()
+                .map(|(i, _)| *i)
+                .unwrap_or(0);
         }
         self.fix_error = None;
         if self.screen != Screen::Followup {
@@ -2059,10 +2246,15 @@ impl CraApp {
     /// Human triage: a dismissed note stays on the record, marked as such,
     /// and is never offered again.
     pub fn dismiss_note(&mut self, id: i64) {
-        let Some(pos) = self.notes.iter().position(|r| r.note.id == id) else { return };
+        let Some(pos) = self.notes.iter().position(|r| r.note.id == id) else {
+            return;
+        };
         let row = self.notes.remove(pos);
         self.db.set_note_status(id, "dismissed");
-        self.note("follow-up", &format!("dismissed note: {}", truncate(&row.note.text, 60)));
+        self.note(
+            "follow-up",
+            &format!("dismissed note: {}", truncate(&row.note.text, 60)),
+        );
     }
 
     /// Launch the interactive fix session on the checked notes. Checking is
@@ -2070,13 +2262,22 @@ impl CraApp {
     /// session launches, so the next visit shows only what was left
     /// unchecked — the session's own transcript is where their fate is read.
     pub fn start_fix_session(&mut self, ctx: &egui::Context) {
-        let picked: Vec<Note> =
-            self.notes.iter().filter(|r| r.checked).map(|r| r.note.clone()).collect();
+        let picked: Vec<Note> = self
+            .notes
+            .iter()
+            .filter(|r| r.checked)
+            .map(|r| r.note.clone())
+            .collect();
         if picked.is_empty() {
             self.fix_error = Some("check at least one note to hand to the session".into());
             return;
         }
-        let Some(model_config) = self.settings.models.get(self.selected_fix_model_index).cloned() else {
+        let Some(model_config) = self
+            .settings
+            .models
+            .get(self.selected_fix_model_index)
+            .cloned()
+        else {
             self.fix_error = Some("no model in that model — configure one in settings".into());
             return;
         };
@@ -2084,25 +2285,31 @@ impl CraApp {
             self.fix_error = Some(format!("{} is disabled in settings", model_config.name));
             return;
         }
-        let Some(repo) = self.repo.as_ref().map(|r| r.path.clone()) else { return };
+        let Some(repo) = self.repo.as_ref().map(|r| r.path.clone()) else {
+            return;
+        };
         let prompt = crate::notes::build_fix_prompt(&self.fix_prompt, &picked);
         self.fix_seq += 1;
         self.active_fix_model_index = self.selected_fix_model_index;
         self.fix_running = true;
         self.fix_error = None;
-        self.fix_convo = vec![Turn { prompt: prompt.clone(), reply: String::new() }];
+        self.fix_convo = vec![Turn {
+            prompt: prompt.clone(),
+            reply: String::new(),
+        }];
         self.fix_session = None;
         // Same session setup as a review turn: a model that names no
         // session key takes an id of our choosing, the rest report theirs.
-        let command =
-            if model_config.session_key.trim().is_empty() && model_config.command.contains("{session}") {
-                let id = uuid::Uuid::new_v4().to_string();
-                let command = model_config.command.replace("{session}", &id);
-                self.fix_session = Some(id);
-                command
-            } else {
-                model_config.command.clone()
-            };
+        let command = if model_config.session_key.trim().is_empty()
+            && model_config.command.contains("{session}")
+        {
+            let id = uuid::Uuid::new_v4().to_string();
+            let command = model_config.command.replace("{session}", &id);
+            self.fix_session = Some(id);
+            command
+        } else {
+            model_config.command.clone()
+        };
         let cli_home = self.cli_home(&repo);
         // Resolving a backlog of larger issues is a different order of work
         // from judging one unit; give the session room to do it.
@@ -2131,7 +2338,11 @@ impl CraApp {
         self.notes.retain(|r| !r.checked);
         self.note(
             "follow-up",
-            &format!("fix session started — {} note(s) handed to {}", picked.len(), model_config.name),
+            &format!(
+                "fix session started — {} note(s) handed to {}",
+                picked.len(),
+                model_config.name
+            ),
         );
     }
 
@@ -2157,11 +2368,25 @@ impl CraApp {
         if message.is_empty() || !self.fix_can_resume() {
             return;
         }
-        let Some(model_config) = self.settings.models.get(self.active_fix_model_index).cloned() else { return };
-        let Some(session) = self.fix_session.clone() else { return };
-        let Some(repo) = self.repo.as_ref().map(|r| r.path.clone()) else { return };
+        let Some(model_config) = self
+            .settings
+            .models
+            .get(self.active_fix_model_index)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(session) = self.fix_session.clone() else {
+            return;
+        };
+        let Some(repo) = self.repo.as_ref().map(|r| r.path.clone()) else {
+            return;
+        };
         let command = model_config.resume_command.replace("{session}", &session);
-        self.fix_convo.push(Turn { prompt: message.clone(), reply: String::new() });
+        self.fix_convo.push(Turn {
+            prompt: message.clone(),
+            reply: String::new(),
+        });
         self.fix_seq += 1;
         self.fix_running = true;
         let cli_home = self.cli_home(&repo);
@@ -2189,14 +2414,22 @@ impl CraApp {
 
     fn handle_fix(&mut self, m: models::FixMsg) {
         if m.seq != self.fix_seq {
-            self.db.log("stale", &format!("discarded late fix-session reply from {}", m.model));
+            self.db.log(
+                "stale",
+                &format!("discarded late fix-session reply from {}", m.model),
+            );
             return;
         }
         self.fix_running = false;
         self.fix_live = None;
         // The reply is read with the launching model's session key, so a moved
         // model picker cannot misread it.
-        if let Some(key) = self.settings.models.get(m.model_index).map(|s| s.session_key.clone()) {
+        if let Some(key) = self
+            .settings
+            .models
+            .get(m.model_index)
+            .map(|s| s.session_key.clone())
+        {
             if let Some(id) = models::extract_session_id(&m.raw, &key) {
                 self.fix_session = Some(id);
             }
@@ -2213,11 +2446,17 @@ impl CraApp {
         }
         match m.result {
             Ok(latency_ms) => {
-                self.note("follow-up", &format!("{} replied ({latency_ms} ms)", m.model));
+                self.note(
+                    "follow-up",
+                    &format!("{} replied ({latency_ms} ms)", m.model),
+                );
             }
             Err(e) => {
                 self.fix_error = Some(e.clone());
-                self.note("follow-up", &format!("{} fix session failed: {}", m.model, truncate(&e, 120)));
+                self.note(
+                    "follow-up",
+                    &format!("{} fix session failed: {}", m.model, truncate(&e, 120)),
+                );
             }
         }
     }
@@ -2251,7 +2490,8 @@ impl CraApp {
                 self.handle_prefetch_reply(pos, c);
                 return;
             }
-            self.db.log("stale", &format!("discarded late reply from {}", c.model));
+            self.db
+                .log("stale", &format!("discarded late reply from {}", c.model));
             return;
         }
         let (file, start, end) = self
@@ -2273,7 +2513,11 @@ impl CraApp {
                 }
             }
         }
-        if let Some(turn) = self.convos.get_mut(c.model_index).and_then(|t| t.last_mut()) {
+        if let Some(turn) = self
+            .convos
+            .get_mut(c.model_index)
+            .and_then(|t| t.last_mut())
+        {
             // The session id and the verdict have already been pulled out
             // of the full text; what is left is for a human to read.
             turn.reply = reply_text(&c.result, &c.raw);
@@ -2288,7 +2532,10 @@ impl CraApp {
             .zip(self.candidate_models.get(c.model_index))
             .and_then(|(u, model)| u.priced(model.price_in, model.price_out));
         // The question this answer replies to, if the model had one pending.
-        let link = self.pending_follow_up.get_mut(c.model_index).and_then(|p| p.take());
+        let link = self
+            .pending_follow_up
+            .get_mut(c.model_index)
+            .and_then(|p| p.take());
         let (follow_up_id, round) = match link {
             Some((id, r)) => (Some(id), r),
             None => (None, 1),
@@ -2425,12 +2672,18 @@ impl CraApp {
                 });
                 self.note(
                     "model",
-                    &format!("early answer for {file}:{start} failed: {}", truncate(e, 120)),
+                    &format!(
+                        "early answer for {file}:{start} failed: {}",
+                        truncate(e, 120)
+                    ),
                 );
             }
         }
         if let Some(r) = self.prefetches[pos].replies.get_mut(c.model_index) {
-            *r = Some(PrefetchedReply { result: c.result, raw: c.raw });
+            *r = Some(PrefetchedReply {
+                result: c.result,
+                raw: c.raw,
+            });
         }
     }
 
@@ -2659,7 +2912,10 @@ mod state_tests {
                 if !pending {
                     return;
                 }
-                assert!(std::time::Instant::now() < deadline, "models never came back");
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "models never came back"
+                );
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
@@ -2672,7 +2928,10 @@ mod state_tests {
                 if self.app.prefetches.iter().all(|p| p.complete()) {
                     return;
                 }
-                assert!(std::time::Instant::now() < deadline, "prefetch never came back");
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "prefetch never came back"
+                );
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
@@ -2692,7 +2951,14 @@ mod state_tests {
     #[test]
     fn a_model_reply_becomes_a_pickable_candidate() {
         let dir = TempDir::new("reply");
-        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let cli = FakeCli::new(
+            &dir,
+            "fake",
+            FakeCliSpec {
+                reply: VERDICT,
+                ..Default::default()
+            },
+        );
         let mut h = Harness::new("reply");
         h.enter_with(vec![cli.model_config("")]);
         h.wait_for_model_replies();
@@ -2710,7 +2976,14 @@ mod state_tests {
     #[test]
     fn the_models_are_started_inside_the_repository_under_review() {
         let dir = TempDir::new("cwd");
-        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let cli = FakeCli::new(
+            &dir,
+            "fake",
+            FakeCliSpec {
+                reply: VERDICT,
+                ..Default::default()
+            },
+        );
         let mut h = Harness::new("cwd");
         h.enter_with(vec![cli.model_config("")]);
         h.wait_for_model_replies();
@@ -2756,8 +3029,14 @@ mod state_tests {
                 ..Default::default()
             },
         );
-        let second =
-            FakeCli::new(&dir, "second", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let second = FakeCli::new(
+            &dir,
+            "second",
+            FakeCliSpec {
+                reply: VERDICT,
+                ..Default::default()
+            },
+        );
 
         let mut h = Harness::new("session");
         let mut model = first.model_config("");
@@ -2767,7 +3046,10 @@ mod state_tests {
         h.wait_for_model_replies();
 
         assert_eq!(h.app.sessions[0].as_deref(), Some("sess-7"));
-        assert!(h.app.can_ask(0), "a model that replied with a session should accept a follow-up");
+        assert!(
+            h.app.can_ask(0),
+            "a model that replied with a session should accept a follow-up"
+        );
 
         h.app.follow_up = "too vague".into();
         h.app.ask_followup(&egui::Context::default(), None);
@@ -2779,9 +3061,16 @@ mod state_tests {
         assert!(argv.contains("--conversation sess-7"), "{argv}");
         let sent = second.stdin_seen();
         assert!(sent.contains("too vague"), "{sent}");
-        assert!(!sent.contains("Increment the counter"), "the diff was re-sent: {sent}");
+        assert!(
+            !sent.contains("Increment the counter"),
+            "the diff was re-sent: {sent}"
+        );
         assert!(h.app.follow_up.is_empty(), "the box should clear once sent");
-        assert_eq!(h.app.convos[0].len(), 2, "both turns belong in the inspector");
+        assert_eq!(
+            h.app.convos[0].len(),
+            2,
+            "both turns belong in the inspector"
+        );
     }
 
     #[test]
@@ -2796,8 +3085,14 @@ mod state_tests {
                 ..Default::default()
             },
         );
-        let second =
-            FakeCli::new(&dir, "second", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let second = FakeCli::new(
+            &dir,
+            "second",
+            FakeCliSpec {
+                reply: VERDICT,
+                ..Default::default()
+            },
+        );
         let mut h = Harness::new("fu_record");
         h.app.settings.prefetch_next = false;
         let mut model = first.model_config("");
@@ -2814,23 +3109,47 @@ mod state_tests {
 
         let links = h.app.db.suggestion_links();
         assert_eq!(links.len(), 2, "one opening answer, one follow-up answer");
-        assert_eq!((links[0].2, links[0].3), (None, Some(1)), "the opening round has no question");
-        let fu_id = links[1].2.expect("the answer should carry its question's id");
-        assert_eq!(links[1].3, Some(2), "the answer to the first question is round two");
+        assert_eq!(
+            (links[0].2, links[0].3),
+            (None, Some(1)),
+            "the opening round has no question"
+        );
+        let fu_id = links[1]
+            .2
+            .expect("the answer should carry its question's id");
+        assert_eq!(
+            links[1].3,
+            Some(2),
+            "the answer to the first question is round two"
+        );
         let (round, question) = h.app.db.followup_row(fu_id).expect("the question row");
         assert_eq!(round, 2);
-        assert_eq!(question, long, "the question must be stored whole, not truncated");
+        assert_eq!(
+            question, long,
+            "the question must be stored whole, not truncated"
+        );
     }
 
     #[test]
     fn the_next_unit_is_prefetched_and_adopted_without_asking_again() {
         let dir = TempDir::new("prefetch");
-        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let cli = FakeCli::new(
+            &dir,
+            "fake",
+            FakeCliSpec {
+                reply: VERDICT,
+                ..Default::default()
+            },
+        );
         let mut h = Harness::new("prefetch");
         h.enter_with(vec![cli.model_config("")]);
         h.wait_for_model_replies();
         h.wait_for_prefetch_replies();
-        assert_eq!(h.app.prefetches.len(), 1, "the second unit should have been prefetched");
+        assert_eq!(
+            h.app.prefetches.len(),
+            1,
+            "the second unit should have been prefetched"
+        );
 
         h.app.choose_keep();
         h.app.save_and_continue(&egui::Context::default(), false);
@@ -2885,7 +3204,10 @@ mod state_tests {
             6,
             "the all-keep second unit should step aside for the third"
         );
-        assert!(activity(&h).contains("deferred"), "the reorder must be visible in the log");
+        assert!(
+            activity(&h).contains("deferred"),
+            "the reorder must be visible in the log"
+        );
 
         // The deferred unit is still reviewed — last, from its stored answers.
         h.wait_for_model_replies();
@@ -2903,10 +3225,19 @@ mod state_tests {
     #[test]
     fn past_follow_ups_reach_the_next_prompt_as_standing_guidance() {
         let dir = TempDir::new("profile_prompt");
-        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let cli = FakeCli::new(
+            &dir,
+            "fake",
+            FakeCliSpec {
+                reply: VERDICT,
+                ..Default::default()
+            },
+        );
         let mut h = Harness::new("profile_prompt");
         h.app.settings.prefetch_next = false;
-        h.app.db.log_follow_up(1, "src/other.rs", 3, 3, 2, "Say why, not what.");
+        h.app
+            .db
+            .log_follow_up(1, "src/other.rs", 3, 3, 2, "Say why, not what.");
         h.enter_with(vec![cli.model_config("")]);
         h.wait_for_model_replies();
         let sent = cli.stdin_seen();
@@ -2923,7 +3254,14 @@ mod state_tests {
     #[test]
     fn a_model_without_a_session_cannot_be_asked_again() {
         let dir = TempDir::new("nosession");
-        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let cli = FakeCli::new(
+            &dir,
+            "fake",
+            FakeCliSpec {
+                reply: VERDICT,
+                ..Default::default()
+            },
+        );
         let mut h = Harness::new("nosession");
         // No session key and no {session} in the command: nothing to resume.
         h.enter_with(vec![cli.model_config("")]);
@@ -2932,8 +3270,14 @@ mod state_tests {
         assert!(!h.app.can_ask(0));
         h.app.follow_up = "why?".into();
         h.app.ask_followup(&egui::Context::default(), None);
-        assert!(h.app.review_error.is_some(), "the user needs to be told why nothing happened");
-        assert_eq!(h.app.follow_up, "why?", "an unsent message must not be cleared");
+        assert!(
+            h.app.review_error.is_some(),
+            "the user needs to be told why nothing happened"
+        );
+        assert_eq!(
+            h.app.follow_up, "why?",
+            "an unsent message must not be cleared"
+        );
     }
 
     #[test]
@@ -2942,7 +3286,11 @@ mod state_tests {
         let cli = FakeCli::new(
             &dir,
             "fake",
-            FakeCliSpec { reply: VERDICT, delay_secs: 30, ..Default::default() },
+            FakeCliSpec {
+                reply: VERDICT,
+                delay_secs: 30,
+                ..Default::default()
+            },
         );
         let mut h = Harness::new("pending");
         let mut model = cli.model_config("");
@@ -2958,7 +3306,14 @@ mod state_tests {
     #[test]
     fn saving_writes_the_indent_back_and_records_provenance() {
         let dir = TempDir::new("save");
-        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let cli = FakeCli::new(
+            &dir,
+            "fake",
+            FakeCliSpec {
+                reply: VERDICT,
+                ..Default::default()
+            },
+        );
         let mut h = Harness::new("save");
         h.enter_with(vec![cli.model_config("")]);
         h.wait_for_model_replies();
@@ -2968,7 +3323,10 @@ mod state_tests {
         assert!(h.app.review_error.is_none(), "{:?}", h.app.review_error);
 
         let after = h.repo.read("src/lib.rs");
-        assert!(after.contains("    // Counts retries."), "indent not restored: {after}");
+        assert!(
+            after.contains("    // Counts retries."),
+            "indent not restored: {after}"
+        );
         assert!(!after.contains("Increment the counter"), "{after}");
         // And it moved on to the next comment in the same file.
         assert_eq!(h.app.original_display, "// Reset the counter to zero");
@@ -2979,7 +3337,14 @@ mod state_tests {
         let dir = TempDir::new("offset");
         let two_liner = "{\"action\":\"rewrite\",\"comment\":\"First line.\\nSecond line.\",\
 \"justification\":\"needs two\"}";
-        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: two_liner, ..Default::default() });
+        let cli = FakeCli::new(
+            &dir,
+            "fake",
+            FakeCliSpec {
+                reply: two_liner,
+                ..Default::default()
+            },
+        );
         let mut h = Harness::new("offset");
 
         // First comment becomes two lines, pushing everything below it down.
@@ -2997,18 +3362,33 @@ mod state_tests {
         assert!(h.app.review_error.is_none(), "{:?}", h.app.review_error);
 
         let after = h.repo.read("src/lib.rs");
-        assert_eq!(after.matches("// First line.").count(), 2, "both comments rewritten: {after}");
+        assert_eq!(
+            after.matches("// First line.").count(),
+            2,
+            "both comments rewritten: {after}"
+        );
         assert!(after.contains("counter += 1;"), "{after}");
         assert!(after.contains("counter = 0;"), "{after}");
         assert!(!after.contains("Increment"), "{after}");
         assert!(!after.contains("Reset"), "{after}");
-        assert_eq!(h.app.screen as u8, Screen::Summary as u8, "plan should be exhausted");
+        assert_eq!(
+            h.app.screen as u8,
+            Screen::Summary as u8,
+            "plan should be exhausted"
+        );
     }
 
     #[test]
     fn an_external_edit_above_the_unit_relocates_the_save() {
         let dir = TempDir::new("drift");
-        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let cli = FakeCli::new(
+            &dir,
+            "fake",
+            FakeCliSpec {
+                reply: VERDICT,
+                ..Default::default()
+            },
+        );
         let mut h = Harness::new("drift");
         h.enter_with(vec![cli.model_config("")]);
         h.wait_for_model_replies();
@@ -3017,14 +3397,24 @@ mod state_tests {
         // Someone touches the file while the review is on screen: two lines
         // added above everything the plan knows about.
         let on_disk = h.repo.read("src/lib.rs");
-        h.repo.write("src/lib.rs", &format!("// header\n// more header\n{on_disk}"));
+        h.repo.write(
+            "src/lib.rs",
+            &format!("// header\n// more header\n{on_disk}"),
+        );
 
         h.app.save_and_continue(&egui::Context::default(), false);
-        assert!(h.app.review_error.is_none(), "a pure drift must resolve itself: {:?}", h.app.review_error);
+        assert!(
+            h.app.review_error.is_none(),
+            "a pure drift must resolve itself: {:?}",
+            h.app.review_error
+        );
         let after = h.repo.read("src/lib.rs");
         assert!(after.contains("    // Counts retries."), "{after}");
         assert!(!after.contains("Increment"), "{after}");
-        assert!(after.starts_with("// header\n"), "the outside edit must survive: {after}");
+        assert!(
+            after.starts_with("// header\n"),
+            "the outside edit must survive: {after}"
+        );
 
         // The measured drift carries to the next unit in the file: its save
         // is applied without needing another relocation.
@@ -3040,7 +3430,14 @@ mod state_tests {
     #[test]
     fn a_unit_changed_on_disk_offers_reload_and_reviews_the_new_text() {
         let dir = TempDir::new("stale");
-        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let cli = FakeCli::new(
+            &dir,
+            "fake",
+            FakeCliSpec {
+                reply: VERDICT,
+                ..Default::default()
+            },
+        );
         let mut h = Harness::new("stale");
         h.enter_with(vec![cli.model_config("")]);
         h.wait_for_model_replies();
@@ -3058,18 +3455,35 @@ mod state_tests {
         );
 
         h.app.save_and_continue(&egui::Context::default(), false);
-        let err = h.app.review_error.clone().expect("the mismatch must be surfaced");
+        let err = h
+            .app
+            .review_error
+            .clone()
+            .expect("the mismatch must be surfaced");
         assert!(err.contains("changed on disk"), "{err}");
-        let stale = h.app.stale_unit.as_ref().expect("resolution state must be offered");
-        assert_eq!(stale.lines, vec!["    // Bump the counter (edited elsewhere)".to_string()]);
+        let stale = h
+            .app
+            .stale_unit
+            .as_ref()
+            .expect("resolution state must be offered");
+        assert_eq!(
+            stale.lines,
+            vec!["    // Bump the counter (edited elsewhere)".to_string()]
+        );
         // Nothing was written while the question is open.
         assert!(h.repo.read("src/lib.rs").contains("Bump the counter"));
 
         // Taking the reload reviews what is actually there now.
         h.app.reload_stale_unit(&egui::Context::default());
-        assert!(h.app.stale_unit.is_none(), "the panel must clear once resolved");
+        assert!(
+            h.app.stale_unit.is_none(),
+            "the panel must clear once resolved"
+        );
         assert!(h.app.review_error.is_none(), "{:?}", h.app.review_error);
-        assert_eq!(h.app.original_display, "// Bump the counter (edited elsewhere)");
+        assert_eq!(
+            h.app.original_display,
+            "// Bump the counter (edited elsewhere)"
+        );
         h.wait_for_model_replies();
         h.app.choose_candidate(0);
         h.app.save_and_continue(&egui::Context::default(), false);
@@ -3082,7 +3496,14 @@ mod state_tests {
     #[test]
     fn committing_records_the_model_as_co_author() {
         let dir = TempDir::new("commit");
-        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let cli = FakeCli::new(
+            &dir,
+            "fake",
+            FakeCliSpec {
+                reply: VERDICT,
+                ..Default::default()
+            },
+        );
         let mut h = Harness::new("commit");
         h.enter_with(vec![cli.model_config("")]);
         h.wait_for_model_replies();
@@ -3094,14 +3515,27 @@ mod state_tests {
         let message = h.repo.git(&["log", "-1", "--format=%B"]);
         assert!(message.contains("review(comments): rewrite"), "{message}");
         assert!(message.contains("Comment-provenance: fake"), "{message}");
-        assert!(message.contains("Co-authored-by: Fake <fake@example.com>"), "{message}");
-        assert!(message.contains("says why"), "the model's reasoning belongs in the body: {message}");
+        assert!(
+            message.contains("Co-authored-by: Fake <fake@example.com>"),
+            "{message}"
+        );
+        assert!(
+            message.contains("says why"),
+            "the model's reasoning belongs in the body: {message}"
+        );
     }
 
     #[test]
     fn commit_message_records_model_and_effort() {
         let dir = TempDir::new("model-effort");
-        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let cli = FakeCli::new(
+            &dir,
+            "fake",
+            FakeCliSpec {
+                reply: VERDICT,
+                ..Default::default()
+            },
+        );
         let mut model = cli.model_config("");
         model.model = "claude-sonnet-5".into();
         model.effort = "low".into();
@@ -3124,7 +3558,14 @@ mod state_tests {
     #[test]
     fn batched_saves_are_all_documented_in_the_final_commit() {
         let dir = TempDir::new("batch");
-        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let cli = FakeCli::new(
+            &dir,
+            "fake",
+            FakeCliSpec {
+                reply: VERDICT,
+                ..Default::default()
+            },
+        );
         let mut h = Harness::new("batch");
         let before = gitio::head_sha(&h.repo.path()).unwrap();
         h.enter_with(vec![cli.model_config("")]);
@@ -3133,7 +3574,11 @@ mod state_tests {
         h.app.choose_candidate(0);
         h.app.save_and_continue(&egui::Context::default(), false);
         assert!(h.app.review_error.is_none(), "{:?}", h.app.review_error);
-        assert_eq!(gitio::head_sha(&h.repo.path()).unwrap(), before, "save must not commit");
+        assert_eq!(
+            gitio::head_sha(&h.repo.path()).unwrap(),
+            before,
+            "save must not commit"
+        );
 
         h.wait_for_model_replies();
         h.app.choose_candidate(0);
@@ -3141,19 +3586,31 @@ mod state_tests {
         assert!(h.app.review_error.is_none(), "{:?}", h.app.review_error);
 
         // Only one commit for both decisions...
-        let new_commits = h.repo.git(&["rev-list", "--count", &format!("{before}..HEAD")]);
-        assert_eq!(new_commits.trim(), "1", "the batch should create one commit");
+        let new_commits = h
+            .repo
+            .git(&["rev-list", "--count", &format!("{before}..HEAD")]);
+        assert_eq!(
+            new_commits.trim(),
+            "1",
+            "the batch should create one commit"
+        );
 
         // ...whose message documents both, not just the second.
         let message = h.repo.git(&["log", "-1", "--format=%B"]);
         assert!(message.contains("2 comment decisions"), "{message}");
         assert!(message.contains("src/lib.rs:2"), "{message}");
         assert!(message.contains("src/lib.rs:4"), "{message}");
-        assert!(message.matches("says why").count() == 2, "each decision's justification: {message}");
+        assert!(
+            message.matches("says why").count() == 2,
+            "each decision's justification: {message}"
+        );
         // Trailers are shared, not duplicated once per decision.
         assert_eq!(message.matches("Co-authored-by:").count(), 1, "{message}");
 
-        assert!(h.app.pending.is_empty(), "the flushed decisions must leave pending empty");
+        assert!(
+            h.app.pending.is_empty(),
+            "the flushed decisions must leave pending empty"
+        );
     }
 
     /// A working-tree review of an untracked file: approving its hunks with
@@ -3205,13 +3662,24 @@ mod state_tests {
         h.app.choose_keep();
         h.app.save_and_continue(&egui::Context::default(), false);
         assert!(h.app.review_error.is_none(), "{:?}", h.app.review_error);
-        assert_eq!(gitio::head_sha(&h.repo.path()).unwrap(), sha, "no empty second commit");
+        assert_eq!(
+            gitio::head_sha(&h.repo.path()).unwrap(),
+            sha,
+            "no empty second commit"
+        );
     }
 
     #[test]
     fn commit_each_toggle_makes_every_save_its_own_commit() {
         let dir = TempDir::new("commit-each");
-        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let cli = FakeCli::new(
+            &dir,
+            "fake",
+            FakeCliSpec {
+                reply: VERDICT,
+                ..Default::default()
+            },
+        );
         let mut h = Harness::new("commit-each");
         let before = gitio::head_sha(&h.repo.path()).unwrap();
         h.app.commit_each = true;
@@ -3229,19 +3697,38 @@ mod state_tests {
         h.app.save_and_continue(&egui::Context::default(), false);
         assert!(h.app.review_error.is_none(), "{:?}", h.app.review_error);
 
-        let new_commits = h.repo.git(&["rev-list", "--count", &format!("{before}..HEAD")]);
-        assert_eq!(new_commits.trim(), "2", "each decision should be its own commit");
+        let new_commits = h
+            .repo
+            .git(&["rev-list", "--count", &format!("{before}..HEAD")]);
+        assert_eq!(
+            new_commits.trim(),
+            "2",
+            "each decision should be its own commit"
+        );
         assert!(h.app.pending.is_empty());
 
         let latest = h.repo.git(&["log", "-1", "--format=%B"]);
-        assert!(latest.contains("review(comments): rewrite comment in src/lib.rs:4"), "{latest}");
-        assert!(!latest.contains("src/lib.rs:2"), "the first decision has its own commit: {latest}");
+        assert!(
+            latest.contains("review(comments): rewrite comment in src/lib.rs:4"),
+            "{latest}"
+        );
+        assert!(
+            !latest.contains("src/lib.rs:2"),
+            "the first decision has its own commit: {latest}"
+        );
     }
 
     #[test]
     fn keeping_the_original_touches_neither_the_file_nor_git() {
         let dir = TempDir::new("keep");
-        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let cli = FakeCli::new(
+            &dir,
+            "fake",
+            FakeCliSpec {
+                reply: VERDICT,
+                ..Default::default()
+            },
+        );
         let mut h = Harness::new("keep");
         let before = h.repo.read("src/lib.rs");
         let head = gitio::head_sha(&h.repo.path()).unwrap();
@@ -3252,18 +3739,37 @@ mod state_tests {
         h.app.save_and_continue(&egui::Context::default(), true);
 
         assert!(h.app.review_error.is_none(), "{:?}", h.app.review_error);
-        assert_eq!(h.repo.read("src/lib.rs"), before, "a keep must not rewrite the file");
-        assert_eq!(gitio::head_sha(&h.repo.path()).unwrap(), head, "a keep must not commit");
+        assert_eq!(
+            h.repo.read("src/lib.rs"),
+            before,
+            "a keep must not rewrite the file"
+        );
+        assert_eq!(
+            gitio::head_sha(&h.repo.path()).unwrap(),
+            head,
+            "a keep must not commit"
+        );
     }
 
     #[test]
     fn a_failing_model_leaves_the_others_usable() {
         let dir = TempDir::new("mixed");
-        let good = FakeCli::new(&dir, "good", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let good = FakeCli::new(
+            &dir,
+            "good",
+            FakeCliSpec {
+                reply: VERDICT,
+                ..Default::default()
+            },
+        );
         let bad = FakeCli::new(
             &dir,
             "bad",
-            FakeCliSpec { reply: "boom", exit_code: 1, ..Default::default() },
+            FakeCliSpec {
+                reply: "boom",
+                exit_code: 1,
+                ..Default::default()
+            },
         );
         let mut h = Harness::new("mixed");
         h.enter_with(vec![good.model_config(""), bad.model_config("")]);
@@ -3278,7 +3784,14 @@ mod state_tests {
     #[test]
     fn a_blind_choice_cannot_be_changed_after_names_are_revealed() {
         let dir = TempDir::new("blind");
-        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let cli = FakeCli::new(
+            &dir,
+            "fake",
+            FakeCliSpec {
+                reply: VERDICT,
+                ..Default::default()
+            },
+        );
         let mut h = Harness::new("blind");
         h.app.settings.blind_review = true;
         let mut a = cli.model_config("");
@@ -3398,17 +3911,33 @@ mod state_tests {
 
     /// Every line the ACTIVITY panel shows, combined into searchable text.
     fn activity(h: &Harness) -> String {
-        h.app.log_lines.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n")
+        h.app
+            .log_lines
+            .iter()
+            .map(|(_, l)| l.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
     fn the_activity_log_does_not_name_models_while_blinded() {
         let dir = TempDir::new("blindlog");
-        let ok = FakeCli::new(&dir, "ok", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let ok = FakeCli::new(
+            &dir,
+            "ok",
+            FakeCliSpec {
+                reply: VERDICT,
+                ..Default::default()
+            },
+        );
         let bad = FakeCli::new(
             &dir,
             "bad",
-            FakeCliSpec { reply: "nope", exit_code: 1, ..Default::default() },
+            FakeCliSpec {
+                reply: "nope",
+                exit_code: 1,
+                ..Default::default()
+            },
         );
         let mut h = Harness::new("blindlog");
         h.app.settings.blind_review = true;
@@ -3423,10 +3952,22 @@ mod state_tests {
         // the model undoes the blinding the cards are enforcing, and a failure
         // line does it just as well as a success.
         let log = activity(&h);
-        assert!(!log.contains("alpha"), "the log named a model while blinded:\n{log}");
-        assert!(!log.contains("beta"), "the log named a model while blinded:\n{log}");
-        assert!(log.contains("replied"), "the reply was never logged at all:\n{log}");
-        assert!(log.contains("failed"), "the failure was never logged at all:\n{log}");
+        assert!(
+            !log.contains("alpha"),
+            "the log named a model while blinded:\n{log}"
+        );
+        assert!(
+            !log.contains("beta"),
+            "the log named a model while blinded:\n{log}"
+        );
+        assert!(
+            log.contains("replied"),
+            "the reply was never logged at all:\n{log}"
+        );
+        assert!(
+            log.contains("failed"),
+            "the failure was never logged at all:\n{log}"
+        );
         assert!(log.contains("model A") || log.contains("model B"), "{log}");
 
         // Once a choice is made the name is the point — it is the provenance.
@@ -3438,7 +3979,10 @@ mod state_tests {
             .expect("one model answered");
         h.app.choose_candidate(ready);
         let log = activity(&h);
-        assert!(log.contains("picked alpha"), "the pick must be on the record by name:\n{log}");
+        assert!(
+            log.contains("picked alpha"),
+            "the pick must be on the record by name:\n{log}"
+        );
     }
 
     #[test]
@@ -3461,7 +4005,10 @@ mod state_tests {
         a.resume_command = format!("{} --resume {{session}}", cli.command());
         h.enter_with(vec![a]);
         h.wait_for_model_replies();
-        assert!(h.app.can_ask(0), "the model must be resumable for this test to mean anything");
+        assert!(
+            h.app.can_ask(0),
+            "the model must be resumable for this test to mean anything"
+        );
 
         h.app.follow_up = "why?".into();
         h.app.ask_followup(&egui::Context::default(), None);
@@ -3469,13 +4016,23 @@ mod state_tests {
         // Which models were asked is as much of a tell as which one answered.
         let log = activity(&h);
         assert!(log.contains("asked model A"), "{log}");
-        assert!(!log.contains("alpha"), "the follow-up named a model while blinded:\n{log}");
+        assert!(
+            !log.contains("alpha"),
+            "the follow-up named a model while blinded:\n{log}"
+        );
     }
 
     #[test]
     fn blinding_off_leaves_the_order_and_the_names_alone() {
         let dir = TempDir::new("unblind");
-        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let cli = FakeCli::new(
+            &dir,
+            "fake",
+            FakeCliSpec {
+                reply: VERDICT,
+                ..Default::default()
+            },
+        );
         let mut h = Harness::new("unblind");
         h.app.settings.blind_review = false;
         let mut a = cli.model_config("");
@@ -3490,7 +4047,14 @@ mod state_tests {
     #[test]
     fn a_decision_records_whether_it_was_blinded() {
         let dir = TempDir::new("blindrec");
-        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let cli = FakeCli::new(
+            &dir,
+            "fake",
+            FakeCliSpec {
+                reply: VERDICT,
+                ..Default::default()
+            },
+        );
         let mut h = Harness::new("blindrec");
         h.app.settings.blind_review = true;
         h.enter_with(vec![cli.model_config("")]);
@@ -3503,13 +4067,23 @@ mod state_tests {
         let rows = h.app.db.corpus(10);
         assert_eq!(rows.len(), 1);
         assert!(rows[0].blinded);
-        assert!(!rows[0].unit_json.is_empty(), "the unit must be stored for replay");
+        assert!(
+            !rows[0].unit_json.is_empty(),
+            "the unit must be stored for replay"
+        );
     }
 
     #[test]
     fn a_recheck_records_the_judgement_without_touching_the_file() {
         let dir = TempDir::new("recheck");
-        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let cli = FakeCli::new(
+            &dir,
+            "fake",
+            FakeCliSpec {
+                reply: VERDICT,
+                ..Default::default()
+            },
+        );
         let mut h = Harness::new("recheck");
 
         // Decide one comment normally, which writes the file and stores a label.
@@ -3533,22 +4107,41 @@ mod state_tests {
         h.app.choose_keep();
         h.app.save_and_continue(&egui::Context::default(), true);
         assert!(h.app.review_error.is_none(), "{:?}", h.app.review_error);
-        assert_eq!(h.repo.read("src/lib.rs"), after_first, "a re-check must not edit the tree");
+        assert_eq!(
+            h.repo.read("src/lib.rs"),
+            after_first,
+            "a re-check must not edit the tree"
+        );
         assert_eq!(gitio::head_sha(&h.repo.path()).unwrap(), head, "or commit");
-        assert_eq!(h.app.db.corpus(10).len(), 2, "but it must record the second judgement");
+        assert_eq!(
+            h.app.db.corpus(10).len(),
+            2,
+            "but it must record the second judgement"
+        );
     }
 
     #[test]
     fn a_recheck_with_no_history_explains_itself() {
         let mut h = Harness::new("nohistory");
         h.app.start_recheck(&egui::Context::default(), 10);
-        assert!(h.app.ref_error.as_deref().is_some_and(|e| e.contains("no past decisions")));
+        assert!(h
+            .app
+            .ref_error
+            .as_deref()
+            .is_some_and(|e| e.contains("no past decisions")));
     }
 
     #[test]
     fn repeated_judgements_give_the_report_a_noise_floor() {
         let dir = TempDir::new("floor");
-        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let cli = FakeCli::new(
+            &dir,
+            "fake",
+            FakeCliSpec {
+                reply: VERDICT,
+                ..Default::default()
+            },
+        );
         let mut h = Harness::new("floor");
         h.enter_with(vec![cli.model_config("")]);
         h.wait_for_model_replies();
@@ -3556,7 +4149,9 @@ mod state_tests {
         h.app.save_and_continue(&egui::Context::default(), false);
 
         // Before any repeat there is no scale to read agreement against.
-        assert!(crate::eval::Report::from_db(&h.app.db).self_agreement_pct().is_none());
+        assert!(crate::eval::Report::from_db(&h.app.db)
+            .self_agreement_pct()
+            .is_none());
 
         // Re-judge the same comment the same way.
         h.app.settings.models.clear();
@@ -3570,7 +4165,11 @@ mod state_tests {
         let report = crate::eval::Report::from_db(&h.app.db);
         assert_eq!(report.repeat_total, 1);
         assert_eq!(report.self_agreement_pct(), Some(0.0));
-        assert!(report.render().contains("self-agreement: 0%"), "{}", report.render());
+        assert!(
+            report.render().contains("self-agreement: 0%"),
+            "{}",
+            report.render()
+        );
     }
 
     // -- decisions persist across sessions -----------------------------------
@@ -3579,7 +4178,8 @@ mod state_tests {
     /// on, so these tests watch the same two comment units each time.
     fn replan(h: &mut Harness) {
         h.app.settings.review_code = false;
-        h.app.build_plan(RefKind::Branch, "feature".into(), "main".into());
+        h.app
+            .build_plan(RefKind::Branch, "feature".into(), "main".into());
     }
 
     /// The file picker's numbers come off the plan, so they have to be
@@ -3592,7 +4192,10 @@ mod state_tests {
         let file = &h.app.plan.as_ref().unwrap().files[0];
         // The branch replaces a one-line file with a six-line one.
         assert_eq!(file.line_changes, (6, 1));
-        assert_eq!(file.total_lines, 6, "the size is of the file on disk, not of the diff");
+        assert_eq!(
+            file.total_lines, 6,
+            "the size is of the file on disk, not of the diff"
+        );
         // Two one-line comment units. What the reviewer is asked to read is a
         // small part of what changed, which is why both numbers are shown.
         assert_eq!(file.review_lines(), 2);
@@ -3606,8 +4209,10 @@ mod state_tests {
 
         // Keeping a comment is a verdict too, even though nothing is written.
         h.enter_with(vec![]);
-        let judged = h.app.current_unit().expect("a unit").raw_lines().join("
-");
+        let judged = h.app.current_unit().expect("a unit").raw_lines().join(
+            "
+",
+        );
         h.app.save_and_continue(&egui::Context::default(), false);
 
         // Same branch, same diff, opened again later: one unit fewer.
@@ -3616,8 +4221,10 @@ mod state_tests {
         assert_eq!(plan.total_units(), 1, "the decided unit came back");
         assert_eq!(plan.skipped_decided, 1);
         assert!(
-            plan.files[0].units.iter().all(|u| u.raw_lines().join("
-") != judged),
+            plan.files[0].units.iter().all(|u| u.raw_lines().join(
+                "
+"
+            ) != judged),
             "the plan still holds the unit that was already judged"
         );
     }
@@ -3643,11 +4250,13 @@ mod state_tests {
         let plan = h.app.plan.as_ref().unwrap();
         assert_eq!(plan.skipped_decided, 1);
         assert!(
-            plan.files[0]
-                .units
-                .iter()
-                .all(|u| !u.raw_lines().join("
-").contains("Counts retries")),
+            plan.files[0].units.iter().all(|u| !u
+                .raw_lines()
+                .join(
+                    "
+"
+                )
+                .contains("Counts retries")),
             "the rewrite is being reviewed as if it were someone else's comment"
         );
     }
@@ -3662,7 +4271,11 @@ mod state_tests {
         h.app.settings.skip_decided = false;
         replan(&mut h);
         let plan = h.app.plan.as_ref().unwrap();
-        assert_eq!(plan.total_units(), 2, "the toggle should have restored both units");
+        assert_eq!(
+            plan.total_units(),
+            2,
+            "the toggle should have restored both units"
+        );
         assert_eq!(plan.skipped_decided, 0);
     }
 
@@ -3692,8 +4305,11 @@ mod state_tests {
 
         // A second checkout with byte-identical comments: its own review.
         let other = TempRepo::new("otherrepo2");
-        other.write("src/lib.rs", "fn main() {}
-");
+        other.write(
+            "src/lib.rs",
+            "fn main() {}
+",
+        );
         other.commit("base");
         other.git(&["checkout", "-b", "feature"]);
         other.write("src/lib.rs", LIB_RS);
@@ -3705,7 +4321,11 @@ mod state_tests {
         });
         replan(&mut h);
         let plan = h.app.plan.as_ref().unwrap();
-        assert_eq!(plan.total_units(), 2, "a verdict leaked across repositories");
+        assert_eq!(
+            plan.total_units(),
+            2,
+            "a verdict leaked across repositories"
+        );
         assert_eq!(plan.skipped_decided, 0);
     }
 
@@ -3735,8 +4355,14 @@ mod state_tests {
 
         let diff = gitio::review_diff(&repo.path(), "main", 12).expect("diff");
         let files = crate::diffparse::parse(&diff);
-        let extracted =
-            units::assemble(&repo.path(), &files, 12, false, true, gitio::new_side("main"));
+        let extracted = units::assemble(
+            &repo.path(),
+            &files,
+            12,
+            false,
+            true,
+            gitio::new_side("main"),
+        );
         assert_eq!(extracted.len(), 1, "expected one reviewable file");
         let files = extracted
             .into_iter()
@@ -3759,7 +4385,11 @@ mod state_tests {
             decided_total: 0,
             skipped_decided: 0,
         });
-        Harness { app, repo, _dir: dir }
+        Harness {
+            app,
+            repo,
+            _dir: dir,
+        }
     }
 
     #[test]
@@ -3768,15 +4398,29 @@ mod state_tests {
         h.enter_with(vec![]);
         let unit = h.app.current_unit().expect("a code unit");
         assert!(unit.is_code());
-        assert_eq!(unit.kind_label(), "code · fn main()", "the enclosing scope names the unit");
+        assert_eq!(
+            unit.kind_label(),
+            "code · fn main()",
+            "the enclosing scope names the unit"
+        );
         // Code is edited exactly as it sits in the file — indentation intact.
-        assert_eq!(h.app.original_display, "    let count = 1;\n    print(count);");
+        assert_eq!(
+            h.app.original_display,
+            "    let count = 1;\n    print(count);"
+        );
     }
 
     #[test]
     fn a_revision_is_applied_verbatim_with_its_evidence_recorded() {
         let dir = TempDir::new("revise");
-        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: REVISE, ..Default::default() });
+        let cli = FakeCli::new(
+            &dir,
+            "fake",
+            FakeCliSpec {
+                reply: REVISE,
+                ..Default::default()
+            },
+        );
         let mut h = code_harness("revise");
         h.enter_with(vec![cli.model_config("")]);
         h.wait_for_model_replies();
@@ -3785,7 +4429,11 @@ mod state_tests {
             panic!("expected a ready candidate");
         };
         assert_eq!(s.action, Action::Rewrite);
-        assert_eq!(s.evidence.len(), 1, "the model's reading list must survive parsing");
+        assert_eq!(
+            s.evidence.len(),
+            1,
+            "the model's reading list must survive parsing"
+        );
         assert_eq!(s.evidence[0].file, "src/lib.rs");
 
         h.app.choose_candidate(0);
@@ -3800,11 +4448,22 @@ mod state_tests {
     #[test]
     fn a_failing_check_reverts_the_edit_and_stays_put() {
         let dir = TempDir::new("checkfail");
-        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: REVISE, ..Default::default() });
+        let cli = FakeCli::new(
+            &dir,
+            "fake",
+            FakeCliSpec {
+                reply: REVISE,
+                ..Default::default()
+            },
+        );
         let checker = FakeCli::new(
             &dir,
             "checker",
-            FakeCliSpec { reply: "error[E0425]: cannot find value", exit_code: 1, ..Default::default() },
+            FakeCliSpec {
+                reply: "error[E0425]: cannot find value",
+                exit_code: 1,
+                ..Default::default()
+            },
         );
         let mut h = code_harness("checkfail");
         h.app.settings.check_command = checker.command();
@@ -3816,12 +4475,31 @@ mod state_tests {
         h.app.save_and_continue(&egui::Context::default(), false);
         // The edit must be rolled back, the failure shown, and the review must
         // not advance past a unit whose edit did not survive.
-        assert_eq!(h.repo.read("src/lib.rs"), before, "the failing edit must be reverted");
-        let err = h.app.review_error.clone().expect("the failure must be surfaced");
+        assert_eq!(
+            h.repo.read("src/lib.rs"),
+            before,
+            "the failing edit must be reverted"
+        );
+        let err = h
+            .app
+            .review_error
+            .clone()
+            .expect("the failure must be surfaced");
         assert!(err.contains("reverted"), "{err}");
-        assert!(err.contains("cannot find value"), "the check's own words: {err}");
-        assert_eq!(h.app.plan.as_ref().unwrap().decided_total, 0, "must not advance");
-        assert_eq!(h.app.db.decision_counts(1).0, 0, "no decision recorded for a reverted edit");
+        assert!(
+            err.contains("cannot find value"),
+            "the check's own words: {err}"
+        );
+        assert_eq!(
+            h.app.plan.as_ref().unwrap().decided_total,
+            0,
+            "must not advance"
+        );
+        assert_eq!(
+            h.app.db.decision_counts(1).0,
+            0,
+            "no decision recorded for a reverted edit"
+        );
         // The check ran where the code lives.
         let seen = std::fs::canonicalize(checker.cwd_seen()).expect("checker cwd");
         assert_eq!(seen, std::fs::canonicalize(h.repo.path()).unwrap());
@@ -3830,8 +4508,22 @@ mod state_tests {
     #[test]
     fn a_passing_check_lets_the_edit_stand() {
         let dir = TempDir::new("checkok");
-        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: REVISE, ..Default::default() });
-        let checker = FakeCli::new(&dir, "checker", FakeCliSpec { reply: "ok", ..Default::default() });
+        let cli = FakeCli::new(
+            &dir,
+            "fake",
+            FakeCliSpec {
+                reply: REVISE,
+                ..Default::default()
+            },
+        );
+        let checker = FakeCli::new(
+            &dir,
+            "checker",
+            FakeCliSpec {
+                reply: "ok",
+                ..Default::default()
+            },
+        );
         let mut h = code_harness("checkok");
         h.app.settings.check_command = checker.command();
         h.enter_with(vec![cli.model_config("")]);
@@ -3840,19 +4532,37 @@ mod state_tests {
 
         h.app.save_and_continue(&egui::Context::default(), false);
         assert!(h.app.review_error.is_none(), "{:?}", h.app.review_error);
-        assert!(h.repo.read("src/lib.rs").contains("count = 2"), "the edit must stand");
-        assert_eq!(h.app.plan.as_ref().unwrap().decided_total, 1, "and the review moves on");
+        assert!(
+            h.repo.read("src/lib.rs").contains("count = 2"),
+            "the edit must stand"
+        );
+        assert_eq!(
+            h.app.plan.as_ref().unwrap().decided_total,
+            1,
+            "and the review moves on"
+        );
     }
 
     #[test]
     fn comment_edits_skip_the_check_unless_asked() {
         let dir = TempDir::new("checkskip");
-        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let cli = FakeCli::new(
+            &dir,
+            "fake",
+            FakeCliSpec {
+                reply: VERDICT,
+                ..Default::default()
+            },
+        );
         // A checker that always fails: if it ran, the edit would be reverted.
         let checker = FakeCli::new(
             &dir,
             "checker",
-            FakeCliSpec { reply: "boom", exit_code: 1, ..Default::default() },
+            FakeCliSpec {
+                reply: "boom",
+                exit_code: 1,
+                ..Default::default()
+            },
         );
         let mut h = Harness::new("checkskip");
         h.app.settings.check_command = checker.command();
@@ -3862,14 +4572,21 @@ mod state_tests {
         h.app.choose_candidate(0);
         h.app.save_and_continue(&egui::Context::default(), false);
         assert!(h.app.review_error.is_none(), "{:?}", h.app.review_error);
-        assert!(h.repo.read("src/lib.rs").contains("// Counts retries."), "edit must stand");
+        assert!(
+            h.repo.read("src/lib.rs").contains("// Counts retries."),
+            "edit must stand"
+        );
 
         // Opt comment edits in, and the same failing checker now blocks them.
         h.app.settings.validate_comment_edits = true;
         h.wait_for_model_replies();
         h.app.choose_candidate(0);
         h.app.save_and_continue(&egui::Context::default(), false);
-        assert!(h.app.review_error.as_deref().is_some_and(|e| e.contains("reverted")));
+        assert!(h
+            .app
+            .review_error
+            .as_deref()
+            .is_some_and(|e| e.contains("reverted")));
     }
 
     #[test]
@@ -3877,7 +4594,14 @@ mod state_tests {
         let dir = TempDir::new("flag");
         let flag_reply = "{\"action\":\"flag\",\
 \"justification\":\"races with init — count is read before main runs\"}";
-        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: flag_reply, ..Default::default() });
+        let cli = FakeCli::new(
+            &dir,
+            "fake",
+            FakeCliSpec {
+                reply: flag_reply,
+                ..Default::default()
+            },
+        );
         let mut h = code_harness("flag");
         let before = h.repo.read("src/lib.rs");
         let head = gitio::head_sha(&h.repo.path()).unwrap();
@@ -3885,7 +4609,10 @@ mod state_tests {
         h.wait_for_model_replies();
 
         h.app.choose_candidate(0);
-        assert_eq!(h.app.editor, h.app.original_display, "a flag proposes no text");
+        assert_eq!(
+            h.app.editor, h.app.original_display,
+            "a flag proposes no text"
+        );
         assert_eq!(h.app.current_action(), Action::Flag);
 
         h.app.save_and_continue(&egui::Context::default(), true);
@@ -3903,13 +4630,24 @@ mod state_tests {
     fn editing_after_a_flag_turns_it_into_a_rewrite() {
         let dir = TempDir::new("flagedit");
         let flag_reply = "{\"action\":\"flag\",\"justification\":\"wrong start value\"}";
-        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: flag_reply, ..Default::default() });
+        let cli = FakeCli::new(
+            &dir,
+            "fake",
+            FakeCliSpec {
+                reply: flag_reply,
+                ..Default::default()
+            },
+        );
         let mut h = code_harness("flagedit");
         h.enter_with(vec![cli.model_config("")]);
         h.wait_for_model_replies();
         h.app.choose_candidate(0);
         h.app.editor = "    let count = 5;\n    print(count);".into();
-        assert_eq!(h.app.current_action(), Action::Rewrite, "a hand edit outranks the flag");
+        assert_eq!(
+            h.app.current_action(),
+            Action::Rewrite,
+            "a hand edit outranks the flag"
+        );
         h.app.save_and_continue(&egui::Context::default(), false);
         assert!(h.app.review_error.is_none(), "{:?}", h.app.review_error);
         assert!(h.repo.read("src/lib.rs").contains("count = 5"));
@@ -3979,7 +4717,10 @@ mod state_tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while h.app.whole_branch_review_running() {
             h.app.pump_messages();
-            assert!(std::time::Instant::now() < deadline, "whole-branch review never came back");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "whole-branch review never came back"
+            );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         h.app.pump_messages();
@@ -3993,7 +4734,14 @@ mod state_tests {
 {\"title\":\"rename half applied\",\"severity\":\"high\",\
 \"detail\":\"old name still read in lib.rs\",\"files\":[\"src/lib.rs\"],\
 \"evidence\":[{\"file\":\"src/lib.rs\",\"lines\":\"1-4\",\"note\":\"checked callers\"}]}]}";
-        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply, ..Default::default() });
+        let cli = FakeCli::new(
+            &dir,
+            "fake",
+            FakeCliSpec {
+                reply,
+                ..Default::default()
+            },
+        );
         let mut h = code_harness("branchpass");
         h.app.settings.models = vec![cli.model_config("")];
 
@@ -4006,9 +4754,15 @@ mod state_tests {
         assert_eq!(seen, std::fs::canonicalize(h.repo.path()).unwrap());
         let sent = cli.stdin_seen();
         assert!(sent.contains("cross-cutting"), "{sent}");
-        assert!(sent.contains("let count = 1;"), "the diff must travel: {sent}");
+        assert!(
+            sent.contains("let count = 1;"),
+            "the diff must travel: {sent}"
+        );
 
-        assert!(matches!(h.app.whole_branch_review[0], WholeBranchReviewState::Done { n: 2, .. }));
+        assert!(matches!(
+            h.app.whole_branch_review[0],
+            WholeBranchReviewState::Done { n: 2, .. }
+        ));
         assert_eq!(h.app.findings.len(), 2);
         // Sorted for triage: high first, whatever order the model used.
         assert_eq!(h.app.findings[0].finding.title, "rename half applied");
@@ -4018,7 +4772,10 @@ mod state_tests {
         // carries only what is still open.
         let (keep_id, drop_id) = (h.app.findings[0].id, h.app.findings[1].id);
         h.app.dismiss_finding(drop_id);
-        assert_eq!(h.app.db.finding_status(drop_id).as_deref(), Some("dismissed"));
+        assert_eq!(
+            h.app.db.finding_status(drop_id).as_deref(),
+            Some("dismissed")
+        );
         assert_eq!(h.app.db.finding_status(keep_id).as_deref(), Some("open"));
         let md = h.app.findings_markdown();
         assert!(md.contains("rename half applied"), "{md}");
@@ -4043,7 +4800,10 @@ mod state_tests {
             }]),
             latency_ms: 1,
         });
-        assert!(h.app.findings.is_empty(), "an outdated review must not record findings");
+        assert!(
+            h.app.findings.is_empty(),
+            "an outdated review must not record findings"
+        );
         assert!(
             h.app.whole_branch_review_running(),
             "and must not mark the new review's model complete"
@@ -4053,7 +4813,14 @@ mod state_tests {
     #[test]
     fn a_recheck_has_no_whole_branch_review() {
         let dir = TempDir::new("norecheck");
-        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let cli = FakeCli::new(
+            &dir,
+            "fake",
+            FakeCliSpec {
+                reply: VERDICT,
+                ..Default::default()
+            },
+        );
         let mut h = Harness::new("norecheck");
         h.enter_with(vec![cli.model_config("")]);
         h.wait_for_model_replies();
@@ -4063,13 +4830,23 @@ mod state_tests {
         h.app.start_recheck(&egui::Context::default(), 10);
 
         h.app.start_whole_branch_review(&egui::Context::default());
-        assert!(h.app.whole_branch_review.is_empty(), "nothing should launch for a re-check");
+        assert!(
+            h.app.whole_branch_review.is_empty(),
+            "nothing should launch for a re-check"
+        );
     }
 
     #[test]
     fn a_stale_reply_from_a_previous_comment_is_discarded() {
         let dir = TempDir::new("stale");
-        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let cli = FakeCli::new(
+            &dir,
+            "fake",
+            FakeCliSpec {
+                reply: VERDICT,
+                ..Default::default()
+            },
+        );
         let mut h = Harness::new("stale");
         h.enter_with(vec![cli.model_config("")]);
 
@@ -4103,7 +4880,10 @@ mod state_tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while app.fix_running {
             app.pump_messages();
-            assert!(std::time::Instant::now() < deadline, "fix session never came back");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fix session never came back"
+            );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
@@ -4114,7 +4894,10 @@ mod state_tests {
         h.enter_with(vec![]);
         h.app.note_input = "  this counter pattern repeats in four files — extract it  ".into();
         h.app.leave_note();
-        assert!(h.app.note_input.is_empty(), "a saved note leaves the input clear");
+        assert!(
+            h.app.note_input.is_empty(),
+            "a saved note leaves the input clear"
+        );
 
         h.app.open_followup();
         assert_eq!(h.app.screen as u8, Screen::Followup as u8);
@@ -4122,11 +4905,17 @@ mod state_tests {
         assert_eq!(h.app.notes.len(), 1);
         let n = &h.app.notes[0].note;
         assert_eq!(n.file, "src/lib.rs");
-        assert_eq!(n.text, "this counter pattern repeats in four files — extract it");
+        assert_eq!(
+            n.text,
+            "this counter pattern repeats in four files — extract it"
+        );
         // The note keeps the code the reviewer was looking at, not a pointer
         // into a tree that will have moved on by the fix session.
         assert!(n.excerpt.contains("Increment the counter"), "{}", n.excerpt);
-        assert!(!h.app.notes[0].checked, "notes load unchecked — checking is the human's call");
+        assert!(
+            !h.app.notes[0].checked,
+            "notes load unchecked — checking is the human's call"
+        );
         // The preamble is offered, not imposed: it appeared in the editable box.
         assert!(h.app.fix_prompt.contains("Resolve the review notes"));
     }
@@ -4157,8 +4946,14 @@ mod state_tests {
     #[test]
     fn checked_notes_resolve_at_launch_and_dismissed_notes_never_return() {
         let dir = TempDir::new("note_triage");
-        let cli =
-            FakeCli::new(&dir, "fixer", FakeCliSpec { reply: "all done.", ..Default::default() });
+        let cli = FakeCli::new(
+            &dir,
+            "fixer",
+            FakeCliSpec {
+                reply: "all done.",
+                ..Default::default()
+            },
+        );
         let mut h = Harness::new("note_triage");
         h.enter_with(vec![]);
         for text in ["first", "second", "third"] {
@@ -4191,7 +4986,10 @@ mod state_tests {
         assert!(!h.app.fix_convo[0].prompt.contains("second"));
         wait_for_fix_reply(&mut h.app);
         assert_eq!(h.app.fix_convo[0].reply, "all done.");
-        assert!(cli.stdin_seen().contains("first"), "the prompt travels on stdin");
+        assert!(
+            cli.stdin_seen().contains("first"),
+            "the prompt travels on stdin"
+        );
 
         // Next visit: dismissed and resolved stay gone, unchecked waits.
         h.app.open_followup();
@@ -4205,7 +5003,9 @@ mod state_tests {
         h.enter_with(vec![]);
         h.app.note_input = "ours".into();
         h.app.leave_note();
-        h.app.db.log_note(0, "some/other/checkout", "src/x.rs", 1, 1, "", "theirs");
+        h.app
+            .db
+            .log_note(0, "some/other/checkout", "src/x.rs", 1, 1, "", "theirs");
         h.app.open_followup();
         assert_eq!(h.app.notes.len(), 1);
         assert_eq!(h.app.notes[0].note.text, "ours");
@@ -4249,10 +5049,21 @@ mod discovery_state_tests {
         // a streamed find is visible immediately, next to the cached entry
         assert_eq!(app.discovered.len(), 2);
 
-        app.handle_repo(RepoMsg::Found { seq: 1, repo: found("proj", None, Some("e/proj"), 900) });
-        app.handle_repo(RepoMsg::Done { seq: 1, source: RepoSource::Local, err: None });
+        app.handle_repo(RepoMsg::Found {
+            seq: 1,
+            repo: found("proj", None, Some("e/proj"), 900),
+        });
+        app.handle_repo(RepoMsg::Done {
+            seq: 1,
+            source: RepoSource::Local,
+            err: None,
+        });
         assert!(app.scanning_gh, "one Done must not stop the other source");
-        app.handle_repo(RepoMsg::Done { seq: 1, source: RepoSource::GitHub, err: None });
+        app.handle_repo(RepoMsg::Done {
+            seq: 1,
+            source: RepoSource::GitHub,
+            err: None,
+        });
 
         // completion replaced the merged view: the vanished repo dropped out,
         // and the two sightings of proj are one row carrying the newest
@@ -4270,7 +5081,10 @@ mod discovery_state_tests {
     fn a_late_find_from_an_abandoned_scan_is_dropped() {
         let (_dir, mut app) = app("disc-stale");
         app.repo_scan_seq = 2;
-        app.handle_repo(RepoMsg::Found { seq: 1, repo: found("old", Some("/x"), None, 1) });
+        app.handle_repo(RepoMsg::Found {
+            seq: 1,
+            repo: found("old", Some("/x"), None, 1),
+        });
         assert!(app.discovered.is_empty());
     }
 }

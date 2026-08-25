@@ -3,9 +3,9 @@
 //! authenticated.
 
 use serde::Deserialize;
-use std::path::Path;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
+use std::path::Path;
 use std::process::Command;
 
 /// Build a `Command` that will not flash a console window on Windows. The
@@ -77,7 +77,11 @@ pub fn run(dir: &str, program: &str, args: &[&str]) -> Result<String, String> {
         Err(format!(
             "{program} {} failed: {}",
             args.join(" "),
-            if stderr.trim().is_empty() { stdout } else { stderr }
+            if stderr.trim().is_empty() {
+                stdout
+            } else {
+                stderr
+            }
         ))
     }
 }
@@ -126,13 +130,21 @@ pub fn file_is_dirty(dir: &str, file: &str) -> bool {
 
 /// Resolve the repo's default branch: origin/HEAD if set, else the fallback.
 pub fn default_branch(dir: &str, fallback: &str) -> String {
-    if let Ok(s) = git(dir, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]) {
+    if let Ok(s) = git(
+        dir,
+        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+    ) {
         if let Some(b) = s.trim().strip_prefix("origin/") {
             return b.to_string();
         }
     }
     for cand in [fallback, "main", "master"] {
-        if git(dir, &["rev-parse", "--verify", &format!("refs/heads/{cand}")]).is_ok() {
+        if git(
+            dir,
+            &["rev-parse", "--verify", &format!("refs/heads/{cand}")],
+        )
+        .is_ok()
+        {
             return cand.to_string();
         }
     }
@@ -245,7 +257,11 @@ pub fn review_diff(dir: &str, base: &str, context: usize) -> Result<String, Stri
 /// `-z` keeps unusual path characters literal instead of quoted-and-escaped.
 pub fn untracked_files(dir: &str) -> Result<Vec<String>, String> {
     let out = git(dir, &["ls-files", "--others", "--exclude-standard", "-z"])?;
-    Ok(out.split('\0').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect())
+    Ok(out
+        .split('\0')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect())
 }
 
 /// One untracked file rendered as a new-file diff. `--no-index` against
@@ -256,7 +272,15 @@ pub fn untracked_files(dir: &str) -> Result<Vec<String>, String> {
 fn untracked_file_diff(dir: &str, path: &str, context: usize) -> Option<String> {
     let u = format!("-U{context}");
     let out = hidden_command("git")
-        .args(["diff", "--no-color", &u, "--no-index", "--", "/dev/null", path])
+        .args([
+            "diff",
+            "--no-color",
+            &u,
+            "--no-index",
+            "--",
+            "/dev/null",
+            path,
+        ])
         .current_dir(dir)
         .output()
         .ok()?;
@@ -336,7 +360,13 @@ pub fn open_prs(dir: &str, gh: &str) -> Result<Vec<PrInfo>, String> {
         dir,
         gh,
         &[
-            "pr", "list", "--state", "open", "--limit", "50", "--json",
+            "pr",
+            "list",
+            "--state",
+            "open",
+            "--limit",
+            "50",
+            "--json",
             "number,title,headRefName,baseRefName,author",
         ],
     )?;
@@ -358,7 +388,10 @@ mod tests {
         let resolved = resolve_program(OsStr::new("cmd"));
         let s = resolved.to_string_lossy().to_ascii_lowercase();
         assert!(s.ends_with("cmd.exe"), "unexpected resolution: {s}");
-        assert!(s.contains(std::path::MAIN_SEPARATOR), "expected a full path, got {s}");
+        assert!(
+            s.contains(std::path::MAIN_SEPARATOR),
+            "expected a full path, got {s}"
+        );
     }
 
     #[test]
@@ -404,7 +437,10 @@ mod repo_tests {
         let repo = TempRepo::new("dirty");
         repo.write("a.txt", "hi\n");
         repo.commit("first");
-        assert!(!is_dirty(&repo.path()), "a clean checkout must not read as dirty");
+        assert!(
+            !is_dirty(&repo.path()),
+            "a clean checkout must not read as dirty"
+        );
 
         repo.write("a.txt", "changed\n");
         assert!(is_dirty(&repo.path()));
@@ -427,7 +463,11 @@ mod repo_tests {
 
         let branches = local_branches(&repo.path()).unwrap();
         let names: Vec<&str> = branches.iter().map(|b| b.name.as_str()).collect();
-        assert_eq!(names, vec!["feature", "main"], "most recently committed first");
+        assert_eq!(
+            names,
+            vec!["feature", "main"],
+            "most recently committed first"
+        );
         assert_eq!(branches[0].subject, "feature commit");
         assert!(!branches[0].sha.is_empty());
         assert!(!branches[0].age.is_empty());
@@ -467,7 +507,10 @@ mod repo_tests {
 
         // Against the base branch: only the feature's own change.
         let branch_diff = review_diff(&repo.path(), "main", 12).unwrap();
-        assert!(branch_diff.contains("Increment the counter"), "{branch_diff}");
+        assert!(
+            branch_diff.contains("Increment the counter"),
+            "{branch_diff}"
+        );
 
         // Against the empty tree: the whole history, so a brand-new repo has
         // something to review.
@@ -478,7 +521,9 @@ mod repo_tests {
         // therefore has nothing to show.
         assert!(review_diff(&repo.path(), "", 12).unwrap().trim().is_empty());
         repo.write("src/lib.rs", LIB_RS.replace("one", "1").as_str());
-        assert!(review_diff(&repo.path(), "", 12).unwrap().contains("counter"));
+        assert!(review_diff(&repo.path(), "", 12)
+            .unwrap()
+            .contains("counter"));
     }
 
     #[test]
@@ -486,7 +531,7 @@ mod repo_tests {
         assert_eq!(base_label(""), "HEAD");
         assert_eq!(base_label(EMPTY_TREE), "root");
         assert_eq!(base_label("main"), "main");
-    // The sentinels must survive the label round-trip: the whole-branch review
+        // The sentinels must survive the label round-trip: the whole-branch review
         // re-runs the diff from the stored label alone.
         for base in ["", EMPTY_TREE, STAGED, UNTRACKED, "main"] {
             assert_eq!(base_from_label(base_label(base)), base);
@@ -495,10 +540,16 @@ mod repo_tests {
 
     #[test]
     fn the_new_side_matches_what_each_diff_actually_ends_at() {
-        assert!(new_side("") == NewSide::WorkTree, "bare diff shows uncommitted lines");
+        assert!(
+            new_side("") == NewSide::WorkTree,
+            "bare diff shows uncommitted lines"
+        );
         assert!(new_side("main") == NewSide::Head);
         assert!(new_side(EMPTY_TREE) == NewSide::Head);
-        assert!(new_side(STAGED) == NewSide::Index, "staged lines live in the index only");
+        assert!(
+            new_side(STAGED) == NewSide::Index,
+            "staged lines live in the index only"
+        );
         assert!(new_side(UNTRACKED) == NewSide::WorkTree);
     }
 
@@ -509,7 +560,10 @@ mod repo_tests {
         repo.commit("first");
 
         // Nothing staged: nothing to review.
-        assert!(review_diff(&repo.path(), STAGED, 12).unwrap().trim().is_empty());
+        assert!(review_diff(&repo.path(), STAGED, 12)
+            .unwrap()
+            .trim()
+            .is_empty());
 
         // A staged edit shows; a later unstaged edit to the same file must not.
         repo.write("a.txt", "one\nstaged line\n");
@@ -517,7 +571,10 @@ mod repo_tests {
         repo.write("a.txt", "one\nstaged line\nunstaged line\n");
         let diff = review_diff(&repo.path(), STAGED, 12).unwrap();
         assert!(diff.contains("staged line"), "{diff}");
-        assert!(!diff.contains("unstaged line"), "the unstaged edit leaked in: {diff}");
+        assert!(
+            !diff.contains("unstaged line"),
+            "the unstaged edit leaked in: {diff}"
+        );
 
         // And the extractor must read content from the index, not the dirty
         // worktree, or the diff's line numbers point into the wrong file.
@@ -556,7 +613,10 @@ mod repo_tests {
             "untracked file lost in parsing: {:?}",
             files.iter().map(|f| &f.path).collect::<Vec<_>>()
         );
-        assert_eq!(untracked_files(&repo.path()).unwrap(), vec!["brand_new.rs".to_string()]);
+        assert_eq!(
+            untracked_files(&repo.path()).unwrap(),
+            vec!["brand_new.rs".to_string()]
+        );
     }
 
     #[test]
@@ -565,7 +625,10 @@ mod repo_tests {
         repo.write("src/lib.rs", "committed\n");
         repo.commit("base");
         repo.write("src/lib.rs", "dirty\n");
-        assert_eq!(file_at_head(&repo.path(), "src/lib.rs").as_deref(), Some("committed\n"));
+        assert_eq!(
+            file_at_head(&repo.path(), "src/lib.rs").as_deref(),
+            Some("committed\n")
+        );
         assert!(file_at_head(&repo.path(), "src/nope.rs").is_none());
     }
 
@@ -584,7 +647,10 @@ mod repo_tests {
         let last = repo.git(&["log", "-1", "--name-only", "--format=%s"]);
         assert!(last.contains("review: tweak a"), "{last}");
         assert!(last.contains("a.txt"), "{last}");
-        assert!(!last.contains("b.txt"), "b.txt should still be uncommitted: {last}");
+        assert!(
+            !last.contains("b.txt"),
+            "b.txt should still be uncommitted: {last}"
+        );
     }
 
     /// The whole non-interactive path: take a real diff, find the comment in
@@ -604,7 +670,11 @@ mod repo_tests {
         let diff = review_diff(&repo.path(), "main", 12).unwrap();
         let files = crate::diffparse::parse(&diff);
         let extracted = comments::extract_units(&files, 12);
-        assert_eq!(extracted.len(), 1, "one file should have a reviewable comment");
+        assert_eq!(
+            extracted.len(),
+            1,
+            "one file should have a reviewable comment"
+        );
         let (path, units) = &extracted[0];
         assert_eq!(path, "src/lib.rs");
         assert_eq!(units.len(), 1);
@@ -619,10 +689,19 @@ mod repo_tests {
 
         assert_eq!(delta, 0, "one line replaced by one line");
         let after = repo.read("src/lib.rs");
-        assert!(after.contains("    // Counting retries, not requests."), "indent lost: {after}");
+        assert!(
+            after.contains("    // Counting retries, not requests."),
+            "indent lost: {after}"
+        );
         assert!(!after.contains("Increment the counter"), "{after}");
-        assert!(after.contains("counter += 1;"), "the code itself must be untouched: {after}");
-        assert!(is_dirty(&repo.path()), "the edit should show up as a working-tree change");
+        assert!(
+            after.contains("counter += 1;"),
+            "the code itself must be untouched: {after}"
+        );
+        assert!(
+            is_dirty(&repo.path()),
+            "the edit should show up as a working-tree change"
+        );
     }
 
     /// Guard for the failure mode `apply_edit` exists to prevent: acting on a

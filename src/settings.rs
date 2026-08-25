@@ -698,8 +698,7 @@ mod tests {
             );
             // Either the CLI reports the id, or we hand it one.
             assert!(
-                !model_config.session_key.is_empty()
-                    || model_config.command.contains("{session}"),
+                !model_config.session_key.is_empty() || model_config.command.contains("{session}"),
                 "{} can neither report nor accept a session id",
                 model_config.name
             );

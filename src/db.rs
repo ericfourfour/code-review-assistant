@@ -115,6 +115,9 @@ pub struct AgreementRow {
     pub blinded: bool,
 }
 
+#[cfg(test)]
+pub type SuggestionLink = (String, Option<String>, Option<i64>, Option<i64>);
+
 fn db_path() -> PathBuf {
     if let Ok(p) = std::env::var("CRA_DB") {
         return PathBuf::from(p);
@@ -130,18 +133,25 @@ fn db_path() -> PathBuf {
 /// `ADD COLUMN IF NOT EXISTS`, and blindly retrying the ALTER would mask real
 /// errors, so ask first.
 fn add_column(conn: &Connection, table: &str, column: &str, decl: &str) {
-    let Ok(mut stmt) = conn.prepare(&format!("PRAGMA table_info({table})")) else { return };
+    let Ok(mut stmt) = conn.prepare(&format!("PRAGMA table_info({table})")) else {
+        return;
+    };
     let existing: Vec<String> = stmt
         .query_map([], |r| r.get::<_, String>(1))
         .map(|rows| rows.flatten().collect())
         .unwrap_or_default();
     if !existing.iter().any(|c| c == column) {
-        let _ = conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"), []);
+        let _ = conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
+            [],
+        );
     }
 }
 
 fn now() -> String {
-    chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string()
+    chrono::Local::now()
+        .format("%Y-%m-%d %H:%M:%S%.3f")
+        .to_string()
 }
 
 impl Db {
@@ -278,7 +288,11 @@ impl Db {
 
     pub fn get_setting(&self, key: &str) -> Option<String> {
         self.conn
-            .query_row("SELECT value FROM settings WHERE key = ?1", params![key], |r| r.get(0))
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![key],
+                |r| r.get(0),
+            )
             .ok()
     }
 
@@ -307,11 +321,25 @@ impl Db {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
                      ?18, ?19)",
             params![
-                now(), s.session_id, s.file, s.line_start, s.line_end, s.model, s.action,
-                s.comment, s.justification, s.latency_ms, s.error, s.evidence,
-                s.usage.map(|u| u.input_tokens), s.usage.map(|u| u.output_tokens),
-                s.usage.map(|u| u.cache_read_tokens), s.cost.map(|(usd, _)| usd),
-                s.cost.map(|(_, estimated)| estimated as i64), s.follow_up_id, s.round
+                now(),
+                s.session_id,
+                s.file,
+                s.line_start,
+                s.line_end,
+                s.model,
+                s.action,
+                s.comment,
+                s.justification,
+                s.latency_ms,
+                s.error,
+                s.evidence,
+                s.usage.map(|u| u.input_tokens),
+                s.usage.map(|u| u.output_tokens),
+                s.usage.map(|u| u.cache_read_tokens),
+                s.cost.map(|(usd, _)| usd),
+                s.cost.map(|(_, estimated)| estimated as i64),
+                s.follow_up_id,
+                s.round
             ],
         );
     }
@@ -331,7 +359,15 @@ impl Db {
         let _ = self.conn.execute(
             "INSERT INTO follow_ups(ts, session_id, file, line_start, line_end, round, question)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![now(), session_id, file, line_start, line_end, round, question],
+            params![
+                now(),
+                session_id,
+                file,
+                line_start,
+                line_end,
+                round,
+                question
+            ],
         );
         self.conn.last_insert_rowid()
     }
@@ -380,9 +416,21 @@ impl Db {
                                    justification, unit_json, blinded)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
-                now(), d.session_id, d.file, d.line_start, d.line_end, d.original, d.action,
-                d.final_text, d.source, d.human_edited as i64, d.committed as i64, d.commit_sha,
-                d.justification, d.unit_json, d.blinded as i64
+                now(),
+                d.session_id,
+                d.file,
+                d.line_start,
+                d.line_end,
+                d.original,
+                d.action,
+                d.final_text,
+                d.source,
+                d.human_edited as i64,
+                d.committed as i64,
+                d.commit_sha,
+                d.justification,
+                d.unit_json,
+                d.blinded as i64
             ],
         );
         self.conn.last_insert_rowid()
@@ -575,7 +623,9 @@ impl Db {
                    LEFT JOIN sessions sess ON sess.id = s.session_id
                    WHERE (?1 IS NULL OR sess.repo = ?1)
                    GROUP BY s.model";
-        let Ok(mut stmt) = self.conn.prepare(sql) else { return Vec::new() };
+        let Ok(mut stmt) = self.conn.prepare(sql) else {
+            return Vec::new();
+        };
         stmt.query_map(params![repo], |r| {
             Ok(SpendRow {
                 model: r.get(0)?,
@@ -653,7 +703,16 @@ impl Db {
         let _ = self.conn.execute(
             "INSERT INTO notes(ts, session_id, repo, file, line_start, line_end, excerpt, text)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![now(), session_id, repo, file, line_start, line_end, excerpt, text],
+            params![
+                now(),
+                session_id,
+                repo,
+                file,
+                line_start,
+                line_end,
+                excerpt,
+                text
+            ],
         );
         self.conn.last_insert_rowid()
     }
@@ -705,10 +764,11 @@ impl Db {
     /// Every suggestion's conversation coordinates, oldest first:
     /// (file, action, follow_up_id, round).
     #[cfg(test)]
-    pub fn suggestion_links(&self) -> Vec<(String, Option<String>, Option<i64>, Option<i64>)> {
-        let Ok(mut stmt) = self.conn.prepare(
-            "SELECT file, action, follow_up_id, round FROM suggestions ORDER BY id ASC",
-        ) else {
+    pub fn suggestion_links(&self) -> Vec<SuggestionLink> {
+        let Ok(mut stmt) = self
+            .conn
+            .prepare("SELECT file, action, follow_up_id, round FROM suggestions ORDER BY id ASC")
+        else {
             return Vec::new();
         };
         stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
@@ -730,7 +790,9 @@ impl Db {
     #[cfg(test)]
     pub fn note_status(&self, id: i64) -> Option<String> {
         self.conn
-            .query_row("SELECT status FROM notes WHERE id = ?1", params![id], |r| r.get(0))
+            .query_row("SELECT status FROM notes WHERE id = ?1", params![id], |r| {
+                r.get(0)
+            })
             .ok()
     }
 
@@ -750,7 +812,16 @@ impl Db {
         let _ = self.conn.execute(
             "INSERT INTO findings(ts, session_id, model, severity, title, detail, files, evidence)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![now(), session_id, model, severity, title, detail, files_json, evidence_json],
+            params![
+                now(),
+                session_id,
+                model,
+                severity,
+                title,
+                detail,
+                files_json,
+                evidence_json
+            ],
         );
         self.conn.last_insert_rowid()
     }
@@ -766,7 +837,11 @@ impl Db {
     #[cfg(test)]
     pub fn finding_status(&self, id: i64) -> Option<String> {
         self.conn
-            .query_row("SELECT status FROM findings WHERE id = ?1", params![id], |r| r.get(0))
+            .query_row(
+                "SELECT status FROM findings WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
             .ok()
     }
 

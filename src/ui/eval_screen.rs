@@ -46,16 +46,21 @@ impl CraApp {
 
         ui.horizontal(|ui| {
             ui.heading("Model evaluation");
-            ui.label(theme::dim("— which suggestions you took, and what they cost"));
+            ui.label(theme::dim(
+                "— which suggestions you took, and what they cost",
+            ));
         });
         ui.add_space(2.0);
         self.filter_row(ui);
         ui.add_space(6.0);
 
-        let Some(board) = self.eval.take() else { return };
-        egui::ScrollArea::vertical().id_salt("eval_scroll").auto_shrink([false, false]).show(
-            ui,
-            |ui| {
+        let Some(board) = self.eval.take() else {
+            return;
+        };
+        egui::ScrollArea::vertical()
+            .id_salt("eval_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
                 self.headline(ui, &board);
                 ui.add_space(10.0);
                 self.leaderboard(ui, &board);
@@ -68,8 +73,7 @@ impl CraApp {
                 ui.add_space(12.0);
                 caveats(ui, &board);
                 ui.add_space(8.0);
-            },
-        );
+            });
         self.eval = Some(board);
     }
 
@@ -83,28 +87,37 @@ impl CraApp {
                 Some(path) => short_repo(path),
                 None => "all repositories".to_string(),
             };
-            egui::ComboBox::from_id_salt("eval_repo").selected_text(label).width(240.0).show_ui(
-                ui,
-                |ui| {
-                    if ui.selectable_label(self.eval_filter.repo.is_none(), "all repositories").clicked()
+            egui::ComboBox::from_id_salt("eval_repo")
+                .selected_text(label)
+                .width(240.0)
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_label(self.eval_filter.repo.is_none(), "all repositories")
+                        .clicked()
                     {
                         self.eval_filter.repo = None;
                     }
                     for repo in &self.eval_repos {
                         let on = self.eval_filter.repo.as_deref() == Some(repo.as_str());
-                        if ui.selectable_label(on, short_repo(repo)).on_hover_text(repo).clicked() {
+                        if ui
+                            .selectable_label(on, short_repo(repo))
+                            .on_hover_text(repo)
+                            .clicked()
+                        {
                             self.eval_filter.repo = Some(repo.clone());
                         }
                     }
-                },
-            );
+                });
             ui.separator();
-            ui.checkbox(&mut self.eval_filter.blinded_only, "blinded decisions only [B]")
-                .on_hover_text(
-                    "A choice made while the model names were visible measures which model \
+            ui.checkbox(
+                &mut self.eval_filter.blinded_only,
+                "blinded decisions only [B]",
+            )
+            .on_hover_text(
+                "A choice made while the model names were visible measures which model \
                      you already trust as much as it measures the suggestion. Off includes \
                      those; the caveats below say how many they are.",
-                );
+            );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("↻ refresh [R]").clicked() {
                     self.eval = None;
@@ -155,7 +168,11 @@ impl CraApp {
             tile(
                 ui,
                 "spent on suggestions",
-                &if cost > 0.0 { format!("${cost:.2}") } else { "—".into() },
+                &if cost > 0.0 {
+                    format!("${cost:.2}")
+                } else {
+                    "—".into()
+                },
                 &format!("{} unpriced call(s)", board.unpriced_calls()),
                 theme::WARN,
             );
@@ -191,7 +208,9 @@ impl CraApp {
             .spacing([14.0, 5.0])
             .striped(true)
             .show(ui, |ui| {
-                for h in ["model", "won", "agreed", "offered", "errors", "mean", "tokens", "cost"] {
+                for h in [
+                    "model", "won", "agreed", "offered", "errors", "mean", "tokens", "cost",
+                ] {
                     ui.label(theme::dim(h));
                 }
                 ui.end_row();
@@ -223,12 +242,11 @@ impl CraApp {
                     };
                     ui.label(errors);
                     ui.label(RichText::new(format!("{} ms", s.mean_latency_ms())).monospace());
-                    ui.label(RichText::new(compact(s.tokens())).monospace()).on_hover_text(
-                        format!(
+                    ui.label(RichText::new(compact(s.tokens())).monospace())
+                        .on_hover_text(format!(
                             "{} in · {} out · {} cached-in, over {} call(s)",
                             s.input_tokens, s.output_tokens, s.cache_read_tokens, s.calls
-                        ),
-                    );
+                        ));
                     cost_cell(ui, s);
                     ui.end_row();
                 }
@@ -259,19 +277,16 @@ impl CraApp {
         ui.horizontal(|ui| {
             ui.add_sized(
                 [110.0, 16.0],
-                egui::Label::new(RichText::new(&h.a).monospace().color(a_color)).halign(
-                    egui::Align::RIGHT,
-                ),
+                egui::Label::new(RichText::new(&h.a).monospace().color(a_color))
+                    .halign(egui::Align::RIGHT),
             );
             count(ui, h.a_wins, egui::Align::RIGHT);
 
             // One 100%-wide bar split three ways: a's wins, neither, b's wins.
             // A single stacked bar rather than two opposed ones, so the
             // undecided middle stays visible instead of being implied by a gap.
-            let (rect, resp) = ui.allocate_exact_size(
-                egui::vec2(220.0, BAR_H + 2.0),
-                egui::Sense::hover(),
-            );
+            let (rect, resp) =
+                ui.allocate_exact_size(egui::vec2(220.0, BAR_H + 2.0), egui::Sense::hover());
             let painter = ui.painter();
             let total = h.together.max(1) as f32;
             let mut x = rect.left();
@@ -307,9 +322,8 @@ impl CraApp {
             count(ui, h.b_wins, egui::Align::LEFT);
             ui.add_sized(
                 [110.0, 16.0],
-                egui::Label::new(RichText::new(&h.b).monospace().color(b_color)).halign(
-                    egui::Align::LEFT,
-                ),
+                egui::Label::new(RichText::new(&h.b).monospace().color(b_color))
+                    .halign(egui::Align::LEFT),
             );
             ui.label(theme::dim(&format!("· {} together", h.together)));
         });
@@ -325,24 +339,27 @@ impl CraApp {
         }
         theme::section_title(ui, "VERDICT MIX — WHAT EACH MODEL REACHES FOR");
         ui.add_space(4.0);
-        egui::Grid::new("eval_mix").num_columns(3).spacing([14.0, 5.0]).show(ui, |ui| {
-            ui.label(theme::dim("you"));
-            mix_bar(ui, &board.human_verdicts);
-            ui.label(theme::dim(&mix_legend(&board.human_verdicts)));
-            ui.end_row();
-            for s in &board.standings {
-                if s.verdicts.is_empty() {
-                    continue;
-                }
-                ui.horizontal(|ui| {
-                    swatch(ui, self.model_color(&s.model));
-                    ui.label(RichText::new(&s.model).monospace());
-                });
-                mix_bar(ui, &s.verdicts);
-                ui.label(theme::dim(&mix_legend(&s.verdicts)));
+        egui::Grid::new("eval_mix")
+            .num_columns(3)
+            .spacing([14.0, 5.0])
+            .show(ui, |ui| {
+                ui.label(theme::dim("you"));
+                mix_bar(ui, &board.human_verdicts);
+                ui.label(theme::dim(&mix_legend(&board.human_verdicts)));
                 ui.end_row();
-            }
-        });
+                for s in &board.standings {
+                    if s.verdicts.is_empty() {
+                        continue;
+                    }
+                    ui.horizontal(|ui| {
+                        swatch(ui, self.model_color(&s.model));
+                        ui.label(RichText::new(&s.model).monospace());
+                    });
+                    mix_bar(ui, &s.verdicts);
+                    ui.label(theme::dim(&mix_legend(&s.verdicts)));
+                    ui.end_row();
+                }
+            });
     }
 
     /// Money, kept apart from the leaderboard on purpose: spend counts every
@@ -424,7 +441,12 @@ impl CraApp {
         self.eval_repos = self.db.repos_with_history();
         // A filter pinned to a repository with no history left would silently
         // show an empty page; fall back to everything.
-        if self.eval_filter.repo.as_ref().is_some_and(|r| !self.eval_repos.contains(r)) {
+        if self
+            .eval_filter
+            .repo
+            .as_ref()
+            .is_some_and(|r| !self.eval_repos.contains(r))
+        {
             self.eval_filter.repo = None;
         }
         self.eval = Some(Leaderboard::from_db(&self.db, &self.eval_filter));
@@ -458,19 +480,10 @@ fn tile(ui: &mut egui::Ui, label: &str, value: &str, sub: &str, color: egui::Col
 /// A rate as bar + `n/d`. The denominator is not optional: this table's rates
 /// are routinely built on a handful of decisions, and a bare percentage
 /// invites reading a 2-of-3 as a result.
-fn rate_cell(
-    ui: &mut egui::Ui,
-    pct: f64,
-    n: usize,
-    d: usize,
-    color: egui::Color32,
-    note: String,
-) {
+fn rate_cell(ui: &mut egui::Ui, pct: f64, n: usize, d: usize, color: egui::Color32, note: String) {
     ui.horizontal(|ui| {
-        let (rect, resp) = ui.allocate_exact_size(
-            egui::vec2(BAR_W, BAR_H + 2.0),
-            egui::Sense::hover(),
-        );
+        let (rect, resp) =
+            ui.allocate_exact_size(egui::vec2(BAR_W, BAR_H + 2.0), egui::Sense::hover());
         let painter = ui.painter();
         let track = egui::Rect::from_min_size(
             egui::pos2(rect.left(), rect.top() + 1.0),
@@ -527,7 +540,10 @@ fn cost_cell(ui: &mut egui::Ui, s: &Standing) {
             };
             let label = ui.label(RichText::new(text).monospace());
             let source = if s.estimated_calls > 0 {
-                format!("{} call(s) priced from the model configuration's rates, not by the CLI", s.estimated_calls)
+                format!(
+                    "{} call(s) priced from the model configuration's rates, not by the CLI",
+                    s.estimated_calls
+                )
             } else {
                 "as the CLI priced it".to_string()
             };
@@ -651,7 +667,11 @@ fn markdown(board: &Leaderboard, filter: &Filter) -> String {
     out.push_str(&format!(
         "Scope: {} · {}\n\n",
         filter.repo.as_deref().unwrap_or("all repositories"),
-        if filter.blinded_only { "blinded decisions only" } else { "all decisions" }
+        if filter.blinded_only {
+            "blinded decisions only"
+        } else {
+            "all decisions"
+        }
     ));
     out.push_str(&format!(
         "{} contests ({} with 2+ models). You took a model's text {} time(s), wrote your own \

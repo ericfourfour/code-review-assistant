@@ -100,7 +100,9 @@ pub fn scan_local(root: &Path, max_depth: usize, mut emit: impl FnMut(Discovered
         if depth >= max_depth {
             continue;
         }
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let Ok(ft) = entry.file_type() else { continue };
             // Symlinks (and junctions, which read_dir also reports as
@@ -110,8 +112,8 @@ pub fn scan_local(root: &Path, max_depth: usize, mut emit: impl FnMut(Discovered
                 continue;
             }
             let name = entry.file_name().to_string_lossy().to_string();
-            let skip = name.starts_with('.')
-                || SKIP_DIRS.iter().any(|s| s.eq_ignore_ascii_case(&name));
+            let skip =
+                name.starts_with('.') || SKIP_DIRS.iter().any(|s| s.eq_ignore_ascii_case(&name));
             // A skip-listed or hidden name still gets in when it is itself a
             // clone (dotfiles repos live in dot-directories), it just is not
             // scanned for more.
@@ -130,7 +132,10 @@ fn from_local(dir: &Path) -> DiscoveredRepo {
     // worktree-style `.git` *file* has only its own mtime to offer.
     let mut last = 0i64;
     let probes: Vec<std::path::PathBuf> = if git.is_dir() {
-        ["HEAD", "index", "FETCH_HEAD"].iter().map(|p| git.join(p)).collect()
+        ["HEAD", "index", "FETCH_HEAD"]
+            .iter()
+            .map(|p| git.join(p))
+            .collect()
     } else {
         vec![git.clone()]
     };
@@ -144,7 +149,10 @@ fn from_local(dir: &Path) -> DiscoveredRepo {
         }
     }
     DiscoveredRepo {
-        name: dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+        name: dir
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default(),
         path: Some(dir.to_string_lossy().to_string()),
         slug: origin_slug(dir),
         last_update: last,
@@ -162,7 +170,7 @@ fn origin_slug(dir: &Path) -> Option<String> {
         if line.starts_with('[') {
             in_origin = line.replace(' ', "") == "[remote\"origin\"]";
         } else if in_origin && line.starts_with("url") {
-            return slug_from_url(line.splitn(2, '=').nth(1)?.trim());
+            return slug_from_url(line.split_once('=')?.1.trim());
         }
     }
     None
@@ -186,7 +194,14 @@ pub fn list_github(gh: &str, limit: usize) -> Result<Vec<DiscoveredRepo>, String
     let out = gitio::run(
         &home.to_string_lossy(),
         gh,
-        &["repo", "list", "--limit", &limit.to_string(), "--json", "nameWithOwner,updatedAt"],
+        &[
+            "repo",
+            "list",
+            "--limit",
+            &limit.to_string(),
+            "--json",
+            "nameWithOwner,updatedAt",
+        ],
     )?;
     #[derive(Deserialize)]
     struct Row {
@@ -199,12 +214,21 @@ pub fn list_github(gh: &str, limit: usize) -> Result<Vec<DiscoveredRepo>, String
     Ok(rows
         .into_iter()
         .map(|r| {
-            let name =
-                r.name_with_owner.rsplit('/').next().unwrap_or(&r.name_with_owner).to_string();
+            let name = r
+                .name_with_owner
+                .rsplit('/')
+                .next()
+                .unwrap_or(&r.name_with_owner)
+                .to_string();
             let last_update = chrono::DateTime::parse_from_rfc3339(&r.updated_at)
                 .map(|t| t.timestamp())
                 .unwrap_or(0);
-            DiscoveredRepo { name, path: None, slug: Some(r.name_with_owner), last_update }
+            DiscoveredRepo {
+                name,
+                path: None,
+                slug: Some(r.name_with_owner),
+                last_update,
+            }
         })
         .collect())
 }
@@ -220,11 +244,16 @@ pub struct RepoCache {
 }
 
 pub fn load_cache(db: &Db) -> RepoCache {
-    db.get_setting(CACHE_KEY).and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default()
+    db.get_setting(CACHE_KEY)
+        .and_then(|v| serde_json::from_str(&v).ok())
+        .unwrap_or_default()
 }
 
 pub fn save_cache(db: &Db, repos: &[DiscoveredRepo], fetched_at: i64) {
-    if let Ok(json) = serde_json::to_string(&RepoCache { fetched_at, repos: repos.to_vec() }) {
+    if let Ok(json) = serde_json::to_string(&RepoCache {
+        fetched_at,
+        repos: repos.to_vec(),
+    }) {
         db.set_setting(CACHE_KEY, &json);
     }
 }
@@ -337,7 +366,10 @@ mod tests {
             "[core]\n\tbare = false\n[remote \"origin\"]\n\turl = git@github.com:eric/repo.git\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n",
         )
         .unwrap();
-        assert_eq!(origin_slug(&dir.path().join("repo")).as_deref(), Some("eric/repo"));
+        assert_eq!(
+            origin_slug(&dir.path().join("repo")).as_deref(),
+            Some("eric/repo")
+        );
     }
 
     #[test]

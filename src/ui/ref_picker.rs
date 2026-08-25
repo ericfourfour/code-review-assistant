@@ -120,8 +120,11 @@ scored against. Nothing is written to disk.",
             {
                 action = Some(RefAction::Recheck);
             }
-            let open_notes =
-                self.repo.as_ref().map(|r| self.db.count_open_notes(&r.path)).unwrap_or(0);
+            let open_notes = self
+                .repo
+                .as_ref()
+                .map(|r| self.db.count_open_notes(&r.path))
+                .unwrap_or(0);
             if ui
                 .button(format!("Follow-up notes ({open_notes}) [N]"))
                 .on_hover_text(

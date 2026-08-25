@@ -75,7 +75,13 @@ pub fn diff_excerpt(diff: &str) -> String {
     )
 }
 
-pub fn build_prompt(ref_name: &str, base: &str, n_files: usize, n_units: usize, diff: &str) -> String {
+pub fn build_prompt(
+    ref_name: &str,
+    base: &str,
+    n_files: usize,
+    n_units: usize,
+    diff: &str,
+) -> String {
     format!(
         "A unit-by-unit review of branch {ref_name} (against {base}) just finished: {n_units} \
 unit(s) across {n_files} file(s), each judged in isolation. Your job now is what that review \
@@ -145,7 +151,13 @@ pub fn spawn_whole_branch_review(
             }
             Err(e) => (Err(e), 0),
         };
-        send(WholeBranchReviewMsg { seq, model_index, model: model_config.name.clone(), result, latency_ms });
+        send(WholeBranchReviewMsg {
+            seq,
+            model_index,
+            model: model_config.name.clone(),
+            result,
+            latency_ms,
+        });
         ctx.request_repaint();
     });
 }
@@ -171,7 +183,11 @@ mod tests {
         let big = "x".repeat(DIFF_BUDGET + 500);
         let cut = diff_excerpt(&big);
         assert!(cut.len() < big.len());
-        assert!(cut.contains("diff truncated here — 500 more characters"), "{}", &cut[DIFF_BUDGET..]);
+        assert!(
+            cut.contains("diff truncated here — 500 more characters"),
+            "{}",
+            &cut[DIFF_BUDGET..]
+        );
         let small = "just a diff";
         assert_eq!(diff_excerpt(small), small);
     }
@@ -200,7 +216,10 @@ mod tests {
 
     #[test]
     fn severity_ranks_order_and_tolerate_nonsense() {
-        let sev = |s: &str| Finding { severity: s.into(), ..blank() };
+        let sev = |s: &str| Finding {
+            severity: s.into(),
+            ..blank()
+        };
         assert!(sev("high").severity_rank() < sev("medium").severity_rank());
         assert!(sev("medium").severity_rank() < sev("low").severity_rank());
         assert!(sev("low").severity_rank() < sev("catastrophic?!").severity_rank());

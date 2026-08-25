@@ -282,7 +282,14 @@ diff --git a/src/main.rs b/src/main.rs
     fn comments_inside_a_code_region_are_absorbed_and_standalone_ones_kept() {
         let dir = repo_with_file();
         let files = crate::diffparse::parse(DIFF);
-        let out = assemble(&dir.path().to_string_lossy(), &files, 12, true, true, crate::gitio::NewSide::WorkTree);
+        let out = assemble(
+            &dir.path().to_string_lossy(),
+            &files,
+            12,
+            true,
+            true,
+            crate::gitio::NewSide::WorkTree,
+        );
         assert_eq!(out.len(), 1);
         let units = &out[0].1;
         // The comment inside the changed code is the code unit's to judge; the
@@ -300,10 +307,28 @@ diff --git a/src/main.rs b/src/main.rs
     fn toggles_select_which_units_exist() {
         let dir = repo_with_file();
         let files = crate::diffparse::parse(DIFF);
-        let comments_only = assemble(&dir.path().to_string_lossy(), &files, 12, true, false, crate::gitio::NewSide::WorkTree);
+        let comments_only = assemble(
+            &dir.path().to_string_lossy(),
+            &files,
+            12,
+            true,
+            false,
+            crate::gitio::NewSide::WorkTree,
+        );
         assert!(comments_only[0].1.iter().all(|u| !u.is_code()));
-        assert_eq!(comments_only[0].1.len(), 2, "both comment runs, nothing absorbs them");
-        let code_only = assemble(&dir.path().to_string_lossy(), &files, 12, false, true, crate::gitio::NewSide::WorkTree);
+        assert_eq!(
+            comments_only[0].1.len(),
+            2,
+            "both comment runs, nothing absorbs them"
+        );
+        let code_only = assemble(
+            &dir.path().to_string_lossy(),
+            &files,
+            12,
+            false,
+            true,
+            crate::gitio::NewSide::WorkTree,
+        );
         assert!(code_only[0].1.iter().all(|u| u.is_code()));
         assert_eq!(code_only[0].1.len(), 1);
     }
@@ -312,7 +337,14 @@ diff --git a/src/main.rs b/src/main.rs
     fn units_already_decided_leave_the_plan_and_take_emptied_files_with_them() {
         let dir = repo_with_file();
         let files = crate::diffparse::parse(DIFF);
-        let mut extracted = assemble(&dir.path().to_string_lossy(), &files, 12, true, true, crate::gitio::NewSide::WorkTree);
+        let mut extracted = assemble(
+            &dir.path().to_string_lossy(),
+            &files,
+            12,
+            true,
+            true,
+            crate::gitio::NewSide::WorkTree,
+        );
         assert_eq!(extracted[0].1.len(), 2);
 
         // Nothing decided yet: the plan is untouched and the review is free.
@@ -338,7 +370,14 @@ diff --git a/src/main.rs b/src/main.rs
     fn a_unit_is_recognised_by_its_text_not_its_line_number() {
         let dir = repo_with_file();
         let files = crate::diffparse::parse(DIFF);
-        let extracted = assemble(&dir.path().to_string_lossy(), &files, 12, true, true, crate::gitio::NewSide::WorkTree);
+        let extracted = assemble(
+            &dir.path().to_string_lossy(),
+            &files,
+            12,
+            true,
+            true,
+            crate::gitio::NewSide::WorkTree,
+        );
         let mut moved = extracted.clone_for_test();
         // An edit above pushes the unit down the file. Same unit, same verdict.
         if let ReviewUnit::Comment(c) = &mut moved[0].1[1] {
@@ -351,7 +390,10 @@ diff --git a/src/main.rs b/src/main.rs
         if let ReviewUnit::Comment(c) = &mut edited[0].1[1] {
             c.raw_lines = vec!["// something else entirely".into()];
         }
-        assert_ne!(decided_key(&extracted[0].1[1]), decided_key(&edited[0].1[1]));
+        assert_ne!(
+            decided_key(&extracted[0].1[1]),
+            decided_key(&edited[0].1[1])
+        );
     }
 
     /// `Vec<(String, Vec<ReviewUnit>)>` is not `Clone` on its own here only
@@ -393,7 +435,14 @@ diff --git a/src/main.rs b/src/main.rs
     fn both_kinds_round_trip_through_json() {
         let dir = repo_with_file();
         let files = crate::diffparse::parse(DIFF);
-        let out = assemble(&dir.path().to_string_lossy(), &files, 12, true, true, crate::gitio::NewSide::WorkTree);
+        let out = assemble(
+            &dir.path().to_string_lossy(),
+            &files,
+            12,
+            true,
+            true,
+            crate::gitio::NewSide::WorkTree,
+        );
         for unit in &out[0].1 {
             let json = serde_json::to_string(unit).unwrap();
             let back: ReviewUnit = serde_json::from_str(&json).unwrap();
@@ -407,19 +456,36 @@ diff --git a/src/main.rs b/src/main.rs
     fn code_edits_round_trip_verbatim_and_comment_edits_reindent() {
         let dir = repo_with_file();
         let files = crate::diffparse::parse(DIFF);
-        let out = assemble(&dir.path().to_string_lossy(), &files, 12, true, true, crate::gitio::NewSide::WorkTree);
+        let out = assemble(
+            &dir.path().to_string_lossy(),
+            &files,
+            12,
+            true,
+            true,
+            crate::gitio::NewSide::WorkTree,
+        );
         let code = &out[0].1[0];
-        assert_eq!(code.display_text(), code.raw_lines().join("\n"), "code shows as-is");
+        assert_eq!(
+            code.display_text(),
+            code.raw_lines().join("\n"),
+            "code shows as-is"
+        );
         assert_eq!(
             code.editor_to_lines(&code.display_text()),
             code.raw_lines(),
             "untouched code saves back exactly"
         );
-        assert!(code.editor_to_lines("   \n").is_empty(), "blank editor deletes");
+        assert!(
+            code.editor_to_lines("   \n").is_empty(),
+            "blank editor deletes"
+        );
         assert_eq!(code.replacement_display("    x();\n"), "    x();");
 
         let comment = &out[0].1[1];
-        assert_eq!(comment.display_text(), "// A standalone note about configuration");
+        assert_eq!(
+            comment.display_text(),
+            "// A standalone note about configuration"
+        );
         assert_eq!(
             comment.editor_to_lines("// tightened"),
             vec!["// tightened".to_string()],

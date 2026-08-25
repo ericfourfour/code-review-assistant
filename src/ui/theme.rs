@@ -156,10 +156,16 @@ mod tests {
         let verdicts = [GOOD, WARN, BAD, ACCENT, ADDED, REMOVED];
         for (i, a) in MODEL_COLORS.iter().enumerate() {
             for b in &MODEL_COLORS[i + 1..] {
-                assert!(distance(*a, *b) > 40.0, "model colours {a:?} and {b:?} are too close");
+                assert!(
+                    distance(*a, *b) > 40.0,
+                    "model colours {a:?} and {b:?} are too close"
+                );
             }
             for v in &verdicts {
-                assert!(distance(*a, *v) > 50.0, "model colour {a:?} reads as verdict {v:?}");
+                assert!(
+                    distance(*a, *v) > 50.0,
+                    "model colour {a:?} reads as verdict {v:?}"
+                );
             }
             // Light enough to carry small text and a hairline stroke on the
             // panel behind it.

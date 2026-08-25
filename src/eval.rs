@@ -84,8 +84,8 @@ impl Corpus {
     }
 
     pub fn load(path: &std::path::Path) -> Result<Corpus, String> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| format!("read {}: {e}", path.display()))?;
+        let text =
+            std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
         serde_json::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))
     }
 
@@ -149,7 +149,9 @@ pub fn replay(
         for (_, model_config) in &model_configs {
             // A replay is one-shot per entry, so no session id is threaded
             // through; `{session}` would be meaningless without a follow-up.
-            let command = model_config.command.replace("{session}", &uuid::Uuid::new_v4().to_string());
+            let command = model_config
+                .command
+                .replace("{session}", &uuid::Uuid::new_v4().to_string());
             let (result, _raw) =
                 models::run_for_eval(model_config, &command, &prompt, &repo, &cli_home, timeout);
             let answer = match result {
@@ -193,7 +195,10 @@ pub struct Filter {
 
 impl Default for Filter {
     fn default() -> Self {
-        Filter { repo: None, blinded_only: true }
+        Filter {
+            repo: None,
+            blinded_only: true,
+        }
     }
 }
 
@@ -312,7 +317,9 @@ fn source_names(source: &str, model: &str) -> Option<bool> {
     if source == model {
         return Some(false);
     }
-    source.strip_prefix(model).and_then(|rest| (rest == "+human-edited").then_some(true))
+    source
+        .strip_prefix(model)
+        .and_then(|rest| (rest == "+human-edited").then_some(true))
 }
 
 /// The whole comparison, aggregated from the review history.
@@ -384,7 +391,11 @@ impl Leaderboard {
             let entry = contests.entry(*decision_id).or_default();
             decision_facts.insert(
                 *decision_id,
-                (row.blinded, row.human_source.clone(), row.human_action.clone()),
+                (
+                    row.blinded,
+                    row.human_source.clone(),
+                    row.human_action.clone(),
+                ),
             );
 
             if row.error.is_some() {
@@ -453,7 +464,10 @@ impl Leaderboard {
 
         Leaderboard {
             contests: contests.len(),
-            contested: contests.values().filter(|(models, _)| models.len() > 1).count(),
+            contested: contests
+                .values()
+                .filter(|(models, _)| models.len() > 1)
+                .count(),
             model_won,
             human_won,
             original_kept,
@@ -483,7 +497,10 @@ impl Leaderboard {
     /// has no rates. The difference between "cheap" and "unmeasured", which
     /// the page has to say out loud or the cost column lies by omission.
     pub fn unpriced_calls(&self) -> usize {
-        self.standings.iter().map(|s| s.calls.saturating_sub(s.priced_calls)).sum()
+        self.standings
+            .iter()
+            .map(|s| s.calls.saturating_sub(s.priced_calls))
+            .sum()
     }
 
     /// Everything that should temper a reading of the table, worst first.
@@ -555,13 +572,15 @@ fn pairs(contests: &BTreeMap<i64, (Vec<String>, Option<String>)>) -> Vec<HeadToH
         sorted.dedup();
         for (i, a) in sorted.iter().enumerate() {
             for b in &sorted[i + 1..] {
-                let h = map.entry((a.clone(), b.clone())).or_insert_with(|| HeadToHead {
-                    a: a.clone(),
-                    b: b.clone(),
-                    together: 0,
-                    a_wins: 0,
-                    b_wins: 0,
-                });
+                let h = map
+                    .entry((a.clone(), b.clone()))
+                    .or_insert_with(|| HeadToHead {
+                        a: a.clone(),
+                        b: b.clone(),
+                        together: 0,
+                        a_wins: 0,
+                        b_wins: 0,
+                    });
                 h.together += 1;
                 match winner.as_deref() {
                     Some(w) if w == a => h.a_wins += 1,
@@ -572,7 +591,12 @@ fn pairs(contests: &BTreeMap<i64, (Vec<String>, Option<String>)>) -> Vec<HeadToH
         }
     }
     let mut out: Vec<HeadToHead> = map.into_values().collect();
-    out.sort_by(|x, y| y.together.cmp(&x.together).then(x.a.cmp(&y.a)).then(x.b.cmp(&y.b)));
+    out.sort_by(|x, y| {
+        y.together
+            .cmp(&x.together)
+            .then(x.a.cmp(&y.a))
+            .then(x.b.cmp(&y.b))
+    });
     out
 }
 
@@ -686,7 +710,13 @@ impl Report {
             }
         }
 
-        Report { models, repeat_total, repeat_agreed, blinded, decisions }
+        Report {
+            models,
+            repeat_total,
+            repeat_agreed,
+            blinded,
+            decisions,
+        }
     }
 
     /// Build from a replay against a labelled corpus.
@@ -694,7 +724,9 @@ impl Report {
         let mut models: BTreeMap<String, ModelScore> = BTreeMap::new();
         let mut blinded = 0;
         for answer in &results.answers {
-            let Some(entry) = corpus.entries.get(answer.entry) else { continue };
+            let Some(entry) = corpus.entries.get(answer.entry) else {
+                continue;
+            };
             let score = models.entry(answer.model.clone()).or_default();
             score.judged += 1;
             if entry.blinded {
@@ -799,7 +831,9 @@ mod tests {
             end_line: line,
             raw_lines: vec!["    // a".into()],
             indent: "    ".into(),
-            style: CommentStyle::Line { prefix: "//".into() },
+            style: CommentStyle::Line {
+                prefix: "//".into(),
+            },
             context: String::new(),
             hunk_header: String::new(),
             has_added: true,
@@ -902,7 +936,11 @@ mod tests {
     }
 
     fn standing<'a>(board: &'a Leaderboard, model: &str) -> &'a Standing {
-        board.standings.iter().find(|s| s.model == model).expect("model should have a standing")
+        board
+            .standings
+            .iter()
+            .find(|s| s.model == model)
+            .expect("model should have a standing")
     }
 
     /// The core of the page: picking one model's text over another's is the
@@ -913,34 +951,52 @@ mod tests {
         let db = Db::open_at(&dir.path().join("cra.db")).expect("open test db");
         let session = db.new_session("C:/work/widgets", "branch", "feature", "main");
 
-        record(&db, session, &Contest {
-            line: 2,
-            answers: &answers(&[("a", Some("rewrite")), ("b", Some("rewrite"))]),
-            human_action: "rewrite",
-            winner: "a",
-            blinded: true,
-        });
-        record(&db, session, &Contest {
-            line: 6,
-            answers: &answers(&[("a", Some("rewrite")), ("b", Some("keep"))]),
-            human_action: "rewrite",
-            winner: "a+human-edited",
-            blinded: true,
-        });
-        record(&db, session, &Contest {
-            line: 9,
-            answers: &answers(&[("a", Some("delete")), ("b", Some("rewrite"))]),
-            human_action: "rewrite",
-            winner: "b",
-            blinded: true,
-        });
+        record(
+            &db,
+            session,
+            &Contest {
+                line: 2,
+                answers: &answers(&[("a", Some("rewrite")), ("b", Some("rewrite"))]),
+                human_action: "rewrite",
+                winner: "a",
+                blinded: true,
+            },
+        );
+        record(
+            &db,
+            session,
+            &Contest {
+                line: 6,
+                answers: &answers(&[("a", Some("rewrite")), ("b", Some("keep"))]),
+                human_action: "rewrite",
+                winner: "a+human-edited",
+                blinded: true,
+            },
+        );
+        record(
+            &db,
+            session,
+            &Contest {
+                line: 9,
+                answers: &answers(&[("a", Some("delete")), ("b", Some("rewrite"))]),
+                human_action: "rewrite",
+                winner: "b",
+                blinded: true,
+            },
+        );
 
         let board = Leaderboard::from_db(&db, &Filter::default());
         let a = standing(&board, "a");
         assert_eq!(a.offered, 3);
-        assert_eq!(a.wins, 2, "a reworded suggestion is still that model's text winning");
+        assert_eq!(
+            a.wins, 2,
+            "a reworded suggestion is still that model's text winning"
+        );
         assert_eq!(a.wins_edited, 1);
-        assert_eq!(a.agreed, 2, "delete against the human's rewrite is a disagreement");
+        assert_eq!(
+            a.agreed, 2,
+            "delete against the human's rewrite is a disagreement"
+        );
         assert!((a.win_pct() - 66.6).abs() < 1.0, "{}", a.win_pct());
 
         let b = standing(&board, "b");
@@ -970,13 +1026,17 @@ mod tests {
 
         // First pass: a says keep. Re-run: a says rewrite, which is what the
         // reviewer answered and took.
-        record(&db, session, &Contest {
-            line: 2,
-            answers: &answers(&[("a", Some("keep"))]),
-            human_action: "rewrite",
-            winner: "a",
-            blinded: true,
-        });
+        record(
+            &db,
+            session,
+            &Contest {
+                line: 2,
+                answers: &answers(&[("a", Some("keep"))]),
+                human_action: "rewrite",
+                winner: "a",
+                blinded: true,
+            },
+        );
         db.log_suggestion(&crate::db::SuggestionRecord {
             session_id: session,
             file: "src/lib.rs",
@@ -999,7 +1059,10 @@ mod tests {
         let a = standing(&board, "a");
         assert_eq!(a.offered, 1, "one decision, one vote");
         assert_eq!(a.wins, 1);
-        assert_eq!(a.agreed, 1, "the answer that stood at decision time is the one scored");
+        assert_eq!(
+            a.agreed, 1,
+            "the answer that stood at decision time is the one scored"
+        );
         assert_eq!(board.contests, 1);
     }
 
@@ -1011,28 +1074,45 @@ mod tests {
         let dir = crate::testkit::TempDir::new("board_blind");
         let db = Db::open_at(&dir.path().join("cra.db")).expect("open test db");
         let session = db.new_session("C:/work/widgets", "branch", "feature", "main");
-        record(&db, session, &Contest {
-            line: 2,
-            answers: &answers(&[("a", Some("rewrite"))]),
-            human_action: "rewrite",
-            winner: "a",
-            blinded: true,
-        });
-        record(&db, session, &Contest {
-            line: 6,
-            answers: &answers(&[("a", Some("rewrite"))]),
-            human_action: "rewrite",
-            winner: "a",
-            blinded: false,
-        });
+        record(
+            &db,
+            session,
+            &Contest {
+                line: 2,
+                answers: &answers(&[("a", Some("rewrite"))]),
+                human_action: "rewrite",
+                winner: "a",
+                blinded: true,
+            },
+        );
+        record(
+            &db,
+            session,
+            &Contest {
+                line: 6,
+                answers: &answers(&[("a", Some("rewrite"))]),
+                human_action: "rewrite",
+                winner: "a",
+                blinded: false,
+            },
+        );
 
         let blinded = Leaderboard::from_db(&db, &Filter::default());
         assert_eq!(blinded.contests, 1);
         assert_eq!(blinded.excluded_unblinded, 1);
         assert_eq!(standing(&blinded, "a").offered, 1);
-        assert!(blinded.caveats().iter().all(|c| !c.contains("names visible")));
+        assert!(blinded
+            .caveats()
+            .iter()
+            .all(|c| !c.contains("names visible")));
 
-        let all = Leaderboard::from_db(&db, &Filter { repo: None, blinded_only: false });
+        let all = Leaderboard::from_db(
+            &db,
+            &Filter {
+                repo: None,
+                blinded_only: false,
+            },
+        );
         assert_eq!(all.contests, 2);
         assert_eq!(all.excluded_unblinded, 0);
         assert!(
@@ -1050,13 +1130,17 @@ mod tests {
         let dir = crate::testkit::TempDir::new("board_err");
         let db = Db::open_at(&dir.path().join("cra.db")).expect("open test db");
         let session = db.new_session("C:/work/widgets", "branch", "feature", "main");
-        record(&db, session, &Contest {
-            line: 2,
-            answers: &answers(&[("a", Some("rewrite")), ("b", None)]),
-            human_action: "rewrite",
-            winner: "a",
-            blinded: true,
-        });
+        record(
+            &db,
+            session,
+            &Contest {
+                line: 2,
+                answers: &answers(&[("a", Some("rewrite")), ("b", None)]),
+                human_action: "rewrite",
+                winner: "a",
+                blinded: true,
+            },
+        );
 
         let board = Leaderboard::from_db(&db, &Filter::default());
         let b = standing(&board, "b");
@@ -1076,13 +1160,17 @@ mod tests {
         let dir = crate::testkit::TempDir::new("board_spend");
         let db = Db::open_at(&dir.path().join("cra.db")).expect("open test db");
         let session = db.new_session("C:/work/widgets", "branch", "feature", "main");
-        record(&db, session, &Contest {
-            line: 2,
-            answers: &[("a", Some("rewrite"), 500, Some(0.02))],
-            human_action: "rewrite",
-            winner: "a",
-            blinded: true,
-        });
+        record(
+            &db,
+            session,
+            &Contest {
+                line: 2,
+                answers: &[("a", Some("rewrite"), 500, Some(0.02))],
+                human_action: "rewrite",
+                winner: "a",
+                blinded: true,
+            },
+        );
         // A unit the reviewer skipped: the call happened, no decision followed.
         db.log_suggestion(&crate::db::SuggestionRecord {
             session_id: session,
@@ -1127,22 +1215,33 @@ mod tests {
         let dir = crate::testkit::TempDir::new("board_unpriced");
         let db = Db::open_at(&dir.path().join("cra.db")).expect("open test db");
         let session = db.new_session("C:/work/widgets", "branch", "feature", "main");
-        record(&db, session, &Contest {
-            line: 2,
-            answers: &answers(&[("quiet", Some("rewrite"))]),
-            human_action: "rewrite",
-            winner: "quiet",
-            blinded: true,
-        });
+        record(
+            &db,
+            session,
+            &Contest {
+                line: 2,
+                answers: &answers(&[("quiet", Some("rewrite"))]),
+                human_action: "rewrite",
+                winner: "quiet",
+                blinded: true,
+            },
+        );
 
         let board = Leaderboard::from_db(&db, &Filter::default());
         let s = standing(&board, "quiet");
         assert_eq!(s.priced_calls, 0);
         assert_eq!(s.cost_per_call(), None);
-        assert_eq!(s.cost_per_win(), None, "a win is not free just because nobody priced it");
+        assert_eq!(
+            s.cost_per_win(),
+            None,
+            "a win is not free just because nobody priced it"
+        );
         assert_eq!(board.unpriced_calls(), 1);
         assert!(
-            board.caveats().iter().any(|c| c.contains("unmeasured on cost")),
+            board
+                .caveats()
+                .iter()
+                .any(|c| c.contains("unmeasured on cost")),
             "{:?}",
             board.caveats()
         );
@@ -1156,24 +1255,35 @@ mod tests {
         let db = Db::open_at(&dir.path().join("cra.db")).expect("open test db");
         let widgets = db.new_session("C:/work/widgets", "branch", "feature", "main");
         let gadgets = db.new_session("C:/work/gadgets", "branch", "feature", "main");
-        record(&db, widgets, &Contest {
-            line: 2,
-            answers: &[("a", Some("rewrite"), 100, Some(0.01))],
-            human_action: "rewrite",
-            winner: "a",
-            blinded: true,
-        });
-        record(&db, gadgets, &Contest {
-            line: 2,
-            answers: &[("a", Some("rewrite"), 100, Some(0.05))],
-            human_action: "keep",
-            winner: "original",
-            blinded: true,
-        });
+        record(
+            &db,
+            widgets,
+            &Contest {
+                line: 2,
+                answers: &[("a", Some("rewrite"), 100, Some(0.01))],
+                human_action: "rewrite",
+                winner: "a",
+                blinded: true,
+            },
+        );
+        record(
+            &db,
+            gadgets,
+            &Contest {
+                line: 2,
+                answers: &[("a", Some("rewrite"), 100, Some(0.05))],
+                human_action: "keep",
+                winner: "original",
+                blinded: true,
+            },
+        );
 
         let scoped = Leaderboard::from_db(
             &db,
-            &Filter { repo: Some("C:/work/widgets".into()), blinded_only: true },
+            &Filter {
+                repo: Some("C:/work/widgets".into()),
+                blinded_only: true,
+            },
         );
         assert_eq!(scoped.contests, 1);
         assert_eq!(standing(&scoped, "a").wins, 1);
@@ -1182,7 +1292,10 @@ mod tests {
         let everything = Leaderboard::from_db(&db, &Filter::default());
         assert_eq!(everything.contests, 2);
         assert_eq!(everything.model_won, 1);
-        assert_eq!(everything.original_kept, 1, "keeping the original is nobody's win");
+        assert_eq!(
+            everything.original_kept, 1,
+            "keeping the original is nobody's win"
+        );
         assert!((everything.total_cost() - 0.06).abs() < 1e-9);
         assert_eq!(db.repos_with_history().len(), 2);
     }
@@ -1195,23 +1308,38 @@ mod tests {
         let dir = crate::testkit::TempDir::new("board_mix");
         let db = Db::open_at(&dir.path().join("cra.db")).expect("open test db");
         let session = db.new_session("C:/work/widgets", "branch", "feature", "main");
-        record(&db, session, &Contest {
-            line: 2,
-            answers: &answers(&[("a", Some("keep")), ("b", Some("rewrite")), ("c", Some("keep"))]),
-            human_action: "keep",
-            winner: "original",
-            blinded: true,
-        });
-        record(&db, session, &Contest {
-            line: 6,
-            answers: &answers(&[("a", Some("delete"))]),
-            human_action: "delete",
-            winner: "a",
-            blinded: true,
-        });
+        record(
+            &db,
+            session,
+            &Contest {
+                line: 2,
+                answers: &answers(&[
+                    ("a", Some("keep")),
+                    ("b", Some("rewrite")),
+                    ("c", Some("keep")),
+                ]),
+                human_action: "keep",
+                winner: "original",
+                blinded: true,
+            },
+        );
+        record(
+            &db,
+            session,
+            &Contest {
+                line: 6,
+                answers: &answers(&[("a", Some("delete"))]),
+                human_action: "delete",
+                winner: "a",
+                blinded: true,
+            },
+        );
 
         let board = Leaderboard::from_db(&db, &Filter::default());
-        assert_eq!(board.human_verdicts["keep"], 1, "three models looked at it; it is one verdict");
+        assert_eq!(
+            board.human_verdicts["keep"], 1,
+            "three models looked at it; it is one verdict"
+        );
         assert_eq!(board.human_verdicts["delete"], 1);
         assert_eq!(standing(&board, "a").verdicts["keep"], 1);
         assert_eq!(standing(&board, "a").verdicts["delete"], 1);
@@ -1223,20 +1351,31 @@ mod tests {
         let dir = crate::testkit::TempDir::new("board_thin");
         let db = Db::open_at(&dir.path().join("cra.db")).expect("open test db");
         let empty = Leaderboard::from_db(&db, &Filter::default());
-        assert_eq!(empty.caveats().len(), 1, "nothing to score yet is the only thing to say");
+        assert_eq!(
+            empty.caveats().len(),
+            1,
+            "nothing to score yet is the only thing to say"
+        );
         assert!(empty.caveats()[0].contains("No decisions to score yet"));
 
         let session = db.new_session("C:/work/widgets", "branch", "feature", "main");
-        record(&db, session, &Contest {
-            line: 2,
-            answers: &answers(&[("a", Some("rewrite")), ("b", Some("keep"))]),
-            human_action: "rewrite",
-            winner: "a",
-            blinded: true,
-        });
+        record(
+            &db,
+            session,
+            &Contest {
+                line: 2,
+                answers: &answers(&[("a", Some("rewrite")), ("b", Some("keep"))]),
+                human_action: "rewrite",
+                winner: "a",
+                blinded: true,
+            },
+        );
         let board = Leaderboard::from_db(&db, &Filter::default());
         let caveats = board.caveats();
-        assert!(caveats[0].contains("too few to separate models"), "{caveats:?}");
+        assert!(
+            caveats[0].contains("too few to separate models"),
+            "{caveats:?}"
+        );
         assert!(
             caveats.iter().any(|c| c.contains("no noise floor")),
             "with nothing judged twice there is no floor to compare against: {caveats:?}"
@@ -1280,19 +1419,28 @@ mod tests {
         let dir = crate::testkit::TempDir::new("corpus");
         let path = dir.path().join("corpus.json");
         let corpus = Corpus {
-            entries: vec![entry("rewrite", "    // better", true), entry("keep", "    // a", false)],
+            entries: vec![
+                entry("rewrite", "    // better", true),
+                entry("keep", "    // a", false),
+            ],
         };
         corpus.save(&path).unwrap();
 
         let loaded = Corpus::load(&path).unwrap();
         assert_eq!(loaded.entries.len(), 2);
         assert_eq!(loaded.entries[0].action, "rewrite");
-        assert!(!loaded.entries[0].unit.is_code(), "the kind must survive the round trip");
+        assert!(
+            !loaded.entries[0].unit.is_code(),
+            "the kind must survive the round trip"
+        );
         assert!(loaded.entries[0].blinded);
         assert!(!loaded.entries[1].blinded);
         // The unit has to survive intact, or a replay is not asking the same
         // question the human answered.
-        assert_eq!(loaded.entries[0].unit.raw_lines(), vec!["    // a".to_string()]);
+        assert_eq!(
+            loaded.entries[0].unit.raw_lines(),
+            vec!["    // a".to_string()]
+        );
     }
 
     #[test]
@@ -1350,8 +1498,15 @@ mod tests {
         assert_eq!(m1.judged, 3);
         assert_eq!(m1.errors, 0);
         assert_eq!(m1.action_agreed, 2);
-        assert!((m1.agreement_pct() - 66.6).abs() < 1.0, "{}", m1.agreement_pct());
-        assert_eq!(m1.accepted, 1, "the matching rewrite should count as accepted");
+        assert!(
+            (m1.agreement_pct() - 66.6).abs() < 1.0,
+            "{}",
+            m1.agreement_pct()
+        );
+        assert_eq!(
+            m1.accepted, 1,
+            "the matching rewrite should count as accepted"
+        );
         assert_eq!(m1.mean_latency_ms(), 200);
 
         let m2 = &report.models["m2"];
@@ -1426,11 +1581,16 @@ mod tests {
 
     #[test]
     fn the_report_says_what_it_does_not_know() {
-        let corpus = Corpus { entries: vec![entry("keep", "    // a", false)] };
+        let corpus = Corpus {
+            entries: vec![entry("keep", "    // a", false)],
+        };
         let results = ReplayResults { answers: vec![] };
         let text = Report::from_replay(&corpus, &results).render();
         assert!(text.contains("self-agreement: unknown"), "{text}");
-        assert!(text.contains("names\n visible") || text.contains("names"), "{text}");
+        assert!(
+            text.contains("names\n visible") || text.contains("names"),
+            "{text}"
+        );
         assert!(text.contains("not with any ground truth"), "{text}");
     }
 }

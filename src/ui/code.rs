@@ -64,8 +64,11 @@ pub fn rows(text: &str, base: Color32) -> Vec<Line> {
 /// Lay the rows out as one unwrapped galley, coloured for the language `path`
 /// implies.
 pub fn galley(ui: &Ui, path: &str, lines: &[Line]) -> Arc<Galley> {
-    let parsed: Vec<&str> =
-        lines.iter().filter(|l| l.syntax).map(|l| l.text.as_str()).collect();
+    let parsed: Vec<&str> = lines
+        .iter()
+        .filter(|l| l.syntax)
+        .map(|l| l.text.as_str())
+        .collect();
     let spans = crate::highlight::line_spans(path, &parsed);
     let font = TextStyle::Monospace.resolve(ui.style());
 
@@ -77,11 +80,20 @@ pub fn galley(ui: &Ui, path: &str, lines: &[Line]) -> Arc<Galley> {
             push(&mut job, "\n", &font, line.base, None);
         }
         if !line.gutter.is_empty() {
-            push(&mut job, &line.gutter, &font, line.gutter_color, line.background);
+            push(
+                &mut job,
+                &line.gutter,
+                &font,
+                line.gutter_color,
+                line.background,
+            );
         }
         let runs = if line.syntax {
             nth_parsed += 1;
-            spans.get(nth_parsed - 1).map(|r| r.as_slice()).unwrap_or(&[])
+            spans
+                .get(nth_parsed - 1)
+                .map(|r| r.as_slice())
+                .unwrap_or(&[])
         } else {
             &[]
         };
@@ -96,13 +108,31 @@ pub fn galley(ui: &Ui, path: &str, lines: &[Line]) -> Arc<Galley> {
                 continue; // a span that does not fit costs colour, not a panic
             }
             if start > cursor {
-                push(&mut job, &line.text[cursor..start], &font, line.base, line.background);
+                push(
+                    &mut job,
+                    &line.text[cursor..start],
+                    &font,
+                    line.base,
+                    line.background,
+                );
             }
-            push(&mut job, &line.text[start..end], &font, *color, line.background);
+            push(
+                &mut job,
+                &line.text[start..end],
+                &font,
+                *color,
+                line.background,
+            );
             cursor = end;
         }
         if cursor < line.text.len() {
-            push(&mut job, &line.text[cursor..], &font, line.base, line.background);
+            push(
+                &mut job,
+                &line.text[cursor..],
+                &font,
+                line.base,
+                line.background,
+            );
         }
     }
     ui.fonts(|f| f.layout_job(job))
@@ -147,8 +177,7 @@ pub fn show_block(ui: &mut Ui, path: &str, text: &str, base: Color32) {
 pub fn diff_rows(old: &str, new: &str) -> Vec<Line> {
     use crate::ui::theme;
 
-    let (a, b): (Vec<&str>, Vec<&str>) =
-        (old.split('\n').collect(), new.split('\n').collect());
+    let (a, b): (Vec<&str>, Vec<&str>) = (old.split('\n').collect(), new.split('\n').collect());
     diff_ops(&a, &b)
         .into_iter()
         .map(|(op, text)| match op {
@@ -255,11 +284,17 @@ mod tests {
     }
 
     /// The galley's text must equal the editor's text byte for byte, or the
-/// text cursor appears somewhere other than where it is drawn.
+    /// text cursor appears somewhere other than where it is drawn.
     #[test]
     fn a_block_lays_out_to_exactly_the_text_it_was_given() {
         let ctx = ctx();
-        for text in ["fn f() {\n    x();\n}", "trailing newline\n", "", "\n\n", "héllo — ok"] {
+        for text in [
+            "fn f() {\n    x();\n}",
+            "trailing newline\n",
+            "",
+            "\n\n",
+            "héllo — ok",
+        ] {
             let _ = ctx.run(Default::default(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     let g = galley(ui, "a.rs", &rows(text, Color32::WHITE));
@@ -276,7 +311,9 @@ mod tests {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let lines = vec![
                     Line::code("    let x = 1;", Color32::WHITE).gutter(">    1| ", Color32::GRAY),
-                    Line::code("    let y = 2;", Color32::WHITE).unparsed().gutter("-     | ", Color32::RED),
+                    Line::code("    let y = 2;", Color32::WHITE)
+                        .unparsed()
+                        .gutter("-     | ", Color32::RED),
                 ];
                 let g = galley(ui, "a.rs", &lines);
                 assert_eq!(g.text(), ">    1|     let x = 1;\n-     |     let y = 2;");
@@ -287,7 +324,10 @@ mod tests {
     /// Compact rendering of a diff for assertions: the gutter marker plus the
     /// line, so the shape of the diff is readable in the test itself.
     fn shape(lines: &[Line]) -> Vec<String> {
-        lines.iter().map(|l| format!("{}{}", l.gutter.trim_end(), l.text)).collect()
+        lines
+            .iter()
+            .map(|l| format!("{}{}", l.gutter.trim_end(), l.text))
+            .collect()
     }
 
     #[test]
@@ -297,7 +337,13 @@ mod tests {
         let rows = diff_rows(old, new);
         assert_eq!(
             shape(&rows),
-            vec!["fn f() {", "-    old();", "+    new();", "+    more();", "}"]
+            vec![
+                "fn f() {",
+                "-    old();",
+                "+    new();",
+                "+    more();",
+                "}"
+            ]
         );
         // Diff role lives in the background tint, leaving colour for syntax.
         assert_eq!(rows[1].background, Some(crate::ui::theme::DEL_BG));
@@ -330,7 +376,10 @@ mod tests {
     fn a_replaced_run_reads_as_old_lines_then_new_ones() {
         // Not the two interleaved, which is unreadable in a narrow card.
         let rows = diff_rows("keep\nx1\nx2\ntail", "keep\ny1\ny2\ntail");
-        assert_eq!(shape(&rows), vec!["keep", "-x1", "-x2", "+y1", "+y2", "tail"]);
+        assert_eq!(
+            shape(&rows),
+            vec!["keep", "-x1", "-x2", "+y1", "+y2", "tail"]
+        );
     }
 
     #[test]
@@ -343,7 +392,10 @@ mod tests {
         assert!(rows.iter().any(|r| r.gutter.starts_with('-')));
         assert!(rows.iter().any(|r| r.gutter.starts_with('+')));
         // The trailing empty line both texts end with is still shared.
-        assert_eq!(shape(rows.last().map(std::slice::from_ref).unwrap()), vec![""]);
+        assert_eq!(
+            shape(rows.last().map(std::slice::from_ref).unwrap()),
+            vec![""]
+        );
     }
 
     #[test]

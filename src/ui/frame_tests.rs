@@ -24,13 +24,22 @@ fn headless_app(tag: &str) -> (TempDir, CraApp) {
 
 fn input(width: f32, height: f32) -> RawInput {
     RawInput {
-        screen_rect: Some(Rect::from_min_size(Default::default(), Vec2::new(width, height))),
+        screen_rect: Some(Rect::from_min_size(
+            Default::default(),
+            Vec2::new(width, height),
+        )),
         ..Default::default()
     }
 }
 
 fn key_press(key: Key) -> Event {
-    Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE }
+    Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: Modifiers::NONE,
+    }
 }
 
 /// Lay out the persistent chrome plus the current screen, exactly as
@@ -80,14 +89,15 @@ fn the_chrome_lays_out_identically_on_every_repaint() {
     for width in [1100.0, 1280.0, 1480.0, 1920.0] {
         for status in ["", "committed 3f9a21b src/app.rs", &"x".repeat(4000)] {
             app.status = status.to_string();
-    // The first frame after a change stabilizes cached panel sizes; the
+            // The first frame after a change stabilizes cached panel sizes; the
             // frames after it are the ones a user actually watches.
             let _ = paint_signature(&mut app, &ctx, input(width, 900.0));
             let first = paint_signature(&mut app, &ctx, input(width, 900.0));
             for _ in 0..3 {
                 let next = paint_signature(&mut app, &ctx, input(width, 900.0));
                 assert_eq!(
-                    first, next,
+                    first,
+                    next,
                     "chrome shifted between repaints at {width}px with a {}-char status",
                     status.len()
                 );
@@ -156,7 +166,11 @@ fn ctrl_e_opens_the_evaluation_page_and_esc_returns_to_where_it_came_from() {
     let mut raw = input(1480.0, 900.0);
     raw.events = vec![key_press(Key::Escape)];
     let _ = ctx.run(raw, |ctx| app.global_hotkeys(ctx));
-    assert_eq!(app.screen as u8, Screen::Review as u8, "Esc must return to the review");
+    assert_eq!(
+        app.screen as u8,
+        Screen::Review as u8,
+        "Esc must return to the review"
+    );
 }
 
 /// The page has to lay out with a real history behind it, not just when empty:
@@ -165,9 +179,15 @@ fn ctrl_e_opens_the_evaluation_page_and_esc_returns_to_where_it_came_from() {
 #[test]
 fn the_evaluation_page_lays_out_with_real_history_and_stays_put() {
     let (_dir, mut app) = headless_app("eval_layout");
-    let session = app.db.new_session("C:/work/widgets", "branch", "feature", "main");
-    for (line, winner) in [(2, "claude"), (6, "codex"), (9, "claude+human-edited"), (12, "original")]
-    {
+    let session = app
+        .db
+        .new_session("C:/work/widgets", "branch", "feature", "main");
+    for (line, winner) in [
+        (2, "claude"),
+        (6, "codex"),
+        (9, "claude+human-edited"),
+        (12, "original"),
+    ] {
         for model in ["claude", "codex"] {
             app.db.log_suggestion(&crate::db::SuggestionRecord {
                 session_id: session,
@@ -214,9 +234,16 @@ fn the_evaluation_page_lays_out_with_real_history_and_stays_put() {
     crate::ui::theme::apply(&ctx);
 
     eval_frame(&mut app, &ctx, vec![]);
-    let board = app.eval.as_ref().expect("the page loads its aggregate on first frame");
+    let board = app
+        .eval
+        .as_ref()
+        .expect("the page loads its aggregate on first frame");
     assert_eq!(board.contests, 4);
-    assert_eq!(board.head_to_head.len(), 1, "two models met on every contest");
+    assert_eq!(
+        board.head_to_head.len(),
+        1,
+        "two models met on every contest"
+    );
 
     // Repaints must be identical: this screen redraws on every pointer move,
     // and a bar that re-measures itself each frame reads as a flicker.
@@ -226,10 +253,20 @@ fn the_evaluation_page_lays_out_with_real_history_and_stays_put() {
                 app.ui_eval(ctx, ui);
             });
         });
-        (out.shapes.len(), format!("{:?}", out.shapes.iter().map(|s| s.clip_rect).collect::<Vec<_>>()))
+        (
+            out.shapes.len(),
+            format!(
+                "{:?}",
+                out.shapes.iter().map(|s| s.clip_rect).collect::<Vec<_>>()
+            ),
+        )
     };
     let first = signature(&mut app);
-    assert_eq!(first, signature(&mut app), "the evaluation page shifted between repaints");
+    assert_eq!(
+        first,
+        signature(&mut app),
+        "the evaluation page shifted between repaints"
+    );
 }
 
 /// `B` toggles the blinded-only filter and the aggregate follows it. The
@@ -238,7 +275,9 @@ fn the_evaluation_page_lays_out_with_real_history_and_stays_put() {
 #[test]
 fn toggling_the_blinded_filter_rebuilds_the_aggregate() {
     let (_dir, mut app) = headless_app("eval_filter");
-    let session = app.db.new_session("C:/work/widgets", "branch", "feature", "main");
+    let session = app
+        .db
+        .new_session("C:/work/widgets", "branch", "feature", "main");
     for (line, blinded) in [(2u32, true), (6, false)] {
         app.db.log_suggestion(&crate::db::SuggestionRecord {
             session_id: session,
@@ -279,11 +318,19 @@ fn toggling_the_blinded_filter_rebuilds_the_aggregate() {
     crate::ui::theme::apply(&ctx);
 
     eval_frame(&mut app, &ctx, vec![]);
-    assert_eq!(app.eval.as_ref().unwrap().contests, 1, "blinded only, by default");
+    assert_eq!(
+        app.eval.as_ref().unwrap().contests,
+        1,
+        "blinded only, by default"
+    );
 
     eval_frame(&mut app, &ctx, vec![key_press(Key::B)]);
     assert!(!app.eval_filter.blinded_only);
-    assert_eq!(app.eval.as_ref().unwrap().contests, 2, "the board follows the filter");
+    assert_eq!(
+        app.eval.as_ref().unwrap().contests,
+        2,
+        "the board follows the filter"
+    );
 }
 
 /// Lay out the review screen itself, delivering `events` first.
@@ -325,14 +372,20 @@ fn the_review_screen_fills_its_window_and_never_overflows_it() {
     app.start_review(&ctx, 0);
 
     let long: String = (0..500).map(|i| format!("    step{i}();\n")).collect();
-    for (label, text) in [("a short unit", "// one line".to_string()), ("a 500-line unit", long)] {
+    for (label, text) in [
+        ("a short unit", "// one line".to_string()),
+        ("a 500-line unit", long),
+    ] {
         app.original_display = text.clone();
         app.editor = text;
         // The first frame after a change measures; the ones after it are what
         // a user actually sees.
         let _ = review_extent(&mut app, &ctx);
         let (used, offered) = review_extent(&mut app, &ctx);
-        assert!(used <= offered + 0.5, "{label} overflowed: used {used} of {offered}");
+        assert!(
+            used <= offered + 0.5,
+            "{label} overflowed: used {used} of {offered}"
+        );
         assert!(
             used > offered - 6.0,
             "{label} left {} px of the window empty",
@@ -374,7 +427,10 @@ fn review_app(tag: &str) -> (TempDir, CraApp) {
         .map(|(path, units)| {
             crate::review::ReviewFile::new(
                 path,
-                units.into_iter().map(crate::units::ReviewUnit::Comment).collect(),
+                units
+                    .into_iter()
+                    .map(crate::units::ReviewUnit::Comment)
+                    .collect(),
             )
         })
         .collect();
@@ -423,22 +479,34 @@ fn review_hotkeys_reach_their_handlers() {
     // P goes back to it.
     review_frame(&mut app, &ctx, vec![key_press(Key::P)]);
     assert_eq!(app.original_display, first, "P should step back");
-    assert!(app.chosen.is_none(), "re-entering a comment starts from a clean slate");
+    assert!(
+        app.chosen.is_none(),
+        "re-entering a comment starts from a clean slate"
+    );
 
     // F focuses the follow-up box...
     review_frame(&mut app, &ctx, vec![key_press(Key::F)]);
-    assert!(ctx.memory(|m| m.focused().is_some()), "F should put focus in the follow-up box");
+    assert!(
+        ctx.memory(|m| m.focused().is_some()),
+        "F should put focus in the follow-up box"
+    );
 
     // ...and once it has focus, letters are text, not commands. Without this
     // guard, typing "delete this line?" into the box would delete the comment,
     // skip to the next one, and keep the original along the way.
     review_frame(&mut app, &ctx, vec![key_press(Key::D)]);
-    assert!(app.chosen.is_none(), "D was treated as a hotkey while typing");
-    assert_eq!(app.original_display, first, "the review moved on while typing");
+    assert!(
+        app.chosen.is_none(),
+        "D was treated as a hotkey while typing"
+    );
+    assert_eq!(
+        app.original_display, first,
+        "the review moved on while typing"
+    );
 }
 
 /// X leaves the review for the summary before every unit is decided — the door
-    /// to the whole-branch review and the follow-up notes must not require finishing the
+/// to the whole-branch review and the follow-up notes must not require finishing the
 /// review — and the plan keeps its place for coming back.
 #[test]
 fn x_ends_the_session_early_and_keeps_the_plans_place() {
@@ -451,7 +519,10 @@ fn x_ends_the_session_early_and_keeps_the_plans_place() {
     assert_eq!(app.screen as u8, Screen::Summary as u8);
     let plan = app.plan.as_ref().expect("the plan survives an early exit");
     assert_eq!(plan.decided_total, 0);
-    assert!(plan.total_units() > 0, "units are still waiting to be resumed");
+    assert!(
+        plan.total_units() > 0,
+        "units are still waiting to be resumed"
+    );
 }
 
 /// A REVISE card previews the proposal as a diff, so the review screen has to
@@ -495,18 +566,27 @@ fn a_revise_candidate_lays_out_as_a_diff_inside_its_card() {
 
     let _ = review_extent(&mut app, &ctx);
     let (used, offered) = review_extent(&mut app, &ctx);
-    assert!(used <= offered + 0.5, "the diff preview overflowed: used {used} of {offered}");
+    assert!(
+        used <= offered + 0.5,
+        "the diff preview overflowed: used {used} of {offered}"
+    );
 
-        // And the diff itself says what would change, not just what would be applied.
+    // And the diff itself says what would change, not just what would be applied.
     let rows = crate::ui::code::diff_rows(
         &app.original_display,
         "    counter += 1;\n    log(counter, \"unit\");",
     );
-    let shape: Vec<String> =
-        rows.iter().map(|r| format!("{}{}", r.gutter.trim_end(), r.text)).collect();
+    let shape: Vec<String> = rows
+        .iter()
+        .map(|r| format!("{}{}", r.gutter.trim_end(), r.text))
+        .collect();
     assert_eq!(
         shape,
-        vec!["    counter += 1;", "-    log(counter);", "+    log(counter, \"unit\");"]
+        vec![
+            "    counter += 1;",
+            "-    log(counter);",
+            "+    log(counter, \"unit\");"
+        ]
     );
 }
 
@@ -521,8 +601,19 @@ fn the_followup_screen_lays_out_with_notes_and_a_transcript() {
     crate::ui::theme::apply(&ctx);
 
     let repo = app.repo.as_ref().expect("repo").path.clone();
-    for text in ["extract the retry loop", "the error type swallows its cause"] {
-        app.db.log_note(1, &repo, "src/lib.rs", 2, 3, "    // a comment\n    call();", text);
+    for text in [
+        "extract the retry loop",
+        "the error type swallows its cause",
+    ] {
+        app.db.log_note(
+            1,
+            &repo,
+            "src/lib.rs",
+            2,
+            3,
+            "    // a comment\n    call();",
+            text,
+        );
     }
     app.open_followup();
     assert_eq!(app.notes.len(), 2);
@@ -542,7 +633,10 @@ fn the_followup_screen_lays_out_with_notes_and_a_transcript() {
         let clips: Vec<_> = out.shapes.iter().map(|s| s.clip_rect).collect();
         frames.push((out.shapes.len(), format!("{clips:?}")));
     }
-    assert_eq!(frames[1], frames[2], "the follow-up screen shifted between repaints");
+    assert_eq!(
+        frames[1], frames[2],
+        "the follow-up screen shifted between repaints"
+    );
 }
 
 /// The picker's rows are layout jobs rather than formatted strings — the
