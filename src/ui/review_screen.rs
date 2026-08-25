@@ -9,8 +9,15 @@ use crate::review::{self, Choice};
 use crate::ui::theme;
 
 const NUM_KEYS: [Key; 9] = [
-    Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5,
-    Key::Num6, Key::Num7, Key::Num8, Key::Num9,
+    Key::Num1,
+    Key::Num2,
+    Key::Num3,
+    Key::Num4,
+    Key::Num5,
+    Key::Num6,
+    Key::Num7,
+    Key::Num8,
+    Key::Num9,
 ];
 
 impl CraApp {
@@ -66,9 +73,12 @@ impl CraApp {
         // ---- header ----
         ui.horizontal(|ui| {
             ui.label(
-                RichText::new(format!("{}:{}-{}", unit.file, unit.start_line, unit.end_line))
-                    .monospace()
-                    .strong(),
+                RichText::new(format!(
+                    "{}:{}-{}",
+                    unit.file, unit.start_line, unit.end_line
+                ))
+                .monospace()
+                .strong(),
             );
             theme::badge(ui, &unit.lang, theme::ACCENT);
             if let Some(p) = &self.plan {
@@ -135,16 +145,27 @@ impl CraApp {
                 // does not give the model away either.
                 let color = theme::model_color(if hidden { pos } else { i });
                 let frame = egui::Frame::group(ui.style())
-                    .fill(if is_chosen { theme::RAISED } else { theme::PANEL })
+                    .fill(if is_chosen {
+                        theme::RAISED
+                    } else {
+                        theme::PANEL
+                    })
                     .stroke(egui::Stroke::new(
                         if is_chosen { 2.0_f32 } else { 1.0_f32 },
-                        if is_chosen { color } else { egui::Color32::from_gray(50) },
+                        if is_chosen {
+                            color
+                        } else {
+                            egui::Color32::from_gray(50)
+                        },
                     ))
                     .inner_margin(egui::Margin::same(6.0));
                 frame.show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(
-                            RichText::new(format!("[{}]", pos + 1)).monospace().strong().color(color),
+                            RichText::new(format!("[{}]", pos + 1))
+                                .monospace()
+                                .strong()
+                                .color(color),
                         );
                         ui.label(RichText::new(&name).strong().color(color));
                         if !hidden {
@@ -155,7 +176,10 @@ impl CraApp {
                                 .filter(|v| !v.is_empty())
                             {
                                 ui.label(
-                                    RichText::new(variant).monospace().small().color(theme::TEXT_DIM),
+                                    RichText::new(variant)
+                                        .monospace()
+                                        .small()
+                                        .color(theme::TEXT_DIM),
                                 );
                             }
                             if let Some(Some(id)) = self.sessions.get(i) {
@@ -172,7 +196,9 @@ impl CraApp {
                                 ui.spinner();
                                 ui.label(theme::dim("thinking…"));
                             }
-                            Some(CandidateState::Failed(_)) => theme::badge(ui, "ERROR", theme::BAD),
+                            Some(CandidateState::Failed(_)) => {
+                                theme::badge(ui, "ERROR", theme::BAD)
+                            }
                             _ => {
                                 ui.label(theme::dim("disabled"));
                             }
@@ -213,7 +239,11 @@ impl CraApp {
                                 {
                                     ask_one = Some(i);
                                 }
-                                if ui.button("🗎").on_hover_text("show the prompt/transcript").clicked() {
+                                if ui
+                                    .button("🗎")
+                                    .on_hover_text("show the prompt/transcript")
+                                    .clicked()
+                                {
                                     show_prompt = Some(i);
                                 }
                             });
@@ -221,10 +251,17 @@ impl CraApp {
                         Some(CandidateState::Failed(e)) => {
                             ui.label(RichText::new(crate::app::truncate(e, 220)).color(theme::BAD));
                             ui.horizontal(|ui| {
-                                if ui.add_enabled(can_ask, egui::Button::new("↩ ask")).clicked() {
+                                if ui
+                                    .add_enabled(can_ask, egui::Button::new("↩ ask"))
+                                    .clicked()
+                                {
                                     ask_one = Some(i);
                                 }
-                                if ui.button("🗎").on_hover_text("show the prompt/transcript").clicked() {
+                                if ui
+                                    .button("🗎")
+                                    .on_hover_text("show the prompt/transcript")
+                                    .clicked()
+                                {
                                     show_prompt = Some(i);
                                 }
                             });
@@ -261,8 +298,8 @@ impl CraApp {
                 resp.request_focus();
                 self.focus_follow_up = false;
             }
-            let submitted = resp.lost_focus()
-                && ctx.input(|i| i.key_pressed(Key::Enter) && !i.modifiers.shift);
+            let submitted =
+                resp.lost_focus() && ctx.input(|i| i.key_pressed(Key::Enter) && !i.modifiers.shift);
             ask_all = send_all || submitted;
         });
         if let Some(i) = ask_one {
@@ -458,7 +495,9 @@ impl CraApp {
                                     ui.label(theme::dim("waiting…"));
                                 });
                             } else {
-                                ui.label(RichText::new(&t.reply).monospace().color(theme::TEXT_DIM));
+                                ui.label(
+                                    RichText::new(&t.reply).monospace().color(theme::TEXT_DIM),
+                                );
                             }
                             ui.add_space(8.0);
                         }

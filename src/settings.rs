@@ -280,12 +280,21 @@ const COMMAND_FIXUPS: &[(&str, &str)] = &[
     ("claude -p --session-id {session}", CLAUDE_CMD),
     ("claude -p --resume {session}", CLAUDE_RESUME),
     ("codex exec --skip-git-repo-check --json", CODEX_CMD),
-    ("codex exec --skip-git-repo-check --json resume {session} -", CODEX_RESUME),
+    (
+        "codex exec --skip-git-repo-check --json resume {session} -",
+        CODEX_RESUME,
+    ),
     ("agy -p {prompt} --output-format json", AGY_CMD),
-    ("agy -p {prompt} --output-format json --conversation {session}", AGY_RESUME),
+    (
+        "agy -p {prompt} --output-format json --conversation {session}",
+        AGY_RESUME,
+    ),
     // Shipped briefly with repo access but no home of its own, which left it
     // running under whatever rules the machine happened to have.
-    ("agy -p {prompt} --output-format json --mode plan --add-dir {repo}", AGY_CMD),
+    (
+        "agy -p {prompt} --output-format json --mode plan --add-dir {repo}",
+        AGY_CMD,
+    ),
     (
         "agy -p {prompt} --output-format json --mode plan --add-dir {repo} \
          --conversation {session}",
@@ -317,8 +326,9 @@ impl Settings {
             // resumed without repo access would answer from a different vantage
             // point than the turn it is continuing.
             for template in [&mut m.command, &mut m.resume_command] {
-                if let Some((_, fixed)) =
-                    COMMAND_FIXUPS.iter().find(|(broken, _)| template.trim() == *broken)
+                if let Some((_, fixed)) = COMMAND_FIXUPS
+                    .iter()
+                    .find(|(broken, _)| template.trim() == *broken)
                 {
                     *template = (*fixed).to_string();
                     changed = true;
@@ -336,8 +346,9 @@ impl Settings {
             // on the one pass that upgrades the row — after that an empty
             // model means the user chose the CLI default, and we leave it be.
             if fresh_fields {
-                if let Some((_, model, effort, effort_flag)) =
-                    STARTING_TIER.iter().find(|(cmd, ..)| m.command.trim() == *cmd)
+                if let Some((_, model, effort, effort_flag)) = STARTING_TIER
+                    .iter()
+                    .find(|(cmd, ..)| m.command.trim() == *cmd)
                 {
                     if m.model.trim().is_empty() {
                         m.model = (*model).to_string();
@@ -351,8 +362,9 @@ impl Settings {
             }
             // Fill in session wiring for a recognised command that predates it.
             if m.resume_command.trim().is_empty() {
-                if let Some((_, resume, key)) =
-                    SESSION_WIRING.iter().find(|(cmd, _, _)| m.command.trim() == *cmd)
+                if let Some((_, resume, key)) = SESSION_WIRING
+                    .iter()
+                    .find(|(cmd, _, _)| m.command.trim() == *cmd)
                 {
                     m.resume_command = (*resume).to_string();
                     m.session_key = (*key).to_string();
@@ -526,7 +538,11 @@ mod tests {
 
     #[test]
     fn a_timeout_the_user_chose_survives_the_upgrade() {
-        let mut s = Settings { model_timeout_secs: 45, schema_version: 1, ..Settings::default() };
+        let mut s = Settings {
+            model_timeout_secs: 45,
+            schema_version: 1,
+            ..Settings::default()
+        };
         s.migrate();
         assert_eq!(s.model_timeout_secs, 45);
     }
@@ -550,7 +566,10 @@ mod tests {
     #[test]
     fn shipped_defaults_are_not_themselves_broken() {
         let mut s = Settings::default();
-        assert!(!s.migrate(), "a default template matches a known-broken one");
+        assert!(
+            !s.migrate(),
+            "a default template matches a known-broken one"
+        );
     }
 }
 
@@ -560,10 +579,16 @@ mod session_tests {
 
     #[test]
     fn tier_fill_runs_once_and_then_respects_the_users_choice() {
-        let mut s = Settings { schema_version: 0, ..Settings::default() };
+        let mut s = Settings {
+            schema_version: 0,
+            ..Settings::default()
+        };
         s.models[0].model.clear();
         s.models[0].effort.clear();
-        assert!(s.migrate(), "the upgrade pass should fill the starting tier");
+        assert!(
+            s.migrate(),
+            "the upgrade pass should fill the starting tier"
+        );
         assert_eq!(s.models[0].model, CLAUDE_MODEL);
         assert_eq!(s.schema_version, SCHEMA_VERSION);
 
@@ -571,7 +596,10 @@ mod session_tests {
         s.models[0].model.clear();
         s.models[0].effort.clear();
         assert!(!s.migrate());
-        assert!(s.models[0].model.is_empty(), "migrate clobbered a deliberate choice");
+        assert!(
+            s.models[0].model.is_empty(),
+            "migrate clobbered a deliberate choice"
+        );
         assert!(s.models[0].effort.is_empty());
     }
 
@@ -592,7 +620,11 @@ mod session_tests {
     #[test]
     fn every_shipped_slot_can_resume() {
         for m in Settings::default().models {
-            assert!(!m.resume_command.is_empty(), "{} has no resume command", m.name);
+            assert!(
+                !m.resume_command.is_empty(),
+                "{} has no resume command",
+                m.name
+            );
             assert!(
                 m.resume_command.contains("{session}"),
                 "{} resume command must carry the session id",

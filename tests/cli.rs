@@ -33,7 +33,10 @@ fn help_lists_the_evaluation_commands() {
     let (ok, text) = run(&dir, &["--help"]);
     assert!(ok, "{text}");
     for expected in ["export-corpus", "replay", "report"] {
-        assert!(text.contains(expected), "help is missing {expected}: {text}");
+        assert!(
+            text.contains(expected),
+            "help is missing {expected}: {text}"
+        );
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -53,7 +56,10 @@ fn exporting_from_an_empty_history_says_so_rather_than_writing_junk() {
     let (ok, text) = run(&dir, &["export-corpus"]);
     assert!(ok, "{text}");
     assert!(text.contains("wrote 0 labelled comment"), "{text}");
-    assert!(text.contains("Nothing to export yet"), "the emptiness needs explaining: {text}");
+    assert!(
+        text.contains("Nothing to export yet"),
+        "the emptiness needs explaining: {text}"
+    );
 
     // It still writes a well-formed corpus, so a replay against it is a no-op
     // rather than a parse error.
@@ -73,7 +79,11 @@ fn reporting_an_empty_history_states_what_it_cannot_know() {
     assert!(text.contains("not with any ground truth"), "{text}");
 
     let written = std::fs::read_to_string(dir.join("report.txt")).expect("report written");
-    assert_eq!(written.trim(), text.trim(), "the file and stdout should agree");
+    assert_eq!(
+        written.trim(),
+        text.trim(),
+        "the file and stdout should agree"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -125,8 +135,16 @@ fn reporting_a_replay_scores_it_against_the_corpus() {
     std::fs::write(dir.join("corpus.json"), corpus).unwrap();
     std::fs::write(dir.join("replay.json"), replay).unwrap();
 
-    let (ok, text) =
-        run(&dir, &["report", "--corpus", "corpus.json", "--results", "replay.json"]);
+    let (ok, text) = run(
+        &dir,
+        &[
+            "report",
+            "--corpus",
+            "corpus.json",
+            "--results",
+            "replay.json",
+        ],
+    );
     assert!(ok, "{text}");
     assert!(text.contains("m1"), "{text}");
     // Agreed on one of two: the score must read 50%, not 100% or 0%.
@@ -139,9 +157,20 @@ fn a_malformed_corpus_is_rejected_with_the_file_named() {
     let dir = work_dir("malformed");
     std::fs::write(dir.join("corpus.json"), "{ not json").unwrap();
     std::fs::write(dir.join("replay.json"), r#"{"answers": []}"#).unwrap();
-    let (ok, text) =
-        run(&dir, &["report", "--corpus", "corpus.json", "--results", "replay.json"]);
+    let (ok, text) = run(
+        &dir,
+        &[
+            "report",
+            "--corpus",
+            "corpus.json",
+            "--results",
+            "replay.json",
+        ],
+    );
     assert!(!ok);
-    assert!(text.contains("corpus.json"), "the error should name the file: {text}");
+    assert!(
+        text.contains("corpus.json"),
+        "the error should name the file: {text}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

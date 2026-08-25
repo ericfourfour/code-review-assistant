@@ -22,8 +22,8 @@ pub struct TempDir {
 impl TempDir {
     pub fn new(tag: &str) -> TempDir {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir()
-            .join(format!("cra_test_{}_{}_{}", std::process::id(), tag, n));
+        let path =
+            std::env::temp_dir().join(format!("cra_test_{}_{}_{}", std::process::id(), tag, n));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).expect("create temp dir");
         // The model command template is whitespace-tokenized, so a fake CLI
@@ -80,7 +80,12 @@ impl FakeCli {
         let reply_file = base.join(format!("{name}.reply"));
         std::fs::write(&reply_file, spec.reply).expect("write reply");
 
-        let logs = Logs { argv: &argv_log, stdin: &stdin_log, cwd: &cwd_log, reply: &reply_file };
+        let logs = Logs {
+            argv: &argv_log,
+            stdin: &stdin_log,
+            cwd: &cwd_log,
+            reply: &reply_file,
+        };
         let (program, script) = Self::script(name, base, &logs, &spec);
         std::fs::write(&program, script).expect("write fake cli");
         #[cfg(unix)]
@@ -89,12 +94,18 @@ impl FakeCli {
             std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
                 .expect("chmod fake cli");
         }
-        FakeCli { program, argv_log, stdin_log, cwd_log }
+        FakeCli {
+            program,
+            argv_log,
+            stdin_log,
+            cwd_log,
+        }
     }
 
     #[cfg(windows)]
     fn script(name: &str, base: &Path, logs: &Logs, spec: &FakeCliSpec) -> (PathBuf, String) {
-        let (argv_log, stdin_log, cwd_log, reply_file) = (logs.argv, logs.stdin, logs.cwd, logs.reply);
+        let (argv_log, stdin_log, cwd_log, reply_file) =
+            (logs.argv, logs.stdin, logs.cwd, logs.reply);
         // `findstr "^"` matches every line, so it copies stdin through; with a
         // null stdin it simply produces an empty file.
         let delay = if spec.delay_secs > 0 {
@@ -121,7 +132,8 @@ impl FakeCli {
 
     #[cfg(not(windows))]
     fn script(name: &str, base: &Path, logs: &Logs, spec: &FakeCliSpec) -> (PathBuf, String) {
-        let (argv_log, stdin_log, cwd_log, reply_file) = (logs.argv, logs.stdin, logs.cwd, logs.reply);
+        let (argv_log, stdin_log, cwd_log, reply_file) =
+            (logs.argv, logs.stdin, logs.cwd, logs.reply);
         let delay = if spec.delay_secs > 0 {
             format!("sleep {}\n", spec.delay_secs)
         } else {
@@ -184,7 +196,10 @@ impl FakeCli {
     /// The directory the process ran in — which is what decides whether the
     /// repository the prompt talks about is reachable from inside it.
     pub fn cwd_seen(&self) -> String {
-        std::fs::read_to_string(&self.cwd_log).unwrap_or_default().trim().to_string()
+        std::fs::read_to_string(&self.cwd_log)
+            .unwrap_or_default()
+            .trim()
+            .to_string()
     }
 }
 

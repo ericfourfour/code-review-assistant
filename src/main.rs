@@ -62,7 +62,9 @@ fn main() -> eframe::Result<()> {
 /// Value of `--name`, if present.
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     let at = args.iter().position(|a| a == name)?;
-    args.get(at + 1).map(|s| s.as_str()).filter(|v| !v.starts_with("--"))
+    args.get(at + 1)
+        .map(|s| s.as_str())
+        .filter(|v| !v.starts_with("--"))
 }
 
 fn path_flag(args: &[String], name: &str, default: &str) -> PathBuf {
@@ -96,11 +98,17 @@ fn execute(args: &[String]) -> Result<(), String> {
         }
         "export-corpus" => {
             let db = db::Db::open()?;
-            let limit: usize = flag(args, "--limit").and_then(|v| v.parse().ok()).unwrap_or(500);
+            let limit: usize = flag(args, "--limit")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(500);
             let corpus = eval::Corpus::from_db(&db, limit);
             let out = path_flag(args, "--out", "corpus.json");
             corpus.save(&out)?;
-            println!("wrote {} labelled comment(s) to {}", corpus.entries.len(), out.display());
+            println!(
+                "wrote {} labelled comment(s) to {}",
+                corpus.entries.len(),
+                out.display()
+            );
             if corpus.entries.is_empty() {
                 println!(
                     "Nothing to export yet: a comment enters the corpus only once you have\n\
@@ -120,7 +128,10 @@ fn execute(args: &[String]) -> Result<(), String> {
             if enabled == 0 {
                 return Err("no models are enabled in settings".into());
             }
-            println!("replaying {} comment(s) against {enabled} model(s)...", corpus.entries.len());
+            println!(
+                "replaying {} comment(s) against {enabled} model(s)...",
+                corpus.entries.len()
+            );
             let results = eval::replay(&settings, &corpus, |done, total, model| {
                 println!("  [{done}/{total}] {model}");
             });
@@ -128,7 +139,11 @@ fn execute(args: &[String]) -> Result<(), String> {
             let text = serde_json::to_string_pretty(&results)
                 .map_err(|e| format!("serialize results: {e}"))?;
             std::fs::write(&out, text).map_err(|e| format!("write {}: {e}", out.display()))?;
-            println!("wrote {} answer(s) to {}", results.answers.len(), out.display());
+            println!(
+                "wrote {} answer(s) to {}",
+                results.answers.len(),
+                out.display()
+            );
             Ok(())
         }
         "report" => {
@@ -166,7 +181,10 @@ mod cli_tests {
         assert_eq!(flag(&args, "--corpus"), Some("c.json"));
         assert_eq!(flag(&args, "--out"), Some("r.json"));
         assert_eq!(flag(&args, "--missing"), None);
-        assert_eq!(path_flag(&args, "--nope", "default.json"), PathBuf::from("default.json"));
+        assert_eq!(
+            path_flag(&args, "--nope", "default.json"),
+            PathBuf::from("default.json")
+        );
     }
 
     #[test]
@@ -183,16 +201,23 @@ mod cli_tests {
     fn unknown_commands_explain_themselves() {
         let err = execute(&argv(&["frobnicate"])).unwrap_err();
         assert!(err.contains("unknown command"), "{err}");
-        assert!(err.contains("export-corpus"), "the error should show usage: {err}");
+        assert!(
+            err.contains("export-corpus"),
+            "the error should show usage: {err}"
+        );
     }
 
     #[test]
     fn replay_without_a_corpus_says_so() {
-        assert!(execute(&argv(&["replay"])).unwrap_err().contains("--corpus"));
+        assert!(execute(&argv(&["replay"]))
+            .unwrap_err()
+            .contains("--corpus"));
     }
 
     #[test]
     fn report_needs_both_halves_or_neither() {
-        assert!(execute(&argv(&["report", "--corpus", "c.json"])).unwrap_err().contains("both"));
+        assert!(execute(&argv(&["report", "--corpus", "c.json"]))
+            .unwrap_err()
+            .contains("both"));
     }
 }

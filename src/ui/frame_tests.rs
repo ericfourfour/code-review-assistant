@@ -24,13 +24,22 @@ fn headless_app(tag: &str) -> (TempDir, CraApp) {
 
 fn input(width: f32, height: f32) -> RawInput {
     RawInput {
-        screen_rect: Some(Rect::from_min_size(Default::default(), Vec2::new(width, height))),
+        screen_rect: Some(Rect::from_min_size(
+            Default::default(),
+            Vec2::new(width, height),
+        )),
         ..Default::default()
     }
 }
 
 fn key_press(key: Key) -> Event {
-    Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE }
+    Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: Modifiers::NONE,
+    }
 }
 
 /// Lay out the persistent chrome plus the current screen, exactly as
@@ -87,7 +96,8 @@ fn the_chrome_lays_out_identically_on_every_repaint() {
             for _ in 0..3 {
                 let next = paint_signature(&mut app, &ctx, input(width, 900.0));
                 assert_eq!(
-                    first, next,
+                    first,
+                    next,
                     "chrome shifted between repaints at {width}px with a {}-char status",
                     status.len()
                 );
@@ -206,16 +216,28 @@ fn review_hotkeys_reach_their_handlers() {
     // P goes back to it.
     review_frame(&mut app, &ctx, vec![key_press(Key::P)]);
     assert_eq!(app.original_display, first, "P should step back");
-    assert!(app.chosen.is_none(), "re-entering a comment starts from a clean slate");
+    assert!(
+        app.chosen.is_none(),
+        "re-entering a comment starts from a clean slate"
+    );
 
     // F focuses the follow-up box...
     review_frame(&mut app, &ctx, vec![key_press(Key::F)]);
-    assert!(ctx.memory(|m| m.focused().is_some()), "F should put focus in the follow-up box");
+    assert!(
+        ctx.memory(|m| m.focused().is_some()),
+        "F should put focus in the follow-up box"
+    );
 
     // ...and once it has focus, letters are text, not commands. Without this
     // guard, typing "delete this line?" into the box would delete the comment,
     // skip to the next one, and keep the original along the way.
     review_frame(&mut app, &ctx, vec![key_press(Key::D)]);
-    assert!(app.chosen.is_none(), "D was treated as a hotkey while typing");
-    assert_eq!(app.original_display, first, "the review moved on while typing");
+    assert!(
+        app.chosen.is_none(),
+        "D was treated as a hotkey while typing"
+    );
+    assert_eq!(
+        app.original_display, first,
+        "the review moved on while typing"
+    );
 }

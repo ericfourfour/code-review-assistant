@@ -118,9 +118,13 @@ impl ReviewPlan {
 /// comments, not cryptographic.
 pub fn blind_order(seed: u64, n: usize) -> Vec<usize> {
     let mut order: Vec<usize> = (0..n).collect();
-    let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    let mut state = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     for i in (1..n).rev() {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let j = (state >> 33) as usize % (i + 1);
         order.swap(i, j);
     }
@@ -152,7 +156,11 @@ pub enum Choice {
 #[derive(Clone)]
 pub enum Provenance {
     Unchanged,
-    Model { name: String, coauthor: String, edited: bool },
+    Model {
+        name: String,
+        coauthor: String,
+        edited: bool,
+    },
     Human,
 }
 
@@ -160,8 +168,14 @@ impl Provenance {
     pub fn source_str(&self) -> String {
         match self {
             Provenance::Unchanged => "original".into(),
-            Provenance::Model { name, edited: false, .. } => name.clone(),
-            Provenance::Model { name, edited: true, .. } => format!("{name}+human-edited"),
+            Provenance::Model {
+                name,
+                edited: false,
+                ..
+            } => name.clone(),
+            Provenance::Model {
+                name, edited: true, ..
+            } => format!("{name}+human-edited"),
             Provenance::Human => "human-authored".into(),
         }
     }
@@ -181,7 +195,11 @@ pub fn derive_provenance(
     match (chosen, chosen_model) {
         (Some(Choice::Candidate(_)), Some((name, coauthor))) => {
             let edited = candidate_baseline.map(|b| b != editor_text).unwrap_or(true);
-            Provenance::Model { name: name.to_string(), coauthor: coauthor.to_string(), edited }
+            Provenance::Model {
+                name: name.to_string(),
+                coauthor: coauthor.to_string(),
+                edited,
+            }
         }
         _ => Provenance::Human,
     }
@@ -207,7 +225,8 @@ pub fn apply_edit(
     new_lines: &[String],
 ) -> Result<i64, String> {
     let path = Path::new(repo).join(&unit.file);
-    let content = std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let content =
+        std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let had_trailing_newline = content.ends_with('\n');
     let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
 
@@ -225,7 +244,10 @@ pub fn apply_edit(
     // Sanity check: the file should still contain what we think it does.
     let on_disk: Vec<&String> = lines[start..=end].iter().collect();
     let matches = on_disk.len() == unit.raw_lines.len()
-        && on_disk.iter().zip(&unit.raw_lines).all(|(a, b)| a.as_str() == b.as_str());
+        && on_disk
+            .iter()
+            .zip(&unit.raw_lines)
+            .all(|(a, b)| a.as_str() == b.as_str());
     if !matches {
         return Err(format!(
             "content mismatch at {}:{} — file changed on disk since the diff was taken",
@@ -268,7 +290,11 @@ fn action_verb(action: Action) -> &'static str {
     }
 }
 
-fn push_model_trailers(msg: &mut String, provenance: &Provenance, model_info: Option<(&str, &str)>) {
+fn push_model_trailers(
+    msg: &mut String,
+    provenance: &Provenance,
+    model_info: Option<(&str, &str)>,
+) {
     if let Provenance::Model { coauthor, .. } = provenance {
         if !coauthor.trim().is_empty() {
             msg.push_str(&format!("Co-authored-by: {coauthor}\n"));
@@ -289,7 +315,10 @@ fn push_model_trailers(msg: &mut String, provenance: &Provenance, model_info: Op
 /// last decision's message once `Commit and Continue` finally runs `git
 /// commit`. `entries` must be non-empty and share the same `file`.
 pub fn commit_message_batch(entries: &[PendingDecision]) -> String {
-    assert!(!entries.is_empty(), "commit_message_batch needs at least one decision");
+    assert!(
+        !entries.is_empty(),
+        "commit_message_batch needs at least one decision"
+    );
     if entries.len() == 1 {
         let e = &entries[0];
         let mut msg = format!(
@@ -304,13 +333,25 @@ pub fn commit_message_batch(entries: &[PendingDecision]) -> String {
             }
         }
         msg.push_str("Reviewed-with: code-review-assistant\n");
-        msg.push_str(&format!("Comment-provenance: {}\n", e.provenance.source_str()));
-        push_model_trailers(&mut msg, &e.provenance, e.model_info.as_ref().map(|(m, ef)| (m.as_str(), ef.as_str())));
+        msg.push_str(&format!(
+            "Comment-provenance: {}\n",
+            e.provenance.source_str()
+        ));
+        push_model_trailers(
+            &mut msg,
+            &e.provenance,
+            e.model_info
+                .as_ref()
+                .map(|(m, ef)| (m.as_str(), ef.as_str())),
+        );
         return msg;
     }
 
     let file = &entries[0].file;
-    let mut msg = format!("review(comments): {} comment decisions in {file}\n\n", entries.len());
+    let mut msg = format!(
+        "review(comments): {} comment decisions in {file}\n\n",
+        entries.len()
+    );
     for e in entries {
         msg.push_str(&format!("- {} {file}:{}", action_verb(e.action), e.line));
         let mut detail: Vec<String> = vec![e.provenance.source_str()];
@@ -373,7 +414,9 @@ mod tests {
             end_line: 3,
             raw_lines: vec!["    // a".into(), "    // b".into()],
             indent: "    ".into(),
-            style: CommentStyle::Line { prefix: "//".into() },
+            style: CommentStyle::Line {
+                prefix: "//".into(),
+            },
             context: String::new(),
             hunk_header: String::new(),
             has_added: true,
@@ -402,7 +445,11 @@ mod tests {
         let first_slots: std::collections::HashSet<usize> = (0..60)
             .map(|line| blind_order(unit_seed("src/lib.rs", line), 3)[0])
             .collect();
-        assert_eq!(first_slots.len(), 3, "every slot should lead sometimes: {first_slots:?}");
+        assert_eq!(
+            first_slots.len(),
+            3,
+            "every slot should lead sometimes: {first_slots:?}"
+        );
     }
 
     #[test]
@@ -511,7 +558,12 @@ mod tests {
     fn batch_documents_every_pending_decision() {
         let entries = vec![
             pending("src/lib.rs", 2, Action::Delete, "restates the code"),
-            pending("src/lib.rs", 9, Action::Rewrite, "clarifies the retry limit"),
+            pending(
+                "src/lib.rs",
+                9,
+                Action::Rewrite,
+                "clarifies the retry limit",
+            ),
         ];
         let msg = commit_message_batch(&entries);
         assert!(msg.starts_with("review(comments): 2 comment decisions in src/lib.rs"));
@@ -533,7 +585,12 @@ mod tests {
             "fn main() {\n    // a\n    // b\n    x();\n}\n",
         )
         .unwrap();
-        let file = ReviewFile { path: "src/lib.rs".into(), units: vec![], line_offset: 0, decided: 0 };
+        let file = ReviewFile {
+            path: "src/lib.rs".into(),
+            units: vec![],
+            line_offset: 0,
+            decided: 0,
+        };
         let delta = apply_edit(
             dir.to_str().unwrap(),
             &file,

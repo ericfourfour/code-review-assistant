@@ -127,7 +127,11 @@ fn build_argv(
     let mut used_placeholder = false;
     // No repository (a replay whose checkout has gone) leaves the CLI pointed
     // at wherever it was started, which is what it would default to anyway.
-    let repo = if repo.trim().is_empty() { "." } else { repo.trim() };
+    let repo = if repo.trim().is_empty() {
+        "."
+    } else {
+        repo.trim()
+    };
     for tok in template.split_whitespace() {
         if tok == "{prompt}" {
             argv.push(prompt.to_string());
@@ -148,7 +152,14 @@ fn build_argv(
         if value.trim().is_empty() {
             continue;
         }
-        argv.push(if flag.trim().is_empty() { fallback } else { flag.trim() }.to_string());
+        argv.push(
+            if flag.trim().is_empty() {
+                fallback
+            } else {
+                flag.trim()
+            }
+            .to_string(),
+        );
         argv.push(value.trim().to_string());
     }
     (argv, !used_placeholder)
@@ -195,7 +206,9 @@ pub fn extract_session_id(output: &str, key: &str) -> Option<String> {
     if key.is_empty() {
         return None;
     }
-    json_documents(output).iter().find_map(|v| find_string_key(v, key))
+    json_documents(output)
+        .iter()
+        .find_map(|v| find_string_key(v, key))
 }
 
 /// Pull the verdict out of whatever the CLI printed. Asking a CLI for
@@ -259,7 +272,9 @@ fn extract_json(output: &str) -> Option<RawSuggestion> {
 /// line that explains it buried inside.
 fn cli_error(name: &str, stdout: &str, stderr: &str) -> String {
     for out in [stdout, stderr] {
-        let reported = json_documents(out).iter().find_map(|v| find_string_key(v, "error"));
+        let reported = json_documents(out)
+            .iter()
+            .find_map(|v| find_string_key(v, "error"));
         if let Some(msg) = reported.filter(|m| !m.trim().is_empty()) {
             return refused_tool(name, &msg).unwrap_or(msg);
         }
@@ -277,7 +292,11 @@ fn refused_tool(name: &str, msg: &str) -> Option<String> {
     }
     // The command is quoted in the refusal; fall back to the whole message
     // rather than guessing if this CLI words it differently.
-    let wanted = msg.split('"').nth(1).map(str::trim).filter(|c| !c.is_empty());
+    let wanted = msg
+        .split('"')
+        .nth(1)
+        .map(str::trim)
+        .filter(|c| !c.is_empty());
     Some(match wanted {
         Some(cmd) => format!(
             "{name} refused a tool it wanted: `{cmd}`. Nothing ran, and retrying will not \
@@ -307,7 +326,15 @@ fn run_model(
     timeout: Duration,
 ) -> (Result<Suggestion, String>, String) {
     let mut raw_output = String::new();
-    let result = run_inner(slot, command, prompt, repo, cli_home, timeout, &mut raw_output);
+    let result = run_inner(
+        slot,
+        command,
+        prompt,
+        repo,
+        cli_home,
+        timeout,
+        &mut raw_output,
+    );
     (result, raw_output)
 }
 
@@ -328,13 +355,19 @@ fn run_inner(
     let started = Instant::now();
     let mut cmd = crate::gitio::hidden_command(&argv[0]);
     cmd.args(&argv[1..])
-        .stdin(if via_stdin { Stdio::piped() } else { Stdio::null() })
+        .stdin(if via_stdin {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if !repo.trim().is_empty() {
         cmd.current_dir(repo);
     }
-    let mut child = cmd.spawn().map_err(|e| format!("spawn `{}`: {e}", argv[0]))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("spawn `{}`: {e}", argv[0]))?;
     if via_stdin {
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(prompt.as_bytes());
@@ -438,9 +471,21 @@ pub fn spawn_model(
     ctx: egui::Context,
 ) {
     std::thread::spawn(move || {
-        let (result, raw) =
-            run_model(&slot, &command, &prompt, &repo, &cli_home, Duration::from_secs(timeout_secs.max(5)));
-        send(CandidateMsg { seq, slot_idx, model: slot.name.clone(), result, raw });
+        let (result, raw) = run_model(
+            &slot,
+            &command,
+            &prompt,
+            &repo,
+            &cli_home,
+            Duration::from_secs(timeout_secs.max(5)),
+        );
+        send(CandidateMsg {
+            seq,
+            slot_idx,
+            model: slot.name.clone(),
+            result,
+            raw,
+        });
         ctx.request_repaint();
     });
 }
@@ -493,28 +538,62 @@ mod tests {
 
     #[test]
     fn model_and_effort_trail_so_they_never_split_a_flag_from_its_value() {
-        let (argv, _) =
-            build_argv("claude -p", "hi", "", "", &slot("haiku", "--model", "low", "--effort"));
-        assert_eq!(argv, vec!["claude", "-p", "--model", "haiku", "--effort", "low"]);
+        let (argv, _) = build_argv(
+            "claude -p",
+            "hi",
+            "",
+            "",
+            &slot("haiku", "--model", "low", "--effort"),
+        );
+        assert_eq!(
+            argv,
+            vec!["claude", "-p", "--model", "haiku", "--effort", "low"]
+        );
         // `agy -p {prompt}` passes the prompt as -p's value, so the flags must
         // land after it — inserting ahead would make -p consume "--model".
-        let (argv, _) =
-            build_argv("agy -p {prompt}", "hi", "", "", &slot("gemini-3.7-flash-low", "--model", "", ""));
-        assert_eq!(argv, vec!["agy", "-p", "hi", "--model", "gemini-3.7-flash-low"]);
+        let (argv, _) = build_argv(
+            "agy -p {prompt}",
+            "hi",
+            "",
+            "",
+            &slot("gemini-3.7-flash-low", "--model", "", ""),
+        );
+        assert_eq!(
+            argv,
+            vec!["agy", "-p", "hi", "--model", "gemini-3.7-flash-low"]
+        );
         // codex routes effort through a config override rather than a flag
         let (argv, _) = build_argv(
             "codex exec",
             "hi",
             "",
             "",
-            &slot("gpt-5.6-luna", "--model", "model_reasoning_effort=low", "-c"),
+            &slot(
+                "gpt-5.6-luna",
+                "--model",
+                "model_reasoning_effort=low",
+                "-c",
+            ),
         );
         assert_eq!(
             argv,
-            vec!["codex", "exec", "--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=low"]
+            vec![
+                "codex",
+                "exec",
+                "--model",
+                "gpt-5.6-luna",
+                "-c",
+                "model_reasoning_effort=low"
+            ]
         );
         // empty values leave argv untouched
-        let (argv, _) = build_argv("claude -p", "hi", "", "", &slot("  ", "--model", " ", "--effort"));
+        let (argv, _) = build_argv(
+            "claude -p",
+            "hi",
+            "",
+            "",
+            &slot("  ", "--model", " ", "--effort"),
+        );
         assert_eq!(argv, vec!["claude", "-p"]);
     }
 
@@ -532,19 +611,31 @@ mod tests {
         // happen inside the token — and a space in the path must not split it.
         assert_eq!(
             argv,
-            vec!["agy", "--gemini_dir=C:/data/agy home", "-p", "hi", "--add-dir", "C:/code/app"]
+            vec![
+                "agy",
+                "--gemini_dir=C:/data/agy home",
+                "-p",
+                "hi",
+                "--add-dir",
+                "C:/code/app"
+            ]
         );
     }
 
     #[test]
     fn the_repo_token_names_the_directory_and_survives_spaces_in_it() {
         let bare = slot("", "--model", "", "--effort");
-        let (argv, _) = build_argv("agy -p {prompt} --add-dir {repo}", "hi", "C:/code/app", "", &bare);
+        let (argv, _) = build_argv(
+            "agy -p {prompt} --add-dir {repo}",
+            "hi",
+            "C:/code/app",
+            "",
+            &bare,
+        );
         assert_eq!(argv, vec!["agy", "-p", "hi", "--add-dir", "C:/code/app"]);
         // The template is tokenized on whitespace, so a path with a space in
         // it has to come back out as one argument rather than two.
-        let (argv, _) =
-            build_argv("agy --add-dir {repo}", "hi", "C:/my code/app", "", &bare);
+        let (argv, _) = build_argv("agy --add-dir {repo}", "hi", "C:/my code/app", "", &bare);
         assert_eq!(argv, vec!["agy", "--add-dir", "C:/my code/app"]);
         // A replay whose checkout is gone still has to produce a valid argv.
         let (argv, _) = build_argv("agy --add-dir {repo}", "hi", "", "", &bare);
@@ -556,10 +647,16 @@ mod tests {
         // codex --json emits an event stream
         let codex = "{\"type\":\"thread.started\",\"thread_id\":\"abc-123\"}\n\
 {\"type\":\"turn.started\"}";
-        assert_eq!(extract_session_id(codex, "thread_id"), Some("abc-123".into()));
+        assert_eq!(
+            extract_session_id(codex, "thread_id"),
+            Some("abc-123".into())
+        );
         // agy emits one object
         let agy = "{\"conversation_id\":\"xyz-789\",\"response\":\"hi\"}";
-        assert_eq!(extract_session_id(agy, "conversation_id"), Some("xyz-789".into()));
+        assert_eq!(
+            extract_session_id(agy, "conversation_id"),
+            Some("xyz-789".into())
+        );
         // a slot that names no key never reports one — the id is ours to pick
         assert_eq!(extract_session_id(agy, ""), None);
         assert_eq!(extract_session_id("plain text", "thread_id"), None);
@@ -607,7 +704,10 @@ deny rule.\"}";
         let refusal = "{\"conversation_id\":\"x\",\"status\":\"ERROR\",\"response\":\"\",\
 \"error\":\"permission check failed for command \\\"git log -1\\\": user denied permission\"}";
         let err = cli_error("agy", refusal, "");
-        assert!(err.contains("git log -1"), "the command it wanted must survive: {err}");
+        assert!(
+            err.contains("git log -1"),
+            "the command it wanted must survive: {err}"
+        );
         assert!(err.contains("agy"), "the slot must be named: {err}");
         assert!(!err.contains("no JSON verdict"), "{err}");
 
@@ -622,7 +722,11 @@ deny rule.\"}";
     #[test]
     fn a_long_transcript_keeps_the_envelope_and_the_verdict() {
         let short = "{\"action\":\"keep\"}";
-        assert_eq!(transcript_excerpt(short), short, "a normal reply is untouched");
+        assert_eq!(
+            transcript_excerpt(short),
+            short,
+            "a normal reply is untouched"
+        );
 
         // What a CLI prints when the model reads a few files on its way to an
         // answer: an opening event, a wall of file content, then the verdict.
@@ -631,10 +735,23 @@ deny rule.\"}";
             "x".repeat(200_000)
         );
         let kept = transcript_excerpt(&long);
-        assert!(kept.chars().count() < 7_000, "still {} chars", kept.chars().count());
-        assert!(kept.starts_with("{\"type\":\"thread.started\""), "lost the envelope");
-        assert!(kept.ends_with("{\"action\":\"delete\"}"), "lost the verdict");
-        assert!(kept.contains("characters elided"), "the cut should be visible: {kept:.200}");
+        assert!(
+            kept.chars().count() < 7_000,
+            "still {} chars",
+            kept.chars().count()
+        );
+        assert!(
+            kept.starts_with("{\"type\":\"thread.started\""),
+            "lost the envelope"
+        );
+        assert!(
+            kept.ends_with("{\"action\":\"delete\"}"),
+            "lost the verdict"
+        );
+        assert!(
+            kept.contains("characters elided"),
+            "the cut should be visible: {kept:.200}"
+        );
     }
 
     #[test]
@@ -662,7 +779,14 @@ mod spawn_tests {
     #[test]
     fn prompt_reaches_the_cli_on_stdin() {
         let dir = TempDir::new("stdin");
-        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let cli = FakeCli::new(
+            &dir,
+            "fake",
+            FakeCliSpec {
+                reply: VERDICT,
+                ..Default::default()
+            },
+        );
         let slot = cli.slot("");
 
         let (res, _) = run(&slot, "line one\nline two");
@@ -672,26 +796,53 @@ mod spawn_tests {
         // Multi-line prompts are exactly what argument passing rejects for a
         // .cmd shim, so this is the case that has to go over the pipe.
         let seen = cli.stdin_seen();
-        assert!(seen.contains("line one"), "stdin missing first line: {seen:?}");
-        assert!(seen.contains("line two"), "stdin missing second line: {seen:?}");
+        assert!(
+            seen.contains("line one"),
+            "stdin missing first line: {seen:?}"
+        );
+        assert!(
+            seen.contains("line two"),
+            "stdin missing second line: {seen:?}"
+        );
     }
 
     #[test]
     fn prompt_reaches_the_cli_as_an_argument_when_templated() {
         let dir = TempDir::new("argv");
-        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let cli = FakeCli::new(
+            &dir,
+            "fake",
+            FakeCliSpec {
+                reply: VERDICT,
+                ..Default::default()
+            },
+        );
         let slot = cli.slot("{prompt}");
 
         let (res, _) = run(&slot, "single-line prompt");
         assert!(res.is_ok());
-        assert!(cli.argv_seen().contains("single-line prompt"), "{}", cli.argv_seen());
-        assert!(cli.stdin_seen().trim().is_empty(), "stdin should be closed in argv mode");
+        assert!(
+            cli.argv_seen().contains("single-line prompt"),
+            "{}",
+            cli.argv_seen()
+        );
+        assert!(
+            cli.stdin_seen().trim().is_empty(),
+            "stdin should be closed in argv mode"
+        );
     }
 
     #[test]
     fn model_and_effort_reach_the_process_in_order() {
         let dir = TempDir::new("flags");
-        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let cli = FakeCli::new(
+            &dir,
+            "fake",
+            FakeCliSpec {
+                reply: VERDICT,
+                ..Default::default()
+            },
+        );
         let mut slot = cli.slot("--print {prompt}");
         slot.model = "tiny-model".into();
         slot.effort = "low".into();
@@ -704,7 +855,10 @@ mod spawn_tests {
         let effort_at = argv.find("--effort low").expect("effort flag in argv");
         // Both must trail the prompt, or `--print` would swallow the flag
         // instead of the prompt — the bug agy's -p exposed.
-        assert!(prompt_at < model_at && model_at < effort_at, "wrong order: {argv:?}");
+        assert!(
+            prompt_at < model_at && model_at < effort_at,
+            "wrong order: {argv:?}"
+        );
     }
 
     #[test]
@@ -713,7 +867,11 @@ mod spawn_tests {
         let cli = FakeCli::new(
             &dir,
             "fake",
-            FakeCliSpec { reply: "command not recognised", exit_code: 1, ..Default::default() },
+            FakeCliSpec {
+                reply: "command not recognised",
+                exit_code: 1,
+                ..Default::default()
+            },
         );
         let (res, raw) = run(&cli.slot(""), "hi");
         let err = res.unwrap_err();
@@ -728,7 +886,11 @@ mod spawn_tests {
         let cli = FakeCli::new(
             &dir,
             "fake",
-            FakeCliSpec { reply: VERDICT, delay_secs: 30, ..Default::default() },
+            FakeCliSpec {
+                reply: VERDICT,
+                delay_secs: 30,
+                ..Default::default()
+            },
         );
         let slot = cli.slot("");
         let started = Instant::now();
@@ -737,7 +899,11 @@ mod spawn_tests {
         assert!(err.contains("timed out"), "{err}");
         // A slot that never returns would wedge the review; the poll loop has
         // to give up close to the deadline rather than wait out the child.
-        assert!(started.elapsed() < Duration::from_secs(15), "took {:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
@@ -757,26 +923,57 @@ mod spawn_tests {
         slot.session_key = "thread_id".into();
 
         let (res, raw) = run(&slot, "first turn");
-        assert_eq!(res.unwrap().action, Action::Keep, "verdict must survive the envelope");
+        assert_eq!(
+            res.unwrap().action,
+            Action::Keep,
+            "verdict must survive the envelope"
+        );
         let session = extract_session_id(&raw, &slot.session_key).expect("session id");
         assert_eq!(session, "sess-42");
 
         // Turn 2 resumes: the id has to land on the child's command line.
-        let second =
-            FakeCli::new(&dir, "second", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let second = FakeCli::new(
+            &dir,
+            "second",
+            FakeCliSpec {
+                reply: VERDICT,
+                ..Default::default()
+            },
+        );
         slot.resume_command = format!("{} resume {{session}}", second.command());
         let resume = slot.resume_command.replace("{session}", &session);
-        let (res2, _) =
-            run_model(&slot, &resume, &followup_prompt("why?"), "", "", Duration::from_secs(30));
+        let (res2, _) = run_model(
+            &slot,
+            &resume,
+            &followup_prompt("why?"),
+            "",
+            "",
+            Duration::from_secs(30),
+        );
         assert!(res2.is_ok());
-        assert!(second.argv_seen().contains("resume sess-42"), "{}", second.argv_seen());
-        assert!(second.stdin_seen().contains("why?"), "{}", second.stdin_seen());
+        assert!(
+            second.argv_seen().contains("resume sess-42"),
+            "{}",
+            second.argv_seen()
+        );
+        assert!(
+            second.stdin_seen().contains("why?"),
+            "{}",
+            second.stdin_seen()
+        );
     }
 
     #[test]
     fn the_cli_runs_in_the_repository_it_is_reviewing() {
         let dir = TempDir::new("cwd");
-        let cli = FakeCli::new(&dir, "fake", FakeCliSpec { reply: VERDICT, ..Default::default() });
+        let cli = FakeCli::new(
+            &dir,
+            "fake",
+            FakeCliSpec {
+                reply: VERDICT,
+                ..Default::default()
+            },
+        );
         let repo = TempDir::new("cwd_repo");
         let slot = cli.slot("");
 
@@ -802,7 +999,10 @@ mod spawn_tests {
         let mut slot = FakeCli::new(&dir, "fake", FakeCliSpec::default()).slot("");
         slot.command = "cra-no-such-program-anywhere".into();
         let (res, _) = run(&slot, "hi");
-        assert!(res.unwrap_err().contains("spawn"), "should name the spawn failure");
+        assert!(
+            res.unwrap_err().contains("spawn"),
+            "should name the spawn failure"
+        );
     }
 }
 
@@ -821,7 +1021,10 @@ mod live_tests {
     /// "the configured limit" means lives in a file next door.
     fn browsable_repo() -> TempRepo {
         let repo = TempRepo::new("live_browse");
-        repo.write("src/config.rs", &format!("pub const RETRY_LIMIT: u32 = {RETRY_LIMIT};\n"));
+        repo.write(
+            "src/config.rs",
+            &format!("pub const RETRY_LIMIT: u32 = {RETRY_LIMIT};\n"),
+        );
         repo.write(
             "src/net.rs",
             "use crate::config::RETRY_LIMIT;\n\npub fn connect() {\n    \
@@ -886,7 +1089,12 @@ Answer with JSON only:\n\
             let (res, raw) = run_model(&slot, &command, &first, &repo_path, &cli_home, timeout);
             match &res {
                 Ok(v) => {
-                    println!("{:>6} turn 1: {} — {}", slot.name, v.action.label(), v.justification);
+                    println!(
+                        "{:>6} turn 1: {} — {}",
+                        slot.name,
+                        v.action.label(),
+                        v.justification
+                    );
                     if !v.justification.contains(RETRY_LIMIT) {
                         failures.push(format!(
                             "{}: did not read the repo — turn 1 said {:?}",
@@ -919,7 +1127,10 @@ Answer with JSON only:\n\
             let (res2, raw2) = run_model(&slot, &resume, &second, &repo_path, &cli_home, timeout);
             match res2 {
                 Ok(v) => {
-                    println!("{:>6} turn 2: justification = {}", slot.name, v.justification);
+                    println!(
+                        "{:>6} turn 2: justification = {}",
+                        slot.name, v.justification
+                    );
                     if !v.justification.contains(RETRY_LIMIT) {
                         failures.push(format!(
                             "{}: session lost — turn 2 said {:?}",
@@ -937,6 +1148,10 @@ Answer with JSON only:\n\
                 }
             }
         }
-        assert!(failures.is_empty(), "live round-trip failed:\n  {}", failures.join("\n  "));
+        assert!(
+            failures.is_empty(),
+            "live round-trip failed:\n  {}",
+            failures.join("\n  ")
+        );
     }
 }

@@ -51,7 +51,10 @@ pub fn configure(repo: &str) -> Result<PathBuf, String> {
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     let path = dir.join("settings.json");
     let wanted = settings_json(repo);
-    if std::fs::read_to_string(&path).map(|c| c == wanted).unwrap_or(false) {
+    if std::fs::read_to_string(&path)
+        .map(|c| c == wanted)
+        .unwrap_or(false)
+    {
         return Ok(home);
     }
     std::fs::write(&path, &wanted).map_err(|e| format!("write {}: {e}", path.display()))?;
@@ -68,7 +71,10 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         let allow = v["permissions"]["allow"].as_array().unwrap();
         let deny = v["permissions"]["deny"].as_array().unwrap();
-        assert!(allow.iter().any(|r| r == "read_file(C:/work/widgets)"), "{allow:?}");
+        assert!(
+            allow.iter().any(|r| r == "read_file(C:/work/widgets)"),
+            "{allow:?}"
+        );
         // Reading anywhere would let a reviewer wander out of the repository
         // it was asked about.
         assert!(!allow.iter().any(|r| r == "read_file(*)"), "{allow:?}");
@@ -99,7 +105,9 @@ mod tests {
         // Written for one repo, then rewritten when the review moves to
         // another — the read grant names a single path.
         std::fs::write(&path, settings_json("C:/work/a")).unwrap();
-        assert!(std::fs::read_to_string(&path).unwrap().contains("read_file(C:/work/a)"));
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("read_file(C:/work/a)"));
         std::fs::write(&path, settings_json("C:/work/b")).unwrap();
         let after = std::fs::read_to_string(&path).unwrap();
         assert!(after.contains("read_file(C:/work/b)"));

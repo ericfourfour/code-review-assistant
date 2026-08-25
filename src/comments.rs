@@ -12,8 +12,13 @@ use crate::diffparse::{DiffFile, Hunk};
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub enum CommentStyle {
     /// The prefix actually used by the original comment (e.g. `//`, `///`, `#`).
-    Line { prefix: String },
-    Block { open: String, close: String },
+    Line {
+        prefix: String,
+    },
+    Block {
+        open: String,
+        close: String,
+    },
 }
 
 pub struct LangSpec {
@@ -27,11 +32,17 @@ pub fn lang_for(path: &str) -> Option<LangSpec> {
     let spec = |name, mut line: Vec<&'static str>, block| {
         // longest-first so `///` wins over `//`
         line.sort_by_key(|p: &&str| std::cmp::Reverse(p.len()));
-        Some(LangSpec { name, line_prefixes: line, block })
+        Some(LangSpec {
+            name,
+            line_prefixes: line,
+            block,
+        })
     };
     match ext.as_str() {
         "rs" => spec("Rust", vec!["///", "//!", "//"], Some(("/*", "*/"))),
-        "c" | "h" | "cpp" | "cc" | "hpp" | "cxx" => spec("C/C++", vec!["///", "//"], Some(("/*", "*/"))),
+        "c" | "h" | "cpp" | "cc" | "hpp" | "cxx" => {
+            spec("C/C++", vec!["///", "//"], Some(("/*", "*/")))
+        }
         "js" | "jsx" | "mjs" | "cjs" => spec("JavaScript", vec!["//"], Some(("/*", "*/"))),
         "ts" | "tsx" => spec("TypeScript", vec!["//"], Some(("/*", "*/"))),
         "java" | "kt" | "kts" | "scala" => spec("JVM", vec!["///", "//"], Some(("/*", "*/"))),
@@ -84,7 +95,11 @@ impl CommentUnit {
         let width = self.indent.chars().count();
         text.lines()
             .map(|l| {
-                let strip = l.chars().take(width).take_while(|c| c.is_whitespace()).count();
+                let strip = l
+                    .chars()
+                    .take(width)
+                    .take_while(|c| c.is_whitespace())
+                    .count();
                 l.chars().skip(strip).collect::<String>()
             })
             .collect::<Vec<_>>()
@@ -115,22 +130,26 @@ impl CommentUnit {
             return Vec::new();
         }
         match &self.style {
-            CommentStyle::Line { prefix } => {
-                prose
-                    .lines()
-                    .map(|l| {
-                        if l.trim().is_empty() {
-                            format!("{}{}", self.indent, prefix)
-                        } else {
-                            format!("{}{} {}", self.indent, prefix, l.trim_end())
-                        }
-                    })
-                    .collect()
-            }
+            CommentStyle::Line { prefix } => prose
+                .lines()
+                .map(|l| {
+                    if l.trim().is_empty() {
+                        format!("{}{}", self.indent, prefix)
+                    } else {
+                        format!("{}{} {}", self.indent, prefix, l.trim_end())
+                    }
+                })
+                .collect(),
             CommentStyle::Block { open, close } => {
                 let lines: Vec<&str> = prose.lines().collect();
                 if lines.len() == 1 {
-                    vec![format!("{}{} {} {}", self.indent, open, lines[0].trim(), close)]
+                    vec![format!(
+                        "{}{} {} {}",
+                        self.indent,
+                        open,
+                        lines[0].trim(),
+                        close
+                    )]
                 } else {
                     let mut out = vec![format!("{}{}", self.indent, open)];
                     for l in &lines {
@@ -157,7 +176,9 @@ fn indent_of(text: &str) -> String {
 pub fn extract_units(files: &[DiffFile], context_lines: usize) -> Vec<(String, Vec<CommentUnit>)> {
     let mut out: Vec<(String, Vec<CommentUnit>)> = Vec::new();
     for f in files {
-        let Some(spec) = lang_for(&f.path) else { continue };
+        let Some(spec) = lang_for(&f.path) else {
+            continue;
+        };
         let mut units = Vec::new();
         for hunk in &f.hunks {
             units.extend(units_in_hunk(&f.path, &spec, hunk, context_lines));
@@ -171,7 +192,12 @@ pub fn extract_units(files: &[DiffFile], context_lines: usize) -> Vec<(String, V
     out
 }
 
-fn units_in_hunk(path: &str, spec: &LangSpec, hunk: &Hunk, context_lines: usize) -> Vec<CommentUnit> {
+fn units_in_hunk(
+    path: &str,
+    spec: &LangSpec,
+    hunk: &Hunk,
+    context_lines: usize,
+) -> Vec<CommentUnit> {
     // Work over the new-side lines only (' ' and '+').
     let new_side: Vec<(usize, &crate::diffparse::HunkLine)> = hunk
         .lines
@@ -204,7 +230,10 @@ fn units_in_hunk(path: &str, spec: &LangSpec, hunk: &Hunk, context_lines: usize)
                         &new_side,
                         i,
                         j,
-                        CommentStyle::Block { open: open.to_string(), close: close.to_string() },
+                        CommentStyle::Block {
+                            open: open.to_string(),
+                            close: close.to_string(),
+                        },
                         context_lines,
                     ));
                     i = j + 1;
@@ -256,7 +285,10 @@ fn make_unit(
 ) -> CommentUnit {
     let start_line = new_side[i].1.new_lineno.unwrap_or(1);
     let end_line = new_side[j].1.new_lineno.unwrap_or(start_line);
-    let raw_lines: Vec<String> = new_side[i..=j].iter().map(|(_, l)| l.text.clone()).collect();
+    let raw_lines: Vec<String> = new_side[i..=j]
+        .iter()
+        .map(|(_, l)| l.text.clone())
+        .collect();
     let has_added = new_side[i..=j].iter().any(|(_, l)| l.origin == '+');
 
     // Context: new-side lines around the unit, numbered, unit rows marked.
@@ -395,7 +427,10 @@ diff --git a/a.c b/a.c
         let out = units_for(RS_DIFF);
         let u = &out[0].1[0];
         let flat = u.dedent(&u.raw_lines.join("\n"));
-        assert_eq!(flat, "// Increment the counter by one\n// to increment the counter.");
+        assert_eq!(
+            flat,
+            "// Increment the counter by one\n// to increment the counter."
+        );
         assert_eq!(u.reindent(&flat), u.raw_lines);
         // deeper relative indentation inside the comment survives the trip
         let nested = "// a\n//   b";

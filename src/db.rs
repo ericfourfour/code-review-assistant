@@ -69,13 +69,18 @@ fn db_path() -> PathBuf {
 /// `ADD COLUMN IF NOT EXISTS`, and blindly retrying the ALTER would mask real
 /// errors, so ask first.
 fn add_column(conn: &Connection, table: &str, column: &str, decl: &str) {
-    let Ok(mut stmt) = conn.prepare(&format!("PRAGMA table_info({table})")) else { return };
+    let Ok(mut stmt) = conn.prepare(&format!("PRAGMA table_info({table})")) else {
+        return;
+    };
     let existing: Vec<String> = stmt
         .query_map([], |r| r.get::<_, String>(1))
         .map(|rows| rows.flatten().collect())
         .unwrap_or_default();
     if !existing.iter().any(|c| c == column) {
-        let _ = conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"), []);
+        let _ = conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
+            [],
+        );
     }
 }
 
@@ -231,9 +236,21 @@ impl Db {
                                    justification, unit_json, blinded)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
-                now(), d.session_id, d.file, d.line_start, d.line_end, d.original, d.action,
-                d.final_text, d.source, d.human_edited as i64, d.committed as i64, d.commit_sha,
-                d.justification, d.unit_json, d.blinded as i64
+                now(),
+                d.session_id,
+                d.file,
+                d.line_start,
+                d.line_end,
+                d.original,
+                d.action,
+                d.final_text,
+                d.source,
+                d.human_edited as i64,
+                d.committed as i64,
+                d.commit_sha,
+                d.justification,
+                d.unit_json,
+                d.blinded as i64
             ],
         );
         self.conn.last_insert_rowid()

@@ -268,7 +268,10 @@ mod tests {
         let resolved = resolve_program(OsStr::new("cmd"));
         let s = resolved.to_string_lossy().to_ascii_lowercase();
         assert!(s.ends_with("cmd.exe"), "unexpected resolution: {s}");
-        assert!(s.contains(std::path::MAIN_SEPARATOR), "expected a full path, got {s}");
+        assert!(
+            s.contains(std::path::MAIN_SEPARATOR),
+            "expected a full path, got {s}"
+        );
     }
 
     #[test]
@@ -314,7 +317,10 @@ mod repo_tests {
         let repo = TempRepo::new("dirty");
         repo.write("a.txt", "hi\n");
         repo.commit("first");
-        assert!(!is_dirty(&repo.path()), "a clean checkout must not read as dirty");
+        assert!(
+            !is_dirty(&repo.path()),
+            "a clean checkout must not read as dirty"
+        );
 
         repo.write("a.txt", "changed\n");
         assert!(is_dirty(&repo.path()));
@@ -337,7 +343,11 @@ mod repo_tests {
 
         let branches = local_branches(&repo.path()).unwrap();
         let names: Vec<&str> = branches.iter().map(|b| b.name.as_str()).collect();
-        assert_eq!(names, vec!["feature", "main"], "most recently committed first");
+        assert_eq!(
+            names,
+            vec!["feature", "main"],
+            "most recently committed first"
+        );
         assert_eq!(branches[0].subject, "feature commit");
         assert!(!branches[0].sha.is_empty());
         assert!(!branches[0].age.is_empty());
@@ -377,7 +387,10 @@ mod repo_tests {
 
         // Against the base branch: only the feature's own change.
         let branch_diff = review_diff(&repo.path(), "main", 12).unwrap();
-        assert!(branch_diff.contains("Increment the counter"), "{branch_diff}");
+        assert!(
+            branch_diff.contains("Increment the counter"),
+            "{branch_diff}"
+        );
 
         // Against the empty tree: the whole history, so a brand-new repo has
         // something to review.
@@ -388,7 +401,9 @@ mod repo_tests {
         // therefore has nothing to show.
         assert!(review_diff(&repo.path(), "", 12).unwrap().trim().is_empty());
         repo.write("src/lib.rs", LIB_RS.replace("one", "1").as_str());
-        assert!(review_diff(&repo.path(), "", 12).unwrap().contains("counter"));
+        assert!(review_diff(&repo.path(), "", 12)
+            .unwrap()
+            .contains("counter"));
     }
 
     #[test]
@@ -413,7 +428,10 @@ mod repo_tests {
         let last = repo.git(&["log", "-1", "--name-only", "--format=%s"]);
         assert!(last.contains("review: tweak a"), "{last}");
         assert!(last.contains("a.txt"), "{last}");
-        assert!(!last.contains("b.txt"), "b.txt should still be uncommitted: {last}");
+        assert!(
+            !last.contains("b.txt"),
+            "b.txt should still be uncommitted: {last}"
+        );
     }
 
     /// The whole non-interactive path: take a real diff, find the comment in
@@ -433,7 +451,11 @@ mod repo_tests {
         let diff = review_diff(&repo.path(), "main", 12).unwrap();
         let files = crate::diffparse::parse(&diff);
         let extracted = comments::extract_units(&files, 12);
-        assert_eq!(extracted.len(), 1, "one file should have a reviewable comment");
+        assert_eq!(
+            extracted.len(),
+            1,
+            "one file should have a reviewable comment"
+        );
         let (path, units) = &extracted[0];
         assert_eq!(path, "src/lib.rs");
         assert_eq!(units.len(), 1);
@@ -441,16 +463,30 @@ mod repo_tests {
         let unit = &units[0];
         assert_eq!(unit.lang, "Rust");
         assert!(unit.has_added);
-        let file = ReviewFile { path: path.clone(), units: vec![], line_offset: 0, decided: 0 };
+        let file = ReviewFile {
+            path: path.clone(),
+            units: vec![],
+            line_offset: 0,
+            decided: 0,
+        };
         let replacement = unit.format_replacement("Counting retries, not requests.");
         let delta = apply_edit(&repo.path(), &file, unit, &replacement).unwrap();
 
         assert_eq!(delta, 0, "one line replaced by one line");
         let after = repo.read("src/lib.rs");
-        assert!(after.contains("    // Counting retries, not requests."), "indent lost: {after}");
+        assert!(
+            after.contains("    // Counting retries, not requests."),
+            "indent lost: {after}"
+        );
         assert!(!after.contains("Increment the counter"), "{after}");
-        assert!(after.contains("counter += 1;"), "the code itself must be untouched: {after}");
-        assert!(is_dirty(&repo.path()), "the edit should show up as a working-tree change");
+        assert!(
+            after.contains("counter += 1;"),
+            "the code itself must be untouched: {after}"
+        );
+        assert!(
+            is_dirty(&repo.path()),
+            "the edit should show up as a working-tree change"
+        );
     }
 
     /// Guard for the failure mode `apply_edit` exists to prevent: acting on a
@@ -470,7 +506,12 @@ mod repo_tests {
         let diff = review_diff(&repo.path(), "main", 12).unwrap();
         let extracted = comments::extract_units(&crate::diffparse::parse(&diff), 12);
         let (path, units) = &extracted[0];
-        let file = ReviewFile { path: path.clone(), units: vec![], line_offset: 0, decided: 0 };
+        let file = ReviewFile {
+            path: path.clone(),
+            units: vec![],
+            line_offset: 0,
+            decided: 0,
+        };
 
         // Someone edits the file behind our back.
         repo.write("src/lib.rs", "fn main() {\n    counter += 1;\n}\n");
