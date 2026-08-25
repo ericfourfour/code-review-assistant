@@ -447,6 +447,7 @@ fn review_app(tag: &str) -> (TempDir, CraApp) {
         ref_name: "feature".into(),
         base_ref: "main".into(),
         branch_base: "main".into(),
+        pr_head_repo: None,
         files,
         file_idx: 0,
         unit_idx: 0,

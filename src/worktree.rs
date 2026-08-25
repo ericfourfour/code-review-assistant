@@ -310,7 +310,7 @@ mod tests {
         // `gh` was asked for the PR, and asked for it in the new worktree.
         assert!(ready.held_by.is_none(), "{ready:?}");
         assert!(
-            gh.argv_seen().contains("pr checkout 3"),
+            gh.argv_seen().contains("pr checkout 3 --force"),
             "{}",
             gh.argv_seen()
         );

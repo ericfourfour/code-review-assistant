@@ -37,6 +37,10 @@ pub struct Stack {
     /// The branch the pull request targets — the reviewed branch when the
     /// remote has it, so the stack is a real stack.
     pub base: String,
+    /// Repository that owns the reviewed PR head. Set for PR reviews so a
+    /// stack onto a fork branch is opened in the fork rather than against an
+    /// unrelated same-named branch in the base repository.
+    pub repository: Option<String>,
     pub title: String,
     pub body: String,
     /// Put the reviewed branch back where the remote has it, once the fixes
@@ -281,6 +285,7 @@ fn stack(req: &Request, stack: &Stack) -> Result<Outcome, String> {
     let url = gitio::pr_create(
         &req.dir,
         &req.gh,
+        stack.repository.as_deref(),
         &stack.base,
         name,
         stack.title.trim(),
@@ -518,6 +523,7 @@ mod tests {
             route: Route::Stack(Stack {
                 branch: "review/feature-fixes".into(),
                 base: "feature".into(),
+                repository: Some("contributor/widgets".into()),
                 title: "Review fixes".into(),
                 body: "two decisions".into(),
                 restore: false,
@@ -546,6 +552,10 @@ mod tests {
 
         let argv = gh.argv_seen();
         assert!(argv.contains("pr create"), "{argv}");
+        assert!(
+            argv.contains("--repo contributor/widgets"),
+            "the PR is opened where the reviewed fork branch lives: {argv}"
+        );
         assert!(argv.contains("--base feature"), "{argv}");
         assert!(argv.contains("--head review/feature-fixes"), "{argv}");
     }
@@ -577,6 +587,7 @@ mod tests {
             route: Route::Stack(Stack {
                 branch: "review/feature-fixes".into(),
                 base: "feature".into(),
+                repository: None,
                 title: "Review fixes".into(),
                 body: body.to_string(),
                 restore: false,
@@ -623,6 +634,7 @@ mod tests {
             route: Route::Stack(Stack {
                 branch: "review/feature-fixes".into(),
                 base: "feature".into(),
+                repository: None,
                 title: "Review fixes".into(),
                 body: String::new(),
                 restore: true,
@@ -717,6 +729,7 @@ mod tests {
             route: Route::Stack(Stack {
                 branch: "review/feature-fixes".into(),
                 base: "feature".into(),
+                repository: None,
                 title: "Review fixes".into(),
                 body: String::new(),
                 restore: false,
@@ -744,6 +757,7 @@ mod tests {
             route: Route::Stack(Stack {
                 branch: "review/feature-fixes".into(),
                 base: "feature".into(),
+                repository: None,
                 title: "Review fixes".into(),
                 body: String::new(),
                 restore: false,

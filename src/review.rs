@@ -106,6 +106,10 @@ pub struct ReviewPlan {
     /// Exact diff base captured when the plan opened. Unlike the display
     /// label `HEAD`, this cannot move when review decisions create commits.
     pub branch_base: String,
+    /// Repository that owns a PR's head branch (`owner/name`). A fork PR's
+    /// short branch name is not meaningful in the base repository, so
+    /// stacked fixes must carry this identity through to publishing.
+    pub pr_head_repo: Option<String>,
     pub files: Vec<ReviewFile>,
     pub file_idx: usize,
     pub unit_idx: usize,

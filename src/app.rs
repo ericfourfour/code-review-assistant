@@ -947,7 +947,7 @@ impl CraApp {
         } else {
             gitio::EMPTY_TREE.to_string()
         };
-        self.build_plan(RefKind::Branch, branch.to_string(), base);
+        self.build_plan(RefKind::Branch, branch.to_string(), base, None);
     }
 
     pub fn select_working_tree(&mut self) {
@@ -963,7 +963,7 @@ impl CraApp {
         } else {
             String::new()
         };
-        self.build_plan(RefKind::WorkingTree, name, base);
+        self.build_plan(RefKind::WorkingTree, name, base, None);
     }
 
     /// Review only what `git add` has staged: the commit being prepared,
@@ -975,7 +975,7 @@ impl CraApp {
             .as_ref()
             .and_then(|r| gitio::current_branch(&r.path).ok())
             .unwrap_or_else(|| "HEAD".into());
-        self.build_plan(RefKind::Staged, name, gitio::STAGED.to_string());
+        self.build_plan(RefKind::Staged, name, gitio::STAGED.to_string(), None);
     }
 
     pub fn select_pr(&mut self, pr: &PrInfo) {
@@ -983,30 +983,33 @@ impl CraApp {
         let path = repo.path.clone();
         let gh = self.settings.gh_path.clone();
         self.ref_note = None;
-        // Someone else's branch is never worth moving the reviewer's checkout
-        // for — unless they are already on it, in which case there is nothing
-        // to move and a fix can be committed straight onto the PR.
-        if gitio::current_branch(&path).is_ok_and(|cur| cur == pr.head_ref) {
-            self.work_in_repo();
-        } else {
-            match worktree::for_pr(&path, &gh, pr.number) {
-                Ok(ready) => {
-                    self.ref_note = Some(ready.describe(&format!("PR #{}", pr.number)));
-                    self.review_work = Some(ready.path);
-                }
-                Err(e) => {
-                    self.ref_error = Some(e);
-                    return;
-                }
+        // A local branch name is not PR identity: it can be stale, or belong
+        // to an unrelated same-named branch when the PR comes from a fork.
+        // Always resolve the selected PR number in the isolated worktree.
+        match worktree::for_pr(&path, &gh, pr.number) {
+            Ok(ready) => {
+                self.ref_note = Some(ready.describe(&format!("PR #{}", pr.number)));
+                self.review_work = Some(ready.path);
+            }
+            Err(e) => {
+                self.ref_error = Some(e);
+                return;
             }
         }
         // The base has to be the one on the server, not the local branch of
         // the same name — see [`gitio::pr_base_ref`].
         let base = gitio::pr_base_ref(&self.work_dir_or_default(), &pr.base_ref);
-        self.build_plan(RefKind::Pr(pr.number), pr.head_ref.clone(), base);
+        let head_repo = pr.head_repo(&path);
+        self.build_plan(RefKind::Pr(pr.number), pr.head_ref.clone(), base, head_repo);
     }
 
-    fn build_plan(&mut self, kind: RefKind, ref_name: String, base: String) {
+    fn build_plan(
+        &mut self,
+        kind: RefKind,
+        ref_name: String,
+        base: String,
+        pr_head_repo: Option<String>,
+    ) {
         let Some(repo) = &self.repo else { return };
         // Two different questions: `work` is where the code is, `path` is which
         // repository it belongs to. A review run in an isolated worktree still
@@ -1060,13 +1063,25 @@ impl CraApp {
                 // carries a finished session's work under a name that session
                 // never had. Only the tip is worth asking about: review
                 // commits are the newest things on the branch.
-                let session = self.db.last_session(&path, &ref_name).or_else(|| {
-                    gitio::delivery_state(&work, &ref_name, &base, &[])
+                let preferred_remote = pr_head_repo
+                    .as_deref()
+                    .and_then(|repository| gitio::remote_for_github_repo(&work, repository));
+                let session = self
+                    .db
+                    .last_committed_session(&path, &ref_name)
+                    .or_else(|| {
+                        gitio::delivery_state_for_remote(
+                            &work,
+                            &ref_name,
+                            &base,
+                            &[],
+                            preferred_remote.as_deref(),
+                        )
                         .unpushed
                         .iter()
                         .take(50)
                         .find_map(|sha| self.db.session_for_commit(sha))
-                });
+                    });
                 if let Some(session_id) = session {
                     self.adopt_plan(ReviewPlan {
                         session_id,
@@ -1074,6 +1089,7 @@ impl CraApp {
                         ref_name,
                         base_ref: gitio::base_label(&base).to_string(),
                         branch_base,
+                        pr_head_repo,
                         files: Vec::new(),
                         file_idx: 0,
                         unit_idx: 0,
@@ -1159,6 +1175,7 @@ impl CraApp {
             ref_name,
             base_ref: gitio::base_label(&base).to_string(),
             branch_base,
+            pr_head_repo,
             files: review_files,
             file_idx: 0,
             unit_idx: 0,
@@ -1255,6 +1272,7 @@ impl CraApp {
             ref_name: "past decisions".into(),
             base_ref: "n/a".into(),
             branch_base: "n/a".into(),
+            pr_head_repo: None,
             files,
             file_idx: 0,
             unit_idx: 0,
@@ -2760,7 +2778,17 @@ impl CraApp {
         // The session's own commits, so the state describes the review rather
         // than whatever this checkout happens to be sitting on.
         let made = self.db.session_commits(session_id);
-        self.delivery = Some(gitio::delivery_state(&work, &ref_name, &base, &made));
+        let preferred_remote = plan
+            .pr_head_repo
+            .as_deref()
+            .and_then(|repository| gitio::remote_for_github_repo(&work, repository));
+        self.delivery = Some(gitio::delivery_state_for_remote(
+            &work,
+            &ref_name,
+            &base,
+            &made,
+            preferred_remote.as_deref(),
+        ));
         self.fill_stack_form(session_id, &ref_name);
     }
 
@@ -2859,6 +2887,7 @@ impl CraApp {
         let route = publish::Route::Stack(publish::Stack {
             branch: self.stack.branch.trim().to_string(),
             base: self.stack.base.trim().to_string(),
+            repository: self.plan.as_ref().and_then(|p| p.pr_head_repo.clone()),
             title: self.stack.title.clone(),
             body: self.stack.body.clone(),
             restore: self.stack.restore,
@@ -2879,12 +2908,28 @@ impl CraApp {
         let Some(state) = self.delivery.clone() else {
             return;
         };
-        let Some(remote) = state.remote.clone() else {
-            self.publish = PublishState::Failed(
-                "this repository has no remote to publish to — add one with `git remote add`"
-                    .to_string(),
-            );
-            return;
+        let remote = match plan.pr_head_repo.as_deref() {
+            Some(repository) => match gitio::remote_for_github_repo(&work, repository) {
+                Some(remote) => remote,
+                None => {
+                    self.publish = PublishState::Failed(format!(
+                        "the reviewed PR head belongs to {repository}, but this checkout has no \
+                         remote for that repository — add its fork as a git remote before \
+                         publishing"
+                    ));
+                    return;
+                }
+            },
+            None => match state.remote.clone() {
+                Some(remote) => remote,
+                None => {
+                    self.publish = PublishState::Failed(
+                        "this repository has no remote to publish to — add one with `git remote add`"
+                            .to_string(),
+                    );
+                    return;
+                }
+            },
         };
         let req = publish::Request {
             dir: work,
@@ -4427,6 +4472,7 @@ mod state_tests {
                 ref_name: "feature".into(),
                 base_ref: "main".into(),
                 branch_base: "main".into(),
+                pr_head_repo: None,
                 files,
                 file_idx: 0,
                 unit_idx: 0,
@@ -5645,6 +5691,7 @@ mod state_tests {
             ref_name: "feature".into(),
             base_ref: "HEAD+untracked".into(),
             branch_base: gitio::head_sha(&h.repo.path()).unwrap(),
+            pr_head_repo: None,
             files: vec![ReviewFile::new(
                 path,
                 units.into_iter().map(ReviewUnit::Comment).collect(),
@@ -5852,7 +5899,7 @@ mod state_tests {
         ));
 
         h.app
-            .build_plan(RefKind::Branch, "feature".into(), "main".into());
+            .build_plan(RefKind::Branch, "feature".into(), "main".into(), None);
 
         assert!(!h.app.commit_each);
         assert!(h.app.pending.is_empty());
@@ -5871,7 +5918,7 @@ mod state_tests {
         );
 
         h.app
-            .build_plan(RefKind::WorkingTree, "feature".into(), String::new());
+            .build_plan(RefKind::WorkingTree, "feature".into(), String::new(), None);
         let captured = h.app.plan.as_ref().unwrap().branch_base.clone();
         assert_eq!(captured, starting_head);
 
@@ -6191,7 +6238,7 @@ mod state_tests {
     fn replan(h: &mut Harness) {
         h.app.settings.review_code = false;
         h.app
-            .build_plan(RefKind::Branch, "feature".into(), "main".into());
+            .build_plan(RefKind::Branch, "feature".into(), "main".into(), None);
     }
 
     /// The file picker's numbers come off the plan, so they have to be
@@ -6311,7 +6358,7 @@ mod state_tests {
         // The same diff under a name no session was ever opened for.
         h.app.settings.review_code = false;
         h.app
-            .build_plan(RefKind::Branch, "renamed-since".into(), "main".into());
+            .build_plan(RefKind::Branch, "renamed-since".into(), "main".into(), None);
         let err = h.app.ref_error.as_deref().unwrap_or_default();
         assert!(err.contains("already"), "unhelpful message: {err}");
         assert!(err.contains('2'), "the message should count them: {err}");
@@ -6404,6 +6451,7 @@ mod state_tests {
             ref_name: "feature".into(),
             base_ref: "main".into(),
             branch_base: "main".into(),
+            pr_head_repo: None,
             files,
             file_idx: 0,
             unit_idx: 0,
@@ -7379,6 +7427,15 @@ mod state_tests {
         let sha = h.repo.git(&["rev-parse", "HEAD"]).trim().to_string();
         record_commit(&mut h.app, first_session, &sha);
 
+        // A later re-review of the same ref can be newer without owning any
+        // commits. It must not mask the earlier session that owns `sha`.
+        let empty_session = h
+            .app
+            .db
+            .new_session(&h.repo.path(), "branch", "feature", "main");
+        assert!(empty_session > first_session);
+        assert!(h.app.db.session_commits(empty_session).is_empty());
+
         // Selecting it again: nothing left to judge, everything left to send.
         replan(&mut h);
         assert!(
@@ -7441,13 +7498,16 @@ mod state_tests {
         let rescued = crate::publish::suggested_branch("feature");
         h.repo.git(&["branch", &rescued]);
         assert!(
-            h.app.db.last_session(&h.repo.path(), &rescued).is_none(),
+            h.app
+                .db
+                .last_committed_session(&h.repo.path(), &rescued)
+                .is_none(),
             "no session by name"
         );
 
         h.app.settings.review_code = false;
         h.app
-            .build_plan(RefKind::Branch, rescued.clone(), "main".into());
+            .build_plan(RefKind::Branch, rescued.clone(), "main".into(), None);
         assert!(
             h.app.ref_error.is_none(),
             "not an error: {:?}",

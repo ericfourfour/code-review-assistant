@@ -546,26 +546,50 @@ impl Delivery {
 /// push would add" is the whole branch. `session_commits` is what keeps the
 /// answer about the *review* rather than about the checkout: see
 /// [`Delivery::tip`].
+#[cfg(test)]
 pub fn delivery_state(
     dir: &str,
     ref_name: &str,
     base: &str,
     session_commits: &[String],
 ) -> Delivery {
+    delivery_state_for_remote(dir, ref_name, base, session_commits, None)
+}
+
+/// [`delivery_state`] pinned to one remote. PR heads use this because a
+/// detached fork checkout cannot reveal its repository through a local branch
+/// upstream, and falling back to `origin/<short-name>` can identify a wholly
+/// different branch in the base repository.
+pub fn delivery_state_for_remote(
+    dir: &str,
+    ref_name: &str,
+    base: &str,
+    session_commits: &[String],
+    preferred_remote: Option<&str>,
+) -> Delivery {
     let branch = current_branch(dir)
         .ok()
         .filter(|b| b != "HEAD" && !b.is_empty());
-    let remote = default_remote(dir, branch.as_deref());
+    let remote = preferred_remote
+        .filter(|r| !r.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| default_remote(dir, branch.as_deref()));
     // The branch's configured upstream first — it is the reviewer's own answer
     // to where this branch goes. Failing that, the tracking ref for the name
     // the review was started under, which is what a detached PR checkout has.
-    let upstream = branch
-        .as_deref()
-        .and_then(|b| upstream_ref(dir, b))
+    let configured = branch.as_deref().and_then(|b| upstream_ref(dir, b));
+    let upstream = preferred_remote
+        .and_then(|wanted| {
+            configured
+                .as_ref()
+                .filter(|u| u.starts_with(&format!("{wanted}/")))
+                .cloned()
+        })
         .or_else(|| {
             let cand = format!("{}/{ref_name}", remote.as_deref()?);
             has_ref(dir, &format!("refs/remotes/{cand}")).then_some(cand)
-        });
+        })
+        .or_else(|| preferred_remote.is_none().then_some(configured).flatten());
 
     // Publish what the review committed. Only when HEAD cannot reach those
     // commits does the tip move off it — otherwise this is HEAD, and every
@@ -639,6 +663,32 @@ pub fn remotes(dir: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The configured remote whose GitHub repository is exactly `owner/name`.
+/// Branch names are not enough for fork PRs: both the fix branch push and the
+/// stacked PR have to stay in the repository that owns the reviewed head.
+pub fn remote_for_github_repo(dir: &str, repository: &str) -> Option<String> {
+    remotes(dir).into_iter().find(|remote| {
+        let url = git(dir, &["remote", "get-url", remote]).ok();
+        url.as_deref()
+            .and_then(github_repo_from_url)
+            .is_some_and(|slug| slug.eq_ignore_ascii_case(repository.trim()))
+    })
+}
+
+fn github_repo_from_url(url: &str) -> Option<String> {
+    let url = url.trim();
+    let lower = url.to_ascii_lowercase();
+    let start = lower.find("github.com")? + "github.com".len();
+    let rest = url[start..]
+        .trim_start_matches([':', '/'])
+        .trim_end_matches('/');
+    let rest = rest.strip_suffix(".git").unwrap_or(rest);
+    let mut parts = rest.split('/');
+    let owner = parts.next().filter(|s| !s.is_empty())?;
+    let name = parts.next().filter(|s| !s.is_empty())?;
+    Some(format!("{owner}/{name}"))
 }
 
 /// The remote a push should go to: whatever the branch is configured to push
@@ -842,28 +892,29 @@ impl Drop for ScratchFile {
 pub fn pr_create(
     dir: &str,
     gh: &str,
+    repository: Option<&str>,
     base: &str,
     head: &str,
     title: &str,
     body: &str,
 ) -> Result<String, String> {
     let body_file = ScratchFile::new("cra-pr-body", body)?;
-    let out = run(
-        dir,
-        gh,
-        &[
-            "pr",
-            "create",
-            "--base",
-            base,
-            "--head",
-            head,
-            "--title",
-            title,
-            "--body-file",
-            &body_file.path(),
-        ],
-    )?;
+    let body_path = body_file.path();
+    let mut args = vec!["pr", "create"];
+    if let Some(repository) = repository.filter(|r| !r.trim().is_empty()) {
+        args.extend(["--repo", repository]);
+    }
+    args.extend([
+        "--base",
+        base,
+        "--head",
+        head,
+        "--title",
+        title,
+        "--body-file",
+        &body_path,
+    ]);
+    let out = run(dir, gh, &args)?;
     // `gh` prints the URL on its own line, with progress chatter around it.
     Ok(out
         .lines()
@@ -883,6 +934,12 @@ pub struct PrAuthor {
 }
 
 #[derive(Clone, Deserialize)]
+pub struct PrRepository {
+    #[serde(rename = "nameWithOwner", default)]
+    pub name_with_owner: String,
+}
+
+#[derive(Clone, Deserialize)]
 pub struct PrInfo {
     pub number: u64,
     pub title: String,
@@ -892,6 +949,27 @@ pub struct PrInfo {
     pub base_ref: String,
     #[serde(default)]
     pub author: Option<PrAuthor>,
+    #[serde(rename = "headRepository", default)]
+    pub head_repository: Option<PrRepository>,
+    #[serde(rename = "headRepositoryOwner", default)]
+    pub head_repository_owner: Option<PrAuthor>,
+}
+
+impl PrInfo {
+    /// Full repository identity for the PR head, including forks. Older `gh`
+    /// output may omit `headRepository`; its owner plus this clone's repo name
+    /// is an accurate fallback for GitHub forks.
+    pub fn head_repo(&self, dir: &str) -> Option<String> {
+        self.head_repository
+            .as_ref()
+            .map(|r| r.name_with_owner.trim())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                let owner = self.head_repository_owner.as_ref()?.login.trim();
+                (!owner.is_empty()).then(|| format!("{owner}/{}", repo_name(dir)))
+            })
+    }
 }
 
 pub fn open_prs(dir: &str, gh: &str) -> Result<Vec<PrInfo>, String> {
@@ -906,7 +984,7 @@ pub fn open_prs(dir: &str, gh: &str) -> Result<Vec<PrInfo>, String> {
             "--limit",
             "50",
             "--json",
-            "number,title,headRefName,baseRefName,author",
+            "number,title,headRefName,baseRefName,author,headRepository,headRepositoryOwner",
         ],
     )?;
     serde_json::from_str(&out).map_err(|e| format!("parse gh output: {e}"))
@@ -919,13 +997,13 @@ pub fn open_prs(dir: &str, gh: &str) -> Result<Vec<PrInfo>, String> {
 /// that forced the fallback, so the UI can say why HEAD came back detached.
 pub fn pr_checkout(dir: &str, gh: &str, number: u64) -> Result<Option<String>, String> {
     let n = number.to_string();
-    let Err(e) = run(dir, gh, &["pr", "checkout", &n]) else {
+    let Err(e) = run(dir, gh, &["pr", "checkout", &n, "--force"]) else {
         return Ok(None);
     };
     let Some(other) = worktree_in_error(&e) else {
         return Err(e);
     };
-    run(dir, gh, &["pr", "checkout", &n, "--detach"])
+    run(dir, gh, &["pr", "checkout", &n, "--detach", "--force"])
         .map_err(|d| format!("{e}\n\nchecking it out detached instead also failed: {d}"))?;
     Ok(Some(other))
 }
@@ -991,6 +1069,53 @@ mod repo_tests {
         // A plain directory is not a repo, and must not be treated as one.
         let plain = TempDir::new("plain");
         assert!(!is_git_repo(&plain.path().to_string_lossy()));
+    }
+
+    #[test]
+    fn a_fork_pr_keeps_its_full_head_repository_identity() {
+        let pr: PrInfo = serde_json::from_str(
+            r#"{
+                "number": 12,
+                "title": "fork change",
+                "headRefName": "feature",
+                "baseRefName": "main",
+                "headRepository": {"nameWithOwner": "contributor/widgets"},
+                "headRepositoryOwner": {"login": "contributor"}
+            }"#,
+        )
+        .expect("PR JSON");
+        assert_eq!(
+            pr.head_repo("C:/some/widgets").as_deref(),
+            Some("contributor/widgets")
+        );
+    }
+
+    #[test]
+    fn a_github_repository_identity_selects_its_remote_not_origin_by_name() {
+        let repo = TempRepo::new("fork-remote");
+        repo.write("a.txt", "hi\n");
+        repo.commit("first");
+        repo.git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/base/widgets.git",
+        ]);
+        repo.git(&[
+            "remote",
+            "add",
+            "contributor",
+            "git@github.com:contributor/widgets.git",
+        ]);
+
+        assert_eq!(
+            remote_for_github_repo(&repo.path(), "contributor/widgets").as_deref(),
+            Some("contributor")
+        );
+        assert_eq!(
+            remote_for_github_repo(&repo.path(), "base/widgets").as_deref(),
+            Some("origin")
+        );
     }
 
     #[test]

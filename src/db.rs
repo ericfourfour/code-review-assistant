@@ -383,17 +383,21 @@ impl Db {
         self.conn.last_insert_rowid()
     }
 
-    /// The most recent session recorded for this ref in this repository.
-    ///
-    /// What lets a ref with nothing left to review reopen on the session its
-    /// fix commits were made in, rather than on an empty new one: publishing
-    /// proves a branch is safe to rewind by matching its commits against a
-    /// session's, and a session that made none proves nothing.
-    pub fn last_session(&self, repo: &str, ref_name: &str) -> Option<i64> {
+    /// The newest session for this ref that actually owns a commit. A later
+    /// re-review may decide nothing or leave every decision uncommitted; it
+    /// must not hide an earlier session whose pending commits still need to
+    /// be delivered.
+    pub fn last_committed_session(&self, repo: &str, ref_name: &str) -> Option<i64> {
         self.conn
             .query_row(
-                "SELECT id FROM sessions WHERE repo = ?1 AND ref_name = ?2
-                 ORDER BY id DESC LIMIT 1",
+                "SELECT s.id FROM sessions s
+                 WHERE s.repo = ?1 AND s.ref_name = ?2
+                   AND EXISTS (
+                     SELECT 1 FROM decisions d
+                     WHERE d.session_id = s.id AND d.committed = 1
+                       AND d.commit_sha IS NOT NULL AND d.commit_sha <> ''
+                   )
+                 ORDER BY s.id DESC LIMIT 1",
                 params![repo, ref_name],
                 |r| r.get(0),
             )
@@ -405,7 +409,7 @@ impl Db {
     /// Names are not reliable identity: a rescued branch carries a finished
     /// review's commits under a name no session was ever opened for, and so
     /// does a branch since renamed. The commits themselves are, so this is
-    /// what finds the session when [`Db::last_session`] draws a blank.
+    /// what finds the session when [`Db::last_committed_session`] draws a blank.
     pub fn session_for_commit(&self, sha: &str) -> Option<i64> {
         self.conn
             .query_row(
