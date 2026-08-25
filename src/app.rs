@@ -372,6 +372,11 @@ impl CraApp {
         let session_id =
             self.db
                 .new_session(&path, &kind.label(), &ref_name, gitio::base_label(&base));
+        let branch_base = if base.is_empty() {
+            gitio::head_sha(&path).unwrap_or_default()
+        } else {
+            base.clone()
+        };
         let n_comments: usize = extracted
             .iter()
             .map(|(_, u)| u.iter().filter(|u| !u.is_code()).count())
@@ -403,6 +408,7 @@ impl CraApp {
             ref_kind: kind,
             ref_name,
             base_ref: gitio::base_label(&base).to_string(),
+            branch_base,
             files: review_files,
             file_idx: 0,
             unit_idx: 0,
@@ -478,6 +484,7 @@ impl CraApp {
             ref_kind: RefKind::Recheck,
             ref_name: "past decisions".into(),
             base_ref: "n/a".into(),
+            branch_base: "n/a".into(),
             files,
             file_idx: 0,
             unit_idx: 0,
@@ -851,7 +858,9 @@ impl CraApp {
         // measuring the reviewer, not editing code, so it stops short of this
         // — and a keep or a flag has nothing to write.
         let recheck = self.plan.as_ref().is_some_and(|p| p.is_recheck());
-        let makes_edit = matches!(action, Action::Rewrite | Action::Delete) && !recheck;
+        let makes_edit = matches!(action, Action::Rewrite | Action::Delete)
+            && !recheck
+            && !unit.is_deleted_file();
         let new_lines = unit.editor_to_lines(&self.editor);
         let final_text = new_lines.join("\n");
         let mut delta = 0i64;
@@ -1072,8 +1081,7 @@ impl CraApp {
         let Some(repo) = self.repo.as_ref().map(|r| r.path.clone()) else {
             return;
         };
-        let base = gitio::base_from_label(&plan.base_ref);
-        let diff = match gitio::review_diff(&repo, &base, self.settings.context_lines) {
+        let diff = match gitio::review_diff(&repo, &plan.branch_base, self.settings.context_lines) {
             Ok(d) => d,
             Err(e) => {
                 self.note("error", &format!("branch pass diff: {e}"));
@@ -1530,6 +1538,7 @@ mod state_tests {
                 ref_kind: RefKind::Branch,
                 ref_name: "feature".into(),
                 base_ref: "main".into(),
+                branch_base: "main".into(),
                 files,
                 file_idx: 0,
                 unit_idx: 0,
@@ -2111,6 +2120,7 @@ mod state_tests {
             review::PendingDecision {
                 file: "src/lib.rs".into(),
                 line: 2,
+                kind: units::UnitKind::Comment,
                 action: Action::Rewrite,
                 provenance: review::Provenance::Human,
                 justification: None,
@@ -2123,6 +2133,30 @@ mod state_tests {
 
         assert!(!h.app.commit_each);
         assert!(h.app.pending.is_empty());
+    }
+
+    #[test]
+    fn a_working_tree_plan_keeps_its_starting_head_for_the_branch_pass() {
+        let mut h = Harness::new("working-base");
+        let starting_head = gitio::head_sha(&h.repo.path()).unwrap();
+        h.repo.write(
+            "src/lib.rs",
+            &format!(
+                "{}\nfn newly_added() {{ risky(); }}\n",
+                h.repo.read("src/lib.rs")
+            ),
+        );
+
+        h.app
+            .build_plan(RefKind::WorkingTree, "feature".into(), String::new());
+        let captured = h.app.plan.as_ref().unwrap().branch_base.clone();
+        assert_eq!(captured, starting_head);
+
+        // Committing during review advances HEAD. The captured SHA must still
+        // produce the whole reviewed change for the later branch pass.
+        h.repo.commit("review decision");
+        let diff = gitio::review_diff(&h.repo.path(), &captured, 12).unwrap();
+        assert!(diff.contains("newly_added"), "{diff}");
     }
 
     #[test]
@@ -2142,12 +2176,12 @@ mod state_tests {
         for session_id in [selected_session, other_session] {
             h.app.db.log_decision(&crate::db::DecisionRecord {
                 session_id,
-                file: &unit.file,
-                line_start: unit.start_line,
-                line_end: unit.end_line,
-                original: &unit.raw_lines.join("\n"),
+                file: unit.file(),
+                line_start: unit.start_line(),
+                line_end: unit.end_line(),
+                original: &unit.raw_lines().join("\n"),
                 action: "keep",
-                final_text: &unit.raw_lines.join("\n"),
+                final_text: &unit.raw_lines().join("\n"),
                 source: "original",
                 human_edited: false,
                 committed: false,
@@ -2361,6 +2395,7 @@ mod state_tests {
             ref_kind: RefKind::Branch,
             ref_name: "feature".into(),
             base_ref: "main".into(),
+            branch_base: "main".into(),
             files,
             file_idx: 0,
             unit_idx: 0,

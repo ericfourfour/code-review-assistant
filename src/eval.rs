@@ -417,14 +417,14 @@ mod tests {
         }
     }
 
-    fn log_label(db: &Db, session_id: i64, unit: &CommentUnit, action: &str, source: &str) {
-        let original = unit.raw_lines.join("\n");
+    fn log_label(db: &Db, session_id: i64, unit: &ReviewUnit, action: &str, source: &str) {
+        let original = unit.raw_lines().join("\n");
         let unit_json = serde_json::to_string(unit).unwrap();
         db.log_decision(&crate::db::DecisionRecord {
             session_id,
-            file: &unit.file,
-            line_start: unit.start_line,
-            line_end: unit.end_line,
+            file: unit.file(),
+            line_start: unit.start_line(),
+            line_end: unit.end_line(),
             original: &original,
             action,
             final_text: &original,
@@ -581,7 +581,7 @@ mod tests {
         let judged = unit("src/lib.rs", 2);
         db.log_suggestion(
             session,
-            &judged.file,
+            judged.file(),
             2,
             2,
             "m1",
@@ -590,10 +590,11 @@ mod tests {
             Some("first answer"),
             10,
             None,
+            None,
         );
         db.log_suggestion(
             session,
-            &judged.file,
+            judged.file(),
             2,
             2,
             "m1",
@@ -601,6 +602,7 @@ mod tests {
             Some("better"),
             Some("follow-up answer"),
             20,
+            None,
             None,
         );
         log_label(&db, session, &judged, "rewrite", "m1");

@@ -1,6 +1,7 @@
 //! Review session state: the plan (files × comment units), edit application
 //! to the working tree, provenance tracking, and commit message assembly.
 
+use std::io::Read;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -59,6 +60,9 @@ pub struct ReviewPlan {
     pub ref_kind: RefKind,
     pub ref_name: String,
     pub base_ref: String,
+    /// Exact diff base captured when the plan opened. Unlike the display
+    /// label `HEAD`, this cannot move when review decisions create commits.
+    pub branch_base: String,
     pub files: Vec<ReviewFile>,
     pub file_idx: usize,
     pub unit_idx: usize,
@@ -310,10 +314,23 @@ pub fn run_check(repo: &str, command: &str, timeout: Duration) -> Result<(), Str
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("spawn `{program}`: {e}"))?;
+    let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
+    let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
+    let stdout_thread = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut bytes);
+        bytes
+    });
+    let stderr_thread = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut bytes);
+        bytes
+    });
+
     let deadline = started + timeout;
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => break status,
             Ok(None) => {
                 if Instant::now() > deadline {
                     let _ = child.kill();
@@ -324,13 +341,18 @@ pub fn run_check(repo: &str, command: &str, timeout: Duration) -> Result<(), Str
             }
             Err(e) => return Err(format!("wait: {e}")),
         }
-    }
-    let out = child.wait_with_output().map_err(|e| e.to_string())?;
-    if out.status.success() {
+    };
+    let stdout = stdout_thread
+        .join()
+        .map_err(|_| "validation stdout reader panicked".to_string())?;
+    let stderr = stderr_thread
+        .join()
+        .map_err(|_| "validation stderr reader panicked".to_string())?;
+    if status.success() {
         return Ok(());
     }
-    let mut text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let mut text = String::from_utf8_lossy(&stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&stderr);
     if !stderr.trim().is_empty() {
         if !text.is_empty() {
             text.push('\n');
@@ -833,5 +855,27 @@ mod tests {
         assert!(run_check(&repo, "   ", timeout)
             .unwrap_err()
             .contains("empty"));
+    }
+
+    #[test]
+    fn run_check_drains_verbose_output_before_waiting_for_exit() {
+        use crate::testkit::{FakeCli, FakeCliSpec, TempDir};
+
+        let dir = TempDir::new("check-output");
+        let verbose = "x".repeat(256 * 1024);
+        let check = FakeCli::new(
+            &dir,
+            "verbose",
+            FakeCliSpec {
+                reply: &verbose,
+                ..Default::default()
+            },
+        );
+        assert!(run_check(
+            &dir.path().to_string_lossy(),
+            &check.command(),
+            Duration::from_secs(10)
+        )
+        .is_ok());
     }
 }

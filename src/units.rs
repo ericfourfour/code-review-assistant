@@ -49,6 +49,10 @@ impl ReviewUnit {
         matches!(self, ReviewUnit::Code(_))
     }
 
+    pub fn is_deleted_file(&self) -> bool {
+        matches!(self, ReviewUnit::Code(u) if u.deleted_file)
+    }
+
     pub fn file(&self) -> &str {
         match self {
             ReviewUnit::Comment(u) => &u.file,
@@ -104,6 +108,7 @@ impl ReviewUnit {
         match self {
             ReviewUnit::Comment(_) => "comment".into(),
             ReviewUnit::Code(u) => match &u.scope {
+                _ if u.deleted_file => "code · deleted file".into(),
                 Some(s) => format!("code · {s}"),
                 None => "code · hunk".into(),
             },

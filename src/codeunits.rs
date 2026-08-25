@@ -55,6 +55,10 @@ pub struct CodeUnit {
     /// removed lines, interleaved where they were removed from.
     pub context: String,
     pub hunk_header: String,
+    /// The unit comes from the old side of a fully deleted file. It can be
+    /// approved or flagged, but there is no working-tree file to splice.
+    #[serde(default)]
+    pub deleted_file: bool,
 }
 
 pub fn extract(
@@ -88,6 +92,9 @@ fn units_in_file(repo: &str, f: &DiffFile, context_lines: usize) -> Vec<CodeUnit
         .as_ref()
         .map(|s| s.name.to_string())
         .unwrap_or_else(|| lang_fallback(&f.path));
+    if f.deleted {
+        return deleted_file_units(f, &lang, spec.as_ref());
+    }
 
     // File-level view of the diff: every new-side line, which of them were
     // added, and what was removed after which line.
@@ -205,10 +212,57 @@ fn units_in_file(repo: &str, f: &DiffFile, context_lines: usize) -> Vec<CodeUnit
                 scope,
                 context,
                 hunk_header: hunk.header.clone(),
+                deleted_file: false,
             });
         }
     }
     units
+}
+
+/// Review the old side of a fully deleted file in bounded windows. There is
+/// no new-side anchor and no file on disk, so ordinary extraction cannot
+/// discover a unit; the removed lines themselves are the review material.
+fn deleted_file_units(f: &DiffFile, lang: &str, spec: Option<&LangSpec>) -> Vec<CodeUnit> {
+    let mut out = Vec::new();
+    for hunk in &f.hunks {
+        let removed: Vec<_> = hunk
+            .lines
+            .iter()
+            .filter(|line| line.origin == '-' && line.old_lineno.is_some())
+            .collect();
+        for window in removed.chunks(MAX_REGION_LINES as usize) {
+            if !window.iter().any(|line| removed_is_code(spec, &line.text)) {
+                continue;
+            }
+            let start_line = window.first().and_then(|line| line.old_lineno).unwrap_or(1);
+            let end_line = window
+                .last()
+                .and_then(|line| line.old_lineno)
+                .unwrap_or(start_line);
+            let raw_lines = window.iter().map(|line| line.text.clone()).collect();
+            let mut context = format!("{}\n", hunk.header);
+            for line in window {
+                context.push_str(&format!(
+                    ">{:>5}| -{}\n",
+                    line.old_lineno.unwrap_or(0),
+                    line.text
+                ));
+            }
+            out.push(CodeUnit {
+                file: f.path.clone(),
+                lang: lang.to_string(),
+                start_line,
+                end_line,
+                raw_lines,
+                changed_lines: Vec::new(),
+                scope: None,
+                context,
+                hunk_header: hunk.header.clone(),
+                deleted_file: true,
+            });
+        }
+    }
+    out
 }
 
 /// New-side line numbers in this hunk that are (part of) whole-line comments,
@@ -922,5 +976,29 @@ diff --git a/src/main.rs b/src/main.rs
         assert!(p.contains("\"approve|revise|flag|delete\""), "{p}");
         assert!(p.contains("\"evidence\""), "{p}");
         assert!(p.contains("root of the repository"), "{p}");
+    }
+
+    #[test]
+    fn a_fully_deleted_file_becomes_reviewable_code_units() {
+        let diff = "\
+diff --git a/src/gone.rs b/src/gone.rs
+deleted file mode 100644
+--- a/src/gone.rs
++++ /dev/null
+@@ -1,3 +0,0 @@
+-fn removed() {
+-    dangerous();
+-}
+";
+        let files = crate::diffparse::parse(diff);
+        let extracted = extract("", &files, 12);
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(extracted[0].0, "src/gone.rs");
+        assert_eq!(extracted[0].1.len(), 1);
+        let unit = &extracted[0].1[0];
+        assert!(unit.deleted_file);
+        assert_eq!(unit.start_line, 1);
+        assert_eq!(unit.end_line, 3);
+        assert!(unit.raw_lines.iter().any(|line| line.contains("dangerous")));
     }
 }

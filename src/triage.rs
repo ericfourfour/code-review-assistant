@@ -275,6 +275,7 @@ mod tests {
             scope: scope.map(|s| s.to_string()),
             context: context.into(),
             hunk_header: String::new(),
+            deleted_file: false,
         })
     }
 

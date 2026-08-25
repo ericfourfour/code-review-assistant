@@ -192,6 +192,7 @@ fn review_hotkeys_reach_their_handlers() {
         ref_kind: crate::review::RefKind::Branch,
         ref_name: "feature".into(),
         base_ref: "main".into(),
+        branch_base: "main".into(),
         files,
         file_idx: 0,
         unit_idx: 0,
