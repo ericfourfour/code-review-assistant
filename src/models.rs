@@ -1,7 +1,7 @@
 //! Invoke reviewer model CLIs (claude / codex / agy / anything configured)
 //! on background threads and parse their JSON verdicts.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -13,6 +13,9 @@ pub enum Action {
     Keep,
     Rewrite,
     Delete,
+    /// Code only: something is wrong that a rewrite of the unit's own lines
+    /// cannot fix. The justification is the payload; nothing is edited.
+    Flag,
 }
 
 impl Action {
@@ -21,6 +24,7 @@ impl Action {
             Action::Keep => "KEEP",
             Action::Rewrite => "REWRITE",
             Action::Delete => "DELETE",
+            Action::Flag => "FLAG",
         }
     }
     pub fn as_str(self) -> &'static str {
@@ -28,8 +32,23 @@ impl Action {
             Action::Keep => "keep",
             Action::Rewrite => "rewrite",
             Action::Delete => "delete",
+            Action::Flag => "flag",
         }
     }
+}
+
+/// One place a model says it read on its way to a verdict, so the human can
+/// look at the same code. Self-reported — it is the only cross-CLI channel
+/// there is — which is exactly why the viewer shows the real file at that
+/// spot rather than anything the model wrote.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Evidence {
+    #[serde(default)]
+    pub file: String,
+    #[serde(default)]
+    pub lines: String,
+    #[serde(default)]
+    pub note: String,
 }
 
 #[derive(Clone, Debug)]
@@ -37,6 +56,7 @@ pub struct Suggestion {
     pub action: Action,
     pub comment: String,
     pub justification: String,
+    pub evidence: Vec<Evidence>,
     pub latency_ms: i64,
 }
 
@@ -71,23 +91,47 @@ pub fn transcript_excerpt(raw: &str) -> String {
     format!("{head}\n\n… {} characters elided …\n\n{tail}", total - kept)
 }
 
+/// The answer format both prompts (and every follow-up) ask for. Shared so a
+/// follow-up can never drift from the schema the opening turn promised.
+/// The evidence list is what lets the human see the larger context the model
+/// judged from — which files it went and read, and why they mattered.
+pub fn answer_schema(code: bool) -> &'static str {
+    if code {
+        "Answer with JSON only:\n\
+{\"action\":\"approve|revise|flag|delete\",\
+\"replacement\":\"full replacement for the lines under review if revise, else empty\",\
+\"justification\":\"one or two short sentences — for flag, say exactly what is wrong and where\",\
+\"evidence\":[{\"file\":\"path\",\"lines\":\"12-40\",\"note\":\"what you checked there\"}]}\n\
+In \"evidence\", list the places you actually read to reach this verdict — the reviewer is \
+shown them. Use [] if you judged from the excerpt alone."
+    } else {
+        "Answer with JSON only:\n\
+{\"action\":\"keep|rewrite|delete\",\
+\"comment\":\"replacement text if rewrite, else empty\",\
+\"justification\":\"one short sentence\",\
+\"evidence\":[{\"file\":\"path\",\"lines\":\"12-40\",\"note\":\"what you checked there\"}]}\n\
+In \"evidence\", list the places you actually read to reach this verdict — the reviewer is \
+shown them. Use [] if you judged from the excerpt alone."
+    }
+}
+
 /// The prompt for a follow-up turn. The conversation itself lives in the
 /// CLI's own session, so only the new message and the answer format go over.
-pub fn followup_prompt(message: &str) -> String {
-    format!(
-        "{}\n\nAnswer with JSON only:\n\
-{{\"action\":\"keep|rewrite|delete\",\"comment\":\"replacement text if rewrite, else empty\",\"justification\":\"one short sentence\"}}",
-        message.trim()
-    )
+pub fn followup_prompt(message: &str, code: bool) -> String {
+    format!("{}\n\n{}", message.trim(), answer_schema(code))
 }
 
 #[derive(Deserialize)]
 struct RawSuggestion {
     action: String,
-    #[serde(default)]
+    /// The proposed replacement. Comment prompts call it "comment", code
+    /// prompts "replacement"; either key lands here.
+    #[serde(default, alias = "replacement")]
     comment: String,
     #[serde(default)]
     justification: String,
+    #[serde(default)]
+    evidence: Vec<Evidence>,
 }
 
 /// Message sent back to the UI thread when a model finishes.
@@ -211,22 +255,32 @@ pub fn extract_session_id(output: &str, key: &str) -> Option<String> {
         .find_map(|v| find_string_key(v, key))
 }
 
-/// Pull the verdict out of whatever the CLI printed. Asking a CLI for
+/// Pull a typed payload out of whatever the CLI printed. Asking a CLI for
 /// machine-readable output (needed to recover the session id) wraps the
-/// model's answer in the CLI's own envelope, so the verdict arrives as an
-/// escaped string inside it rather than as bare text.
-fn extract_verdict(output: &str) -> Option<RawSuggestion> {
-    if let Some(raw) = extract_json(output) {
-        return Some(raw);
+/// model's answer in the CLI's own envelope, so the payload arrives as an
+/// escaped string inside it rather than as bare text — first scan the output
+/// itself, then every string embedded in its JSON documents.
+pub(crate) fn extract_payload<T: serde::de::DeserializeOwned>(output: &str) -> Option<T> {
+    if let Some(v) = scan_json::<T>(output) {
+        return Some(v);
     }
     let mut strings = Vec::new();
     for doc in json_documents(output) {
         collect_strings(&doc, &mut strings);
     }
-    strings.iter().rev().find_map(|s| extract_json(s))
+    strings.iter().rev().find_map(|s| scan_json::<T>(s))
 }
 
+fn extract_verdict(output: &str) -> Option<RawSuggestion> {
+    extract_payload(output)
+}
+
+#[cfg(test)]
 fn extract_json(output: &str) -> Option<RawSuggestion> {
+    scan_json(output)
+}
+
+fn scan_json<T: serde::de::DeserializeOwned>(output: &str) -> Option<T> {
     // Model CLIs often wrap JSON in prose or code fences; scan for the first
     // balanced object that parses into the expected shape.
     let bytes = output.as_bytes();
@@ -252,7 +306,7 @@ fn extract_json(output: &str) -> Option<RawSuggestion> {
                 depth -= 1;
                 if depth == 0 {
                     if let Some(s) = start {
-                        if let Ok(raw) = serde_json::from_str::<RawSuggestion>(&output[s..=i]) {
+                        if let Ok(raw) = serde_json::from_str::<T>(&output[s..=i]) {
                             return Some(raw);
                         }
                     }
@@ -270,7 +324,7 @@ fn extract_json(output: &str) -> Option<RawSuggestion> {
 /// A CLI that refuses one of its own tools reports it in its envelope and
 /// still exits 0, so without this the slot shows a wall of JSON with the one
 /// line that explains it buried inside.
-fn cli_error(name: &str, stdout: &str, stderr: &str) -> String {
+pub(crate) fn cli_error(name: &str, stdout: &str, stderr: &str) -> String {
     for out in [stdout, stderr] {
         let reported = json_documents(out)
             .iter()
@@ -338,8 +392,13 @@ fn run_model(
     (result, raw_output)
 }
 
+/// Run a model CLI to completion and collect what it printed: everything up
+/// to — but not including — parsing a verdict out of the output. Shared by
+/// the per-unit review and the branch pass, which want different payloads
+/// from the same plumbing. Returns (stdout, stderr, latency_ms) and appends
+/// the transcript-worthy text to `raw_output`.
 #[allow(clippy::too_many_arguments)]
-fn run_inner(
+pub(crate) fn capture_cli(
     slot: &ModelSlot,
     command: &str,
     prompt: &str,
@@ -347,7 +406,7 @@ fn run_inner(
     cli_home: &str,
     timeout: Duration,
     raw_output: &mut String,
-) -> Result<Suggestion, String> {
+) -> Result<(String, String, i64), String> {
     let (argv, via_stdin) = build_argv(command, prompt, repo, cli_home, slot);
     if argv.is_empty() {
         return Err("empty command template".into());
@@ -411,8 +470,8 @@ fn run_inner(
     let stderr_bytes = stderr_thread
         .join()
         .map_err(|_| "stderr reader panicked".to_string())?;
-    let stdout = String::from_utf8_lossy(&stdout_bytes);
-    let stderr = String::from_utf8_lossy(&stderr_bytes);
+    let stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
     let latency_ms = started.elapsed().as_millis() as i64;
     raw_output.push_str(stdout.trim());
     if !stderr.trim().is_empty() {
@@ -422,24 +481,40 @@ fn run_inner(
         raw_output.push_str("[stderr] ");
         raw_output.push_str(stderr.trim());
     }
-
     if !status.success() && stdout.trim().is_empty() && stderr.trim().is_empty() {
         return Err(format!("model exited with {status}"));
     }
+    Ok((stdout, stderr, latency_ms))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_inner(
+    slot: &ModelSlot,
+    command: &str,
+    prompt: &str,
+    repo: &str,
+    cli_home: &str,
+    timeout: Duration,
+    raw_output: &mut String,
+) -> Result<Suggestion, String> {
+    let (stdout, stderr, latency_ms) =
+        capture_cli(slot, command, prompt, repo, cli_home, timeout, raw_output)?;
 
     let raw = extract_verdict(&stdout)
         .or_else(|| extract_verdict(&stderr))
         .ok_or_else(|| cli_error(&slot.name, &stdout, &stderr))?;
-    let action = match raw.action.to_ascii_lowercase().as_str() {
-        "keep" => Action::Keep,
-        "rewrite" => Action::Rewrite,
+    let action = match raw.action.trim().to_ascii_lowercase().as_str() {
+        "keep" | "approve" => Action::Keep,
+        "rewrite" | "revise" => Action::Rewrite,
         "delete" | "remove" => Action::Delete,
+        "flag" | "concern" => Action::Flag,
         other => return Err(format!("unknown action {other:?}")),
     };
     Ok(Suggestion {
         action,
         comment: raw.comment,
         justification: raw.justification,
+        evidence: raw.evidence,
         latency_ms,
     })
 }
@@ -500,6 +575,43 @@ mod tests {
         let raw = extract_json(noisy).unwrap();
         assert_eq!(raw.action, "rewrite");
         assert_eq!(raw.comment, "Bump the counter.");
+    }
+
+    #[test]
+    fn a_code_verdict_parses_with_replacement_alias_and_evidence() {
+        let out = "{\"action\":\"revise\",\"replacement\":\"    retry(n - 1);\",\
+\"justification\":\"off by one\",\
+\"evidence\":[{\"file\":\"src/retry.rs\",\"lines\":\"10-30\",\"note\":\"caller counts from 1\"}]}";
+        let raw = extract_json(out).unwrap();
+        assert_eq!(raw.action, "revise");
+        assert_eq!(
+            raw.comment, "    retry(n - 1);",
+            "\"replacement\" must land in comment"
+        );
+        assert_eq!(raw.evidence.len(), 1);
+        assert_eq!(raw.evidence[0].file, "src/retry.rs");
+        assert_eq!(raw.evidence[0].lines, "10-30");
+    }
+
+    #[test]
+    fn evidence_objects_inside_the_verdict_do_not_confuse_the_scanner() {
+        // The balanced-object scan must return the verdict, not the first
+        // nested {...} it happens to close.
+        let out = "prose {\"action\":\"flag\",\"justification\":\"races\",\
+\"evidence\":[{\"file\":\"a.rs\"},{\"file\":\"b.rs\"}]} more prose";
+        let raw = extract_json(out).unwrap();
+        assert_eq!(raw.action, "flag");
+        assert_eq!(raw.evidence.len(), 2);
+    }
+
+    #[test]
+    fn the_schemas_stay_paired_with_the_prompts() {
+        assert!(answer_schema(false).contains("keep|rewrite|delete"));
+        assert!(answer_schema(false).contains("\"evidence\""));
+        assert!(answer_schema(true).contains("approve|revise|flag|delete"));
+        assert!(answer_schema(true).contains("\"replacement\""));
+        assert!(followup_prompt("why?", true).contains("approve|revise|flag|delete"));
+        assert!(followup_prompt("why?", false).contains("keep|rewrite|delete"));
     }
 
     #[test]
@@ -756,10 +868,10 @@ deny rule.\"}";
 
     #[test]
     fn followup_prompt_carries_the_message_and_the_format() {
-        let p = followup_prompt("  too wordy — one line?  ");
+        let p = followup_prompt("  too wordy — one line?  ", false);
         assert!(p.starts_with("too wordy — one line?"));
         assert!(p.contains("\"action\""));
-        assert!(p.trim_end().ends_with("}"));
+        assert!(p.contains("keep|rewrite|delete"));
     }
 }
 
@@ -945,7 +1057,7 @@ mod spawn_tests {
         let (res2, _) = run_model(
             &slot,
             &resume,
-            &followup_prompt("why?"),
+            &followup_prompt("why?", false),
             "",
             "",
             Duration::from_secs(30),
@@ -1123,6 +1235,7 @@ Answer with JSON only:\n\
             let second = followup_prompt(
                 "What was the value of RETRY_LIMIT you found? \
                  Put just that number in \"justification\".",
+                false,
             );
             let (res2, raw2) = run_model(&slot, &resume, &second, &repo_path, &cli_home, timeout);
             match res2 {

@@ -2,22 +2,27 @@
 
 mod agycli;
 mod app;
+mod codeunits;
 mod comments;
 mod db;
 mod diffparse;
 mod eval;
+mod findings;
 mod gitio;
 mod models;
 mod review;
+mod scopes;
 mod settings;
 #[cfg(test)]
 mod testkit;
+mod triage;
 mod ui;
+mod units;
 
 use std::path::PathBuf;
 
 const USAGE: &str = "\
-Code Review Assistant — review AI-written comments one at a time.
+Code Review Assistant — review AI-written comments and code, one unit at a time.
 
     cra                                  open the review window (default)
 
@@ -49,7 +54,7 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1480.0, 940.0])
             .with_min_inner_size([1100.0, 700.0])
-            .with_title("Code Review Assistant — comments"),
+            .with_title("Code Review Assistant"),
         ..Default::default()
     };
     eframe::run_native(

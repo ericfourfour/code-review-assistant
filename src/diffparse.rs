@@ -21,6 +21,7 @@ pub struct Hunk {
 pub struct DiffFile {
     pub path: String,
     pub hunks: Vec<Hunk>,
+    pub deleted: bool,
 }
 
 /// Decode the C-style quoting Git applies to paths containing non-ASCII or
@@ -79,6 +80,7 @@ pub fn parse(diff: &str) -> Vec<DiffFile> {
     let mut cur_hunk: Option<Hunk> = None;
     let mut old_no = 0u32;
     let mut new_no = 0u32;
+    let mut old_path: Option<String> = None;
 
     let close_hunk = |file: &mut Option<DiffFile>, hunk: &mut Option<Hunk>| {
         if let (Some(f), Some(h)) = (file.as_mut(), hunk.take()) {
@@ -95,15 +97,26 @@ pub fn parse(diff: &str) -> Vec<DiffFile> {
                 }
             }
             cur_file = None;
+            old_path = None;
+        } else if let Some(rest) = line.strip_prefix("--- ") {
+            let path = git_path(rest);
+            if path != "/dev/null" {
+                old_path = Some(path.strip_prefix("a/").unwrap_or(&path).to_string());
+            }
         } else if let Some(rest) = line.strip_prefix("+++ ") {
             let path = git_path(rest);
             if path == "/dev/null" {
-                cur_file = None;
+                cur_file = old_path.clone().map(|path| DiffFile {
+                    path,
+                    hunks: Vec::new(),
+                    deleted: true,
+                });
             } else {
                 let path = path.strip_prefix("b/").unwrap_or(&path);
                 cur_file = Some(DiffFile {
                     path: path.to_string(),
                     hunks: Vec::new(),
+                    deleted: false,
                 });
             }
         } else if line.starts_with("@@") {
@@ -216,7 +229,7 @@ index 111..222 100644
     }
 
     #[test]
-    fn skips_deleted_files() {
+    fn retains_deleted_files_with_their_old_path() {
         let diff = "\
 diff --git a/gone.rs b/gone.rs
 --- a/gone.rs
@@ -225,7 +238,10 @@ diff --git a/gone.rs b/gone.rs
 -// old
 -fn f() {}
 ";
-        assert!(parse(diff).is_empty());
+        let files = parse(diff);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "gone.rs");
+        assert!(files[0].deleted);
     }
 
     #[test]

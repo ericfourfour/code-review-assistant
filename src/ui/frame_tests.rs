@@ -174,8 +174,11 @@ fn review_hotkeys_reach_their_handlers() {
         .into_iter()
         .map(|(path, units)| crate::review::ReviewFile {
             path,
-            units,
-            line_offset: 0,
+            units: units
+                .into_iter()
+                .map(crate::units::ReviewUnit::Comment)
+                .collect(),
+            edits: Vec::new(),
             decided: 0,
         })
         .collect();
@@ -189,6 +192,7 @@ fn review_hotkeys_reach_their_handlers() {
         ref_kind: crate::review::RefKind::Branch,
         ref_name: "feature".into(),
         base_ref: "main".into(),
+        branch_base: "main".into(),
         files,
         file_idx: 0,
         unit_idx: 0,

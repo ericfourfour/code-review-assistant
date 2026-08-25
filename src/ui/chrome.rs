@@ -39,7 +39,7 @@ pub fn top_bar(app: &mut CraApp, ctx: &egui::Context) {
             match app
                 .plan
                 .as_ref()
-                .and_then(|p| p.current().map(|(f, u)| (f.path.clone(), u.start_line)))
+                .and_then(|p| p.current().map(|(f, u)| (f.path.clone(), u.start_line())))
             {
                 Some((f, l)) => crumb(ui, &format!("{f}:{l}"), app.screen == Screen::Review),
                 None => crumb(ui, "file?", false),
@@ -58,7 +58,7 @@ pub fn top_bar(app: &mut CraApp, ctx: &egui::Context) {
                 if let Some(p) = &app.plan {
                     ui.separator();
                     ui.label(theme::dim(&format!(
-                        "{}/{} comments decided",
+                        "{}/{} units decided",
                         p.decided_total,
                         p.total_units()
                     )));
@@ -112,6 +112,7 @@ pub fn hotkey_bar(app: &mut CraApp, ctx: &egui::Context) {
                         k(ui, "Esc", "files");
                     }
                     Screen::Summary => {
+                        k(ui, "G", "branch pass");
                         k(ui, "F", "files");
                         k(ui, "B", "branches/PRs");
                         k(ui, "Esc", "repos");
@@ -199,6 +200,10 @@ pub fn side_panel(app: &mut CraApp, ctx: &egui::Context) {
                 // the palette even with the name itself hidden.
                 let hidden = app.names_hidden();
                 let order = app.candidate_order();
+                let kind = app
+                    .current_unit()
+                    .map(|u| u.kind())
+                    .unwrap_or(crate::units::UnitKind::Comment);
                 for (i, slot) in app.candidate_models.iter().enumerate() {
                     let pos = order.iter().position(|&s| s == i).unwrap_or(i);
                     ui.horizontal(|ui| {
@@ -219,7 +224,11 @@ pub fn side_panel(app: &mut CraApp, ctx: &egui::Context) {
                                 ui.label(theme::dim(&format!("answered · {} ms", s.latency_ms)));
                             }
                             Some(CandidateState::Ready(s)) => {
-                                theme::badge(ui, s.action.label(), theme::action_color(s.action));
+                                theme::badge(
+                                    ui,
+                                    crate::units::action_label(s.action, kind),
+                                    theme::action_color(s.action),
+                                );
                                 ui.label(theme::dim(&format!("{} ms", s.latency_ms)));
                             }
                             Some(CandidateState::Failed(_)) => {

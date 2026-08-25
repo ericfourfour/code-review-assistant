@@ -1,10 +1,13 @@
 //! Review session state: the plan (files × comment units), edit application
 //! to the working tree, provenance tracking, and commit message assembly.
 
+use std::io::Read;
 use std::path::Path;
+use std::process::Stdio;
+use std::time::{Duration, Instant};
 
-use crate::comments::CommentUnit;
 use crate::models::Action;
+use crate::units::{ReviewUnit, UnitKind};
 
 #[derive(Clone, PartialEq)]
 pub enum RefKind {
@@ -29,10 +32,27 @@ impl RefKind {
 
 pub struct ReviewFile {
     pub path: String,
-    pub units: Vec<CommentUnit>,
-    /// Line-number shift accumulated by earlier edits in this file.
-    pub line_offset: i64,
+    pub units: Vec<ReviewUnit>,
+    /// Every edit applied to this file so far, as (original start line,
+    /// line-count delta). Kept per edit rather than as one running total so
+    /// the walk may visit units in any order — riskiest first included — and
+    /// still land each edit exactly where it belongs: only edits *above* a
+    /// unit shift it.
+    pub edits: Vec<(u32, i64)>,
     pub decided: usize,
+}
+
+impl ReviewFile {
+    /// How far the given (original) line has drifted on disk: the sum of the
+    /// deltas of every applied edit that started above it. Units are
+    /// disjoint, so comparing original start lines is exact.
+    pub fn offset_for(&self, start_line: u32) -> i64 {
+        self.edits
+            .iter()
+            .filter(|(at, _)| *at < start_line)
+            .map(|(_, d)| d)
+            .sum()
+    }
 }
 
 pub struct ReviewPlan {
@@ -40,6 +60,9 @@ pub struct ReviewPlan {
     pub ref_kind: RefKind,
     pub ref_name: String,
     pub base_ref: String,
+    /// Exact diff base captured when the plan opened. Unlike the display
+    /// label `HEAD`, this cannot move when review decisions create commits.
+    pub branch_base: String,
     pub files: Vec<ReviewFile>,
     pub file_idx: usize,
     pub unit_idx: usize,
@@ -58,7 +81,7 @@ impl ReviewPlan {
         self.files.iter().map(|f| f.units.len()).sum()
     }
 
-    pub fn current(&self) -> Option<(&ReviewFile, &CommentUnit)> {
+    pub fn current(&self) -> Option<(&ReviewFile, &ReviewUnit)> {
         let f = self.files.get(self.file_idx)?;
         let u = f.units.get(self.unit_idx)?;
         Some((f, u))
@@ -221,49 +244,126 @@ pub fn final_action(editor_text: &str, original_text: &str) -> Action {
 pub fn apply_edit(
     repo: &str,
     file: &ReviewFile,
-    unit: &CommentUnit,
+    unit: &ReviewUnit,
     new_lines: &[String],
 ) -> Result<i64, String> {
-    let path = Path::new(repo).join(&unit.file);
+    let offset = file.offset_for(unit.start_line());
+    let start = (unit.start_line() as i64 - 1 + offset).max(0) as usize;
+    splice_lines(repo, unit.file(), start, unit.raw_lines(), new_lines)
+}
+
+/// Swap `expect` for `replace` at `start0` (0-based), refusing to touch the
+/// file unless it still contains exactly `expect` there. The same primitive
+/// applies an edit and — with the arguments swapped — reverts one that a
+/// failed validation should not leave behind.
+pub fn splice_lines(
+    repo: &str,
+    file_rel: &str,
+    start0: usize,
+    expect: &[String],
+    replace: &[String],
+) -> Result<i64, String> {
+    let path = Path::new(repo).join(file_rel);
     let content =
         std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let had_trailing_newline = content.ends_with('\n');
     let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
 
-    let start = (unit.start_line as i64 - 1 + file.line_offset).max(0) as usize;
-    let end = (unit.end_line as i64 - 1 + file.line_offset).max(0) as usize; // inclusive
-    if end >= lines.len() {
+    let end = start0 + expect.len().saturating_sub(1); // inclusive
+    if expect.is_empty() || end >= lines.len() {
         return Err(format!(
-            "line range {}..{} out of bounds for {} ({} lines) — file changed on disk?",
-            start + 1,
+            "line range {}..{} out of bounds for {file_rel} ({} lines) — file changed on disk?",
+            start0 + 1,
             end + 1,
-            unit.file,
             lines.len()
         ));
     }
     // Sanity check: the file should still contain what we think it does.
-    let on_disk: Vec<&String> = lines[start..=end].iter().collect();
-    let matches = on_disk.len() == unit.raw_lines.len()
-        && on_disk
-            .iter()
-            .zip(&unit.raw_lines)
-            .all(|(a, b)| a.as_str() == b.as_str());
+    let matches = lines[start0..=end].iter().zip(expect).all(|(a, b)| a == b);
     if !matches {
         return Err(format!(
-            "content mismatch at {}:{} — file changed on disk since the diff was taken",
-            unit.file,
-            start + 1
+            "content mismatch at {file_rel}:{} — file changed on disk since the diff was taken",
+            start0 + 1
         ));
     }
 
-    let old_len = end - start + 1;
-    lines.splice(start..=end, new_lines.iter().cloned());
+    lines.splice(start0..=end, replace.iter().cloned());
     let mut out = lines.join("\n");
     if had_trailing_newline {
         out.push('\n');
     }
     std::fs::write(&path, out).map_err(|e| format!("write {}: {e}", path.display()))?;
-    Ok(new_lines.len() as i64 - old_len as i64)
+    Ok(replace.len() as i64 - expect.len() as i64)
+}
+
+/// Run the configured validation command in the repository, whitespace-
+/// tokenized like a model template — no shell. Ok means exit 0 in time;
+/// anything else returns the tail of what the command printed, which is
+/// where compilers and test runners put the part worth reading.
+pub fn run_check(repo: &str, command: &str, timeout: Duration) -> Result<(), String> {
+    let argv: Vec<&str> = command.split_whitespace().collect();
+    let Some(program) = argv.first() else {
+        return Err("empty check command".into());
+    };
+    let started = Instant::now();
+    let mut child = crate::gitio::hidden_command(program)
+        .args(&argv[1..])
+        .current_dir(repo)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn `{program}`: {e}"))?;
+    let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
+    let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
+    let stdout_thread = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut bytes);
+        bytes
+    });
+    let stderr_thread = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut bytes);
+        bytes
+    });
+
+    let deadline = started + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() > deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("check timed out after {}s", timeout.as_secs()));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => return Err(format!("wait: {e}")),
+        }
+    };
+    let stdout = stdout_thread
+        .join()
+        .map_err(|_| "validation stdout reader panicked".to_string())?;
+    let stderr = stderr_thread
+        .join()
+        .map_err(|_| "validation stderr reader panicked".to_string())?;
+    if status.success() {
+        return Ok(());
+    }
+    let mut text = String::from_utf8_lossy(&stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&stderr);
+    if !stderr.trim().is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(stderr.trim());
+    }
+    let tail: String = {
+        let chars: Vec<char> = text.chars().collect();
+        chars[chars.len().saturating_sub(600)..].iter().collect()
+    };
+    Err(format!("`{command}` failed: {}", tail.trim()))
 }
 
 /// One decision that has changed the working tree but is not committed yet.
@@ -274,6 +374,7 @@ pub fn apply_edit(
 pub struct PendingDecision {
     pub file: String,
     pub line: u32,
+    pub kind: UnitKind,
     pub action: Action,
     pub provenance: Provenance,
     pub justification: Option<String>,
@@ -282,11 +383,26 @@ pub struct PendingDecision {
     pub model_info: Option<(String, String)>,
 }
 
-fn action_verb(action: Action) -> &'static str {
-    match action {
-        Action::Keep => "keep",
-        Action::Rewrite => "rewrite",
-        Action::Delete => "delete",
+/// The verb for a commit subject, phrased for what was actually reviewed:
+/// comments are rewritten, code is revised.
+fn action_verb(kind: UnitKind, action: Action) -> &'static str {
+    match (kind, action) {
+        (_, Action::Keep) => "keep",
+        (UnitKind::Comment, Action::Rewrite) => "rewrite",
+        (UnitKind::Code, Action::Rewrite) => "revise",
+        (_, Action::Delete) => "delete",
+        (_, Action::Flag) => "flag",
+    }
+}
+
+/// `review(comments)` / `review(code)` / plain `review` for a mixed batch.
+fn subject_scope(kinds: &[UnitKind]) -> &'static str {
+    let any_comment = kinds.contains(&UnitKind::Comment);
+    let any_code = kinds.contains(&UnitKind::Code);
+    match (any_comment, any_code) {
+        (true, false) => "review(comments)",
+        (false, true) => "review(code)",
+        _ => "review",
     }
 }
 
@@ -319,11 +435,17 @@ pub fn commit_message_batch(entries: &[PendingDecision]) -> String {
         !entries.is_empty(),
         "commit_message_batch needs at least one decision"
     );
+    let kinds: Vec<UnitKind> = entries.iter().map(|e| e.kind).collect();
     if entries.len() == 1 {
         let e = &entries[0];
+        let what = match e.kind {
+            UnitKind::Comment => " comment in",
+            UnitKind::Code => " code in",
+        };
         let mut msg = format!(
-            "review(comments): {} comment in {}:{}\n\n",
-            action_verb(e.action),
+            "{}: {}{what} {}:{}\n\n",
+            subject_scope(&kinds),
+            action_verb(e.kind, e.action),
             e.file,
             e.line
         );
@@ -333,10 +455,11 @@ pub fn commit_message_batch(entries: &[PendingDecision]) -> String {
             }
         }
         msg.push_str("Reviewed-with: code-review-assistant\n");
-        msg.push_str(&format!(
-            "Comment-provenance: {}\n",
-            e.provenance.source_str()
-        ));
+        let trailer = match e.kind {
+            UnitKind::Comment => "Comment-provenance",
+            UnitKind::Code => "Change-provenance",
+        };
+        msg.push_str(&format!("{trailer}: {}\n", e.provenance.source_str()));
         push_model_trailers(
             &mut msg,
             &e.provenance,
@@ -348,12 +471,21 @@ pub fn commit_message_batch(entries: &[PendingDecision]) -> String {
     }
 
     let file = &entries[0].file;
+    let noun = match subject_scope(&kinds) {
+        "review(comments)" => "comment decisions",
+        _ => "decisions",
+    };
     let mut msg = format!(
-        "review(comments): {} comment decisions in {file}\n\n",
+        "{}: {} {noun} in {file}\n\n",
+        subject_scope(&kinds),
         entries.len()
     );
     for e in entries {
-        msg.push_str(&format!("- {} {file}:{}", action_verb(e.action), e.line));
+        msg.push_str(&format!(
+            "- {} {file}:{}",
+            action_verb(e.kind, e.action),
+            e.line
+        ));
         let mut detail: Vec<String> = vec![e.provenance.source_str()];
         if let Some((model, _)) = &e.model_info {
             if !model.trim().is_empty() {
@@ -404,7 +536,7 @@ pub fn commit_message_batch(entries: &[PendingDecision]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::comments::CommentStyle;
+    use crate::comments::{CommentStyle, CommentUnit};
 
     fn unit() -> CommentUnit {
         CommentUnit {
@@ -483,6 +615,7 @@ mod tests {
         PendingDecision {
             file: file.into(),
             line,
+            kind: UnitKind::Comment,
             action,
             provenance: Provenance::Model {
                 name: "claude".into(),
@@ -516,6 +649,7 @@ mod tests {
         let entry = PendingDecision {
             file: "src/lib.rs".into(),
             line: 2,
+            kind: UnitKind::Comment,
             action: Action::Rewrite,
             provenance: Provenance::Model {
                 name: "agy".into(),
@@ -544,6 +678,7 @@ mod tests {
         let entries = vec![PendingDecision {
             file: "src/lib.rs".into(),
             line: 2,
+            kind: UnitKind::Comment,
             action: Action::Delete,
             provenance: Provenance::Human,
             justification: None,
@@ -588,13 +723,14 @@ mod tests {
         let file = ReviewFile {
             path: "src/lib.rs".into(),
             units: vec![],
-            line_offset: 0,
+            edits: Vec::new(),
             decided: 0,
         };
+        let wrapped = ReviewUnit::Comment(unit());
         let delta = apply_edit(
             dir.to_str().unwrap(),
             &file,
-            &unit(),
+            &wrapped,
             &["    // merged".to_string()],
         )
         .unwrap();
@@ -602,8 +738,145 @@ mod tests {
         let out = std::fs::read_to_string(dir.join("src/lib.rs")).unwrap();
         assert_eq!(out, "fn main() {\n    // merged\n    x();\n}\n");
         // mismatch is detected after the file changed
-        let err = apply_edit(dir.to_str().unwrap(), &file, &unit(), &[]).unwrap_err();
+        let err = apply_edit(dir.to_str().unwrap(), &file, &wrapped, &[]).unwrap_err();
         assert!(err.contains("mismatch") || err.contains("out of bounds"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn offsets_only_count_edits_above_the_unit() {
+        let mut f = ReviewFile {
+            path: "a".into(),
+            units: vec![],
+            edits: Vec::new(),
+            decided: 0,
+        };
+        f.edits.push((50, 3));
+        assert_eq!(
+            f.offset_for(10),
+            0,
+            "an edit below must not shift a unit above it"
+        );
+        assert_eq!(f.offset_for(60), 3);
+        f.edits.push((5, -2));
+        assert_eq!(f.offset_for(10), -2);
+        assert_eq!(f.offset_for(60), 1, "deltas above accumulate");
+        assert_eq!(
+            f.offset_for(5),
+            0,
+            "an edit at the unit's own line is that unit's own"
+        );
+    }
+
+    #[test]
+    fn splice_lines_reverts_what_it_applied() {
+        let dir = crate::testkit::TempDir::new("revert");
+        std::fs::write(dir.path().join("a.rs"), "one\ntwo\nthree\n").unwrap();
+        let repo = dir.path().to_string_lossy().to_string();
+        let old = vec!["two".to_string()];
+        let new = vec!["2a".to_string(), "2b".to_string()];
+        assert_eq!(splice_lines(&repo, "a.rs", 1, &old, &new).unwrap(), 1);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.rs")).unwrap(),
+            "one\n2a\n2b\nthree\n"
+        );
+        // The exact inverse call restores the file byte for byte.
+        assert_eq!(splice_lines(&repo, "a.rs", 1, &new, &old).unwrap(), -1);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.rs")).unwrap(),
+            "one\ntwo\nthree\n"
+        );
+    }
+
+    #[test]
+    fn a_single_code_decision_reads_as_a_code_review_commit() {
+        let mut e = pending("src/lib.rs", 42, Action::Rewrite, "off by one");
+        e.kind = UnitKind::Code;
+        let msg = commit_message_batch(&[e]);
+        assert!(
+            msg.starts_with("review(code): revise code in src/lib.rs:42"),
+            "{msg}"
+        );
+        assert!(msg.contains("Change-provenance: claude"), "{msg}");
+        assert!(!msg.contains("Comment-provenance"), "{msg}");
+    }
+
+    #[test]
+    fn a_mixed_batch_says_review_and_uses_each_kinds_verb() {
+        let mut code = pending("src/lib.rs", 9, Action::Rewrite, "simpler");
+        code.kind = UnitKind::Code;
+        let msg = commit_message_batch(&[
+            pending("src/lib.rs", 2, Action::Delete, "restates the code"),
+            code,
+        ]);
+        assert!(
+            msg.starts_with("review: 2 decisions in src/lib.rs"),
+            "{msg}"
+        );
+        assert!(msg.contains("delete src/lib.rs:2"), "{msg}");
+        assert!(msg.contains("revise src/lib.rs:9"), "{msg}");
+    }
+
+    #[test]
+    fn run_check_passes_and_fails_with_the_commands_own_words() {
+        use crate::testkit::{FakeCli, FakeCliSpec, TempDir};
+        let dir = TempDir::new("check");
+        let repo = dir.path().to_string_lossy().to_string();
+        let timeout = Duration::from_secs(10);
+
+        let ok = FakeCli::new(
+            &dir,
+            "check-ok",
+            FakeCliSpec {
+                reply: "all good",
+                ..Default::default()
+            },
+        );
+        assert!(run_check(&repo, &ok.command(), timeout).is_ok());
+
+        let bad = FakeCli::new(
+            &dir,
+            "check-bad",
+            FakeCliSpec {
+                reply: "error[E0308]: mismatched types",
+                exit_code: 2,
+                ..Default::default()
+            },
+        );
+        let err = run_check(&repo, &bad.command(), timeout).unwrap_err();
+        // The command's own output is the error the reviewer sees.
+        assert!(err.contains("mismatched types"), "{err}");
+        assert!(err.contains("failed"), "{err}");
+
+        assert!(
+            run_check(&repo, "definitely-not-a-real-binary-xyz", timeout)
+                .unwrap_err()
+                .contains("spawn")
+        );
+        assert!(run_check(&repo, "   ", timeout)
+            .unwrap_err()
+            .contains("empty"));
+    }
+
+    #[test]
+    fn run_check_drains_verbose_output_before_waiting_for_exit() {
+        use crate::testkit::{FakeCli, FakeCliSpec, TempDir};
+
+        let dir = TempDir::new("check-output");
+        let verbose = "x".repeat(256 * 1024);
+        let check = FakeCli::new(
+            &dir,
+            "verbose",
+            FakeCliSpec {
+                reply: &verbose,
+                ..Default::default()
+            },
+        );
+        assert!(run_check(
+            &dir.path().to_string_lossy(),
+            &check.command(),
+            Duration::from_secs(10)
+        )
+        .is_ok());
     }
 }
