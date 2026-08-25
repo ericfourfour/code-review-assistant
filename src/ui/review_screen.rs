@@ -690,7 +690,9 @@ impl CraApp {
                     ui.label(RichText::new(format!("“{}”", ev.note.trim())).italics());
                     ui.separator();
                 }
-                let Some(repo) = self.repo.as_ref().map(|r| r.path.clone()) else {
+                // The tree the model actually read, which for a branch or PR
+                // review is the isolated worktree, not the reviewer's checkout.
+                let Some(repo) = self.work_dir() else {
                     ui.label(theme::dim("no repository open"));
                     return;
                 };

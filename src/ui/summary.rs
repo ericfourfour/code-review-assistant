@@ -1,6 +1,6 @@
 use egui::{Key, Modifiers, RichText};
 
-use crate::app::{WholeBranchReviewState, CraApp, Screen};
+use crate::app::{CraApp, PublishState, Screen, WholeBranchReviewState};
 use crate::ui::theme;
 
 impl CraApp {
@@ -25,6 +25,20 @@ impl CraApp {
                 self.open_followup();
                 return;
             }
+            // Both routes move the same commits, so the keys are as guarded as
+            // the buttons: nothing to publish, or one already in flight, and
+            // the key does nothing rather than starting a second attempt.
+            let deliverable =
+                self.delivery.as_ref().is_some_and(|d| d.can_push()) && !self.publish.running();
+            if deliverable {
+                if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::P)) {
+                    self.start_push();
+                }
+                let stackable = self.plan.as_ref().is_some_and(|p| !p.reviews_uncommitted());
+                if stackable && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::S)) {
+                    self.start_stacked_pr();
+                }
+            }
         }
 
         // An early exit opens this screen too (End session on the review screen), and
@@ -38,6 +52,15 @@ impl CraApp {
                 "the session was ended early — undecided units resume from the file picker [F]",
             ));
         }
+        // Reopened rather than reviewed: every unit was decided in an earlier
+        // session, so this screen is here for the commits, not the verdicts.
+        if self.plan.as_ref().is_some_and(|p| p.nothing_left()) {
+            ui.label(theme::dim(
+                "nothing left to decide here — this is the earlier session, reopened so its \
+                 commits can be delivered. Untick \"skip decided\" in settings to judge the \
+                 units again.",
+            ));
+        }
         ui.add_space(6.0);
         if let Some(p) = &self.plan {
             let (decided, committed) = self.db.decision_counts(p.session_id);
@@ -49,7 +72,7 @@ impl CraApp {
                 ui.label(RichText::new(&p.base_ref).monospace());
                 ui.end_row();
                 ui.label(theme::dim("units reviewed"));
-                ui.label(RichText::new(format!("{decided} / {}", p.total_units())).monospace());
+                ui.label(RichText::new(format!("{decided} / {}", p.reported_units())).monospace());
                 ui.end_row();
                 ui.label(theme::dim("commits made"));
                 ui.label(RichText::new(committed.to_string()).monospace());
@@ -112,11 +135,263 @@ impl CraApp {
 
         let recheck = self.plan.as_ref().is_some_and(|p| p.is_recheck());
         if self.plan.is_some() && !recheck {
+            // Above the whole-branch review, because that section ends in a
+            // scroll area that takes the rest of the window — anything after
+            // it would be off the bottom of the screen.
+            ui.add_space(10.0);
+            ui.separator();
+            self.publish_section(ui);
             ui.add_space(10.0);
             ui.separator();
             self.whole_branch_review_section(ctx, ui);
         }
         self.evidence_window(ctx);
+    }
+
+    /// Where the review's commits go once the reviewing is over.
+    ///
+    /// The fixes were committed in a worktree nobody else can see, on a branch
+    /// that may not even be checked out anywhere the reviewer would look. Both
+    /// routes out are offered together because choosing between them is a
+    /// question about the branch rather than about git: push when the fixes
+    /// belong on the branch that was reviewed, stack when they should be
+    /// proposed back to whoever owns it.
+    fn publish_section(&mut self, ui: &mut egui::Ui) {
+        // Read out of the state rather than holding a borrow of it: the
+        // buttons below need `self` back, and `unpushed` is as long as the
+        // branch is — nothing here should be cloning it every repaint.
+        let Some(d) = self.delivery.as_ref() else { return };
+        let (branch, remote, upstream) = (d.branch.clone(), d.remote.clone(), d.upstream.clone());
+        let (ahead, behind, dirty) = (d.ahead(), d.behind, d.dirty);
+        let deliverable = d.can_push();
+        // Where the commits being published actually are, when that is not
+        // this checkout — a detached review whose commits have since been
+        // rescued onto a branch of their own.
+        let elsewhere = (d.tip != "HEAD").then(|| {
+            d.tip_branch
+                .clone()
+                .unwrap_or_else(|| format!("commit {}", &d.tip[..8.min(d.tip.len())]))
+        });
+        let Some(plan) = self.plan.as_ref() else { return };
+        let ref_name = plan.ref_name.clone();
+        let what = plan.ref_kind.label();
+        // A stacked pull request needs a committed branch to sit on top of. A
+        // working-tree review has none: its commits *are* the branch tip.
+        let stackable = !plan.reviews_uncommitted();
+        let base = self.stack.base.clone();
+        let restore_blocker = self.restore_blocker();
+        let running = self.publish.running();
+        let target = match (&upstream, &remote) {
+            (Some(u), _) => u.clone(),
+            (None, Some(r)) => format!("{r}/{ref_name} (new)"),
+            (None, None) => "nowhere — this repository has no remote".to_string(),
+        };
+
+        theme::section_title(ui, "DELIVER — PUSH, OR STACK A PULL REQUEST");
+
+        // A finished publish moved the very commits the controls describe, and
+        // after a stacked one the worktree is on a different branch entirely.
+        // Re-offering the buttons over that would invite a second publish that
+        // undoes the first, so the outcome stands alone until it is dismissed.
+        if let PublishState::Done(outcome) = &self.publish {
+            ui.colored_label(theme::GOOD, format!("✔ {}", outcome.headline));
+            if let Some(url) = &outcome.url {
+                ui.hyperlink_to(RichText::new(url).monospace(), url);
+            }
+            for line in &outcome.detail {
+                ui.label(theme::dim(line));
+            }
+            ui.add_space(4.0);
+            if ui
+                .button("↻ Publish again")
+                .on_hover_text("re-reads where the commits stand and offers both routes again")
+                .clicked()
+            {
+                self.publish = PublishState::Idle;
+                self.refresh_delivery();
+            }
+            return;
+        }
+
+        // What is actually here, before either button claims it can move it.
+        ui.horizontal_wrapped(|ui| {
+            let from = match &elsewhere {
+                Some(where_) => where_.clone(),
+                None => branch.clone().unwrap_or_else(|| "HEAD (detached)".into()),
+            };
+            ui.label(RichText::new(from).monospace());
+            ui.label(theme::dim("→"));
+            ui.label(RichText::new(target).monospace().color(theme::ACCENT));
+            ui.separator();
+            ui.label(
+                RichText::new(format!("{ahead} commit(s) to publish"))
+                    .color(if ahead == 0 { theme::TEXT_DIM } else { theme::GOOD }),
+            );
+            if behind > 0 {
+                ui.separator();
+                ui.colored_label(theme::WARN, format!("{behind} behind"));
+            }
+            if dirty {
+                ui.separator();
+                ui.colored_label(theme::WARN, "uncommitted edits — not published by either route");
+            }
+        });
+        if let Some(where_) = &elsewhere {
+            // The case that used to read "1 commit made · 0 to publish": the
+            // session's commits are not on this checkout at all.
+            ui.label(theme::dim(&format!(
+                "this session's commits are not on this checkout — they are on {where_}, saved \
+                 there when the worktree was re-pointed. They are what gets published."
+            )));
+        } else if branch.is_none() {
+            ui.label(theme::dim(&format!(
+                "the review ran detached because {ref_name} was checked out elsewhere — the \
+                 commits are real and can still be published under that name"
+            )));
+        }
+        ui.add_space(6.0);
+
+        // -- push ---------------------------------------------------------
+        let can_push = deliverable && behind == 0 && !running;
+        ui.horizontal_wrapped(|ui| {
+            let where_to = match &remote {
+                Some(r) => format!("{r}/{ref_name}"),
+                None => ref_name.clone(),
+            };
+            if ui
+                .add_enabled(
+                    can_push,
+                    egui::Button::new(
+                        RichText::new(format!("⬆ Push {ahead} commit(s) to {where_to} [P]"))
+                            .strong(),
+                    ),
+                )
+                .on_hover_text(format!(
+                    "the fixes land on the {what} itself — for your own branch, or one you have \
+                     write access to and agreed to fix directly"
+                ))
+                .clicked()
+            {
+                self.start_push();
+            }
+            if !can_push {
+                ui.label(theme::dim(if running {
+                    "waiting for the one in flight to finish"
+                } else if remote.is_none() {
+                    "no remote configured"
+                } else if ahead == 0 {
+                    "the remote already has every commit here"
+                } else {
+                    "the remote branch has moved — pull it in, or stack instead"
+                }));
+            }
+        });
+
+        // -- stack ---------------------------------------------------------
+        if stackable {
+            ui.add_space(4.0);
+            egui::CollapsingHeader::new(RichText::new("⎇ Stacked pull request").strong())
+                .id_salt("stacked_pr")
+                // Open by default exactly when it is the better route: a push
+                // that would be refused leaves this as the only way out.
+                .default_open(behind > 0)
+                .show(ui, |ui| {
+                    ui.label(theme::dim(&format!(
+                        "puts the fixes on a branch of their own and opens a pull request into \
+                         {base}, so whoever owns the {what} reviews the reviewer. Needs `gh`."
+                    )));
+                    ui.add_space(4.0);
+                    egui::Grid::new("stack_form").num_columns(2).spacing([10.0, 4.0]).show(
+                        ui,
+                        |ui| {
+                            ui.label(theme::dim("branch"));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.stack.branch)
+                                    .desired_width(320.0)
+                                    .font(egui::TextStyle::Monospace),
+                            );
+                            ui.end_row();
+                            ui.label(theme::dim("into"));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.stack.base)
+                                    .desired_width(320.0)
+                                    .font(egui::TextStyle::Monospace),
+                            )
+                            .on_hover_text(
+                                "the branch the pull request targets — the reviewed branch by \
+                                 default, so the stack is a real stack",
+                            );
+                            ui.end_row();
+                            ui.label(theme::dim("title"));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.stack.title)
+                                    .desired_width(420.0),
+                            );
+                            ui.end_row();
+                            ui.label(theme::dim("body"));
+                            ui.add(
+                                egui::TextEdit::multiline(&mut self.stack.body)
+                                    .desired_width(420.0)
+                                    .desired_rows(3),
+                            );
+                            ui.end_row();
+                        },
+                    );
+
+                    // Without this the fixes stay on the reviewed branch as
+                    // well, and the next push of that branch quietly swallows
+                    // the pull request just opened for them.
+                    match &restore_blocker {
+                        None => {
+                            ui.checkbox(
+                                &mut self.stack.restore,
+                                format!(
+                                    "put {ref_name} back at {} afterwards",
+                                    upstream.as_deref().unwrap_or_default()
+                                ),
+                            )
+                            .on_hover_text(
+                                "the fixes then live on the new branch only, so the reviewed \
+                                 branch matches the remote again and cannot swallow the pull \
+                                 request",
+                            );
+                        }
+                        Some(why) => {
+                            ui.label(theme::dim(&format!("{ref_name} is left as it is: {why}")));
+                        }
+                    }
+                    ui.add_space(4.0);
+                    if ui
+                        .add_enabled(
+                            deliverable && !running,
+                            egui::Button::new(
+                                RichText::new(format!("⎇ Open pull request into {base} [S]"))
+                                    .strong(),
+                            ),
+                        )
+                        .clicked()
+                    {
+                        self.start_stacked_pr();
+                    }
+                });
+        }
+
+        // -- what happened --------------------------------------------------
+        match &self.publish {
+            PublishState::Running(stage) => {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(theme::dim(stage));
+                });
+            }
+            PublishState::Failed(e) => {
+                ui.add_space(6.0);
+                ui.colored_label(theme::BAD, format!("✕ {e}"));
+            }
+            // Handled above, before anything that could start a second one.
+            PublishState::Idle | PublishState::Done(_) => {}
+        }
     }
 
     /// The whole-branch review finds interactions that isolated unit reviews

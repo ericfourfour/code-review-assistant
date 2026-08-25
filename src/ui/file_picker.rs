@@ -95,6 +95,12 @@ impl CraApp {
                 "{n} more unit(s) already decided in this repository and left out"
             )));
         }
+        // How HEAD got here, when it was not the obvious way — a branch held
+        // by another worktree is reviewed detached, and a detached HEAD is
+        // surprising enough to say out loud rather than let the reviewer find.
+        if let Some(note) = self.ref_note.clone() {
+            ui.label(RichText::new(note).small().color(theme::WARN));
+        }
         ui.add_space(4.0);
 
         if let Some(plan) = &self.plan {

@@ -22,7 +22,7 @@ file stay disjoint and ordered so sequential edits are applied exactly where the
 ## Flow
 
 ```
-Pick Repository  →  Pick Branch / PR (or working tree / staged)  →  Start or Pick File  →  Review
+Pick Repository → Pick Branch / PR (or working tree / staged) → Start or Pick File → Review → Deliver
 ```
 
 1. **Pick repository** — recent repos are remembered; add any path. The picker also discovers
@@ -32,8 +32,11 @@ Pick Repository  →  Pick Branch / PR (or working tree / staged)  →  Start or
    Repositories inactive past a configurable cutoff are hidden, and any repository can be
    excluded from the list — both editable in settings.
 2. **Pick branch / PR** — local branches (via `git`) or open PRs (via your authenticated `gh`
-   CLI). Selecting one checks it out and diffs it against its base (`base...HEAD`). You can
-   also review uncommitted working-tree changes.
+   CLI). Selecting one diffs it against its base (`base...HEAD`). Unless you are already
+   standing on it, the review runs in an **isolated worktree** rather than moving your own
+   checkout: a dirty tree no longer blocks a PR review, a branch checked out somewhere else
+   is still reviewable, and you come back to the commit you left. You can also review
+   uncommitted working-tree or staged changes, which happen in your checkout by definition.
 3. **Start or pick file** — every file with reviewable units is listed with comment and code
    counts; start from the top or jump to a file.
 4. **Review** — one unit at a time:
@@ -47,6 +50,9 @@ Pick Repository  →  Pick Branch / PR (or working tree / staged)  →  Start or
      whether it also commits that file with provenance metadata, and retitles the button
      **Save and Continue** or **Commit and Continue** to match;
    - progress bars track the current file and the whole branch.
+5. **Deliver** — the summary screen takes the fix commits out of the review worktree: push
+   them onto the branch you reviewed, or stack them as a pull request of their own targeting
+   it. See [Delivering the review](#delivering-the-review-push-or-stack-a-pull-request).
 
 ## Semantic units and hunk units
 
@@ -359,6 +365,99 @@ to the model that raised them.
 If you edit a picked suggestion, provenance becomes `<model>+human-edited` (co-author kept);
 if you write the comment yourself, it's `human-authored` with no co-author trailer.
 
+## Delivering the review: push, or stack a pull request
+
+Those commits were made in a worktree nobody else can see, on a branch that may not be
+checked out anywhere you'd think to look. The summary screen's **DELIVER** section is how
+they get out. It opens by reading where they actually stand — the branch, the remote it
+belongs to, how many commits are unpushed, whether the remote has moved underneath you, and
+whether uncommitted edits are still lying around (neither route publishes those):
+
+```
+feature  →  origin/feature  ·  3 commit(s) to publish
+```
+
+**Push [P]** puts the fixes on the branch that was reviewed. That's the right route for your
+own branch, or a PR you have write access to and agreed to fix directly. It pushes
+`HEAD:refs/heads/<branch>`, so a review that ran detached — which is what happens when the
+branch was already checked out somewhere else — publishes its commits just the same. If the
+remote branch has moved, the push is refused before it's attempted, with the alternative
+named rather than git's wall of text.
+
+**Stacked pull request [S]** is the route for someone else's PR, a protected branch, or
+changes big enough to deserve their own discussion. It puts the fixes on a branch of their
+own, pushes it, and opens a PR **targeting the branch you reviewed** — so whoever owns it
+reviews the reviewer. Branch name, target, title and body are all pre-filled from the session
+and all editable; the body goes to `gh` as a file, so it can be as long and as multi-line as
+you like. The target is editable because it isn't always derivable — a branch rescued off a
+detached review (below) has no upstream to name what it was built from.
+
+The checkbox under the form is what makes a stack a stack:
+
+> ☑ put `feature` back at `origin/feature` afterwards
+
+Without it the fixes sit on the reviewed branch *as well*, and the next push of that branch
+quietly swallows the pull request just opened for them. It's offered only when rewinding is
+provably safe — the review is on the branch (not detached), the branch has a remote position
+to return to, the worktree is clean, and **every** unpushed commit is one this session made,
+checked against the shas in the database. Anything less certain and the branch is left
+exactly as it is, with the reason shown. Even then the rewind happens only *after* the fixes
+are pushed, so nothing is ever the only copy.
+
+A finished publish replaces both buttons with what it did — the pull request URL, the branch
+created, the branch put back — rather than leaving an armed Push button over commits that
+have already moved. **Publish again** re-reads the state and offers both routes back.
+
+Neither route appears for a re-check (it writes nothing), and stacking needs a committed
+branch to sit on top of, so a working-tree or staged review is offered the push only.
+
+### Reopening a finished review
+
+Selecting a ref whose every unit is already decided doesn't stop at the picker — that is what
+a *finished* review looks like, and its commits may still be waiting to go out. It opens the
+summary instead, on the session those commits were made in (which is what lets the restore
+check prove they're yours), with the units it skipped reported as reviewed and a line saying
+why there's nothing left to judge. Untick **skip decided** in settings to judge them again.
+
+### Commits are never left on no branch
+
+A branch review commits onto the branch, which keeps the commits. A review that ran
+**detached** — what a branch already checked out elsewhere gets — has no branch to commit
+onto, and re-pointing the worktree for the next review used to leave its fixes reachable only
+through the reflog, where they expire. Nothing said so, and nothing could get them back.
+
+Now, before any checkout that would move off them, such commits are put on a branch of their
+own and the branch is named in the ref-picker note:
+
+> The last review left 1 commit(s) here on no branch; they were saved to `review/codex/cd-fixes`
+> before this checkout, and can be pushed or stacked from its summary screen.
+
+The name is the one the stacked-pull-request flow would have chosen, so stacking them later
+finds the branch already holding exactly those commits and reuses it rather than colliding.
+They're saved rather than refused because refusing would deadlock: the summary screen is
+where they get published, and reaching it means selecting a ref, which means coming through
+the same checkout.
+
+Selecting a rescued branch delivers it like any other. Its *name* belongs to no session, so
+the session is found by the commits themselves — the database knows which session made each
+commit — which is also what lets the restore check recognise them as yours.
+
+You don't have to go and find it, either. DELIVER reports on **the session's commits, not on
+whatever is checked out**. Reopening the PR whose review made them shows them even though
+HEAD has moved back to the remote's position, names the branch they were saved to, and
+pushes from there:
+
+```
+review/codex/cd-fixes  →  origin/codex/cd  ·  1 commit(s) to publish
+this session's commits are not on this checkout — they are on review/codex/cd-fixes,
+saved there when the worktree was re-pointed. They are what gets published.
+```
+
+Measuring HEAD instead is what produced the contradiction this replaced: `commits made 1`
+directly above `0 commit(s) to publish`. Commits already on the checkout — every ordinary
+review — take the old path unchanged, and a commit the reflog has since dropped is skipped
+rather than asked about.
+
 ## Evaluation: which model you actually listen to
 
 Every review is a blind side-by-side test that already happened. Choosing one model's
@@ -434,7 +533,7 @@ Every action has one; the bottom bar always shows what's live. Highlights:
 | Files | `Enter` start at file · `S` start full review |
 | Review | `1/2/3` pick candidate · `K` keep/approve · `D` delete · `E` edit · `C` note for follow-up · `R` re-run models · `P` prev · `N` skip |
 | Continue | `Ctrl+S` save + continue · `Ctrl+Enter` commit + continue |
-| Summary | `G` run whole-branch review · `N` follow-up notes · `F` files · `B` branches/PRs |
+| Summary | `G` run whole-branch review · `P` push · `S` stacked PR · `N` follow-up notes · `F` files · `B` branches/PRs |
 | Evaluation | `B` blinded decisions only · `R` refresh |
 
 ## Build & run
@@ -443,8 +542,18 @@ Every action has one; the bottom bar always shows what's live. Highlights:
 cargo run --release
 ```
 
-Requires `git` on PATH; `gh` (authenticated) for the PR picker; and whichever model CLIs you
-configure. `cargo test` runs the unit tests (diff parsing, comment and code-unit extraction,
+Requires `git` on PATH; `gh` (authenticated) for the PR picker and for opening a stacked pull
+request; and whichever model CLIs you configure.
+
+Review worktrees live under the app's data directory (`%APPDATA%\code-review-assistant\worktrees`
+on Windows, `~/.local/share/code-review-assistant/worktrees` elsewhere), one per repository and
+reused between reviews; `CRA_WORKTREES` moves that root. Edits and fix commits made during a
+review land there, on the branch under review — the summary screen's
+[DELIVER](#delivering-the-review-push-or-stack-a-pull-request) section is how they leave it. To
+reclaim the disk, `git worktree remove` it — the app re-creates it on the next branch or PR
+review.
+
+`cargo test` runs the unit tests (diff parsing, comment and code-unit extraction,
 scope detection, provenance, edit application and revert, validation, model-output parsing).
 
 ## Scope notes
