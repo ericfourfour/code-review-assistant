@@ -383,6 +383,44 @@ impl Db {
         self.conn.last_insert_rowid()
     }
 
+    /// The newest session for this ref that actually owns a commit. A later
+    /// re-review may decide nothing or leave every decision uncommitted; it
+    /// must not hide an earlier session whose pending commits still need to
+    /// be delivered.
+    pub fn last_committed_session(&self, repo: &str, ref_name: &str) -> Option<i64> {
+        self.conn
+            .query_row(
+                "SELECT s.id FROM sessions s
+                 WHERE s.repo = ?1 AND s.ref_name = ?2
+                   AND EXISTS (
+                     SELECT 1 FROM decisions d
+                     WHERE d.session_id = s.id AND d.committed = 1
+                       AND d.commit_sha IS NOT NULL AND d.commit_sha <> ''
+                   )
+                 ORDER BY s.id DESC LIMIT 1",
+                params![repo, ref_name],
+                |r| r.get(0),
+            )
+            .ok()
+    }
+
+    /// The session that made a given commit.
+    ///
+    /// Names are not reliable identity: a rescued branch carries a finished
+    /// review's commits under a name no session was ever opened for, and so
+    /// does a branch since renamed. The commits themselves are, so this is
+    /// what finds the session when [`Db::last_committed_session`] draws a blank.
+    pub fn session_for_commit(&self, sha: &str) -> Option<i64> {
+        self.conn
+            .query_row(
+                "SELECT session_id FROM decisions
+                 WHERE commit_sha = ?1 AND committed = 1 ORDER BY id DESC LIMIT 1",
+                params![sha],
+                |r| r.get(0),
+            )
+            .ok()
+    }
+
     pub fn log_suggestion(&self, s: &SuggestionRecord) {
         let _ = self.conn.execute(
             "INSERT INTO suggestions(ts, session_id, file, line_start, line_end, model,
@@ -1008,5 +1046,22 @@ impl Db {
             )
             .unwrap_or(0);
         (total, committed)
+    }
+
+    /// Every distinct commit this session made, newest first. What lets
+    /// publishing prove a branch holds nothing but this review's work before
+    /// it offers to rewind it — see [`crate::publish::restore_blocker`].
+    pub fn session_commits(&self, session_id: i64) -> Vec<String> {
+        let Ok(mut stmt) = self.conn.prepare(
+            "SELECT DISTINCT commit_sha FROM decisions
+             WHERE session_id = ?1 AND committed = 1 AND commit_sha IS NOT NULL
+               AND commit_sha <> ''
+             ORDER BY id DESC",
+        ) else {
+            return Vec::new();
+        };
+        stmt.query_map(params![session_id], |r| r.get::<_, String>(0))
+            .map(|rows| rows.filter_map(Result::ok).collect())
+            .unwrap_or_default()
     }
 }

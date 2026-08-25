@@ -142,6 +142,9 @@ scored against. Nothing is written to disk.",
         if let Some(err) = self.ref_error.clone() {
             ui.colored_label(theme::BAD, err);
         }
+        if let Some(note) = self.ref_note.clone() {
+            ui.colored_label(theme::WARN, note);
+        }
         ui.add_space(4.0);
 
         egui::ScrollArea::vertical()

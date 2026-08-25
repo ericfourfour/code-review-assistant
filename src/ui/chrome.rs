@@ -121,6 +121,8 @@ pub fn hotkey_bar(app: &mut CraApp, ctx: &egui::Context) {
                     }
                     Screen::Summary => {
                         k(ui, "G", "whole-branch review");
+                        k(ui, "P", "push");
+                        k(ui, "S", "stacked PR");
                         k(ui, "N", "follow-up notes");
                         k(ui, "F", "files");
                         k(ui, "B", "branches/PRs");

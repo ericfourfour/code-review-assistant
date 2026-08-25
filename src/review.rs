@@ -106,6 +106,10 @@ pub struct ReviewPlan {
     /// Exact diff base captured when the plan opened. Unlike the display
     /// label `HEAD`, this cannot move when review decisions create commits.
     pub branch_base: String,
+    /// Repository that owns a PR's head branch (`owner/name`). A fork PR's
+    /// short branch name is not meaningful in the base repository, so
+    /// stacked fixes must carry this identity through to publishing.
+    pub pr_head_repo: Option<String>,
     pub files: Vec<ReviewFile>,
     pub file_idx: usize,
     pub unit_idx: usize,
@@ -135,6 +139,23 @@ impl ReviewPlan {
 
     pub fn total_units(&self) -> usize {
         self.files.iter().map(|f| f.units.len()).sum()
+    }
+
+    /// How many units the summary is reporting on. Normally the plan's own —
+    /// but a ref whose every unit was decided before this session opened has
+    /// no units *left*, and reporting "2 / 0" over a finished review reads as
+    /// a bug. There, the ones left out are what "reviewed" refers to.
+    pub fn reported_units(&self) -> usize {
+        match self.files.is_empty() {
+            true => self.skipped_decided,
+            false => self.total_units(),
+        }
+    }
+
+    /// Whether this plan exists only to carry a finished review's session to
+    /// the summary screen — nothing left to decide, only commits to deliver.
+    pub fn nothing_left(&self) -> bool {
+        self.files.is_empty() && self.skipped_decided > 0
     }
 
     pub fn current(&self) -> Option<(&ReviewFile, &ReviewUnit)> {

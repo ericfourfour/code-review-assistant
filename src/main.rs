@@ -15,6 +15,7 @@ mod models;
 mod notes;
 mod procs;
 mod profile;
+mod publish;
 mod review;
 mod scopes;
 mod settings;
@@ -23,6 +24,7 @@ mod testkit;
 mod triage;
 mod ui;
 mod units;
+mod worktree;
 
 use std::path::PathBuf;
 
