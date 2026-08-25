@@ -49,7 +49,7 @@ fn color_for(capture: &str) -> Option<Color32> {
         "string" | "escape" | "character" => STRING,
         "number" | "float" => NUMBER,
         "comment" => COMMENT,
-        "constant" => CONSTANT,
+        "constant" | "boolean" => CONSTANT,
         "property" | "field" | "tag" => PROPERTY,
         "attribute" | "label" | "annotation" => ATTRIBUTE,
         "operator" | "punctuation" => PUNCT,
@@ -134,32 +134,28 @@ fn compute(language: &tree_sitter::Language, query: &Query, lines: &[&str]) -> V
     if parser.set_language(language).is_err() {
         return empty();
     }
-    let Some(tree) = parser.parse(&source, None) else {
-        return empty();
-    };
+    let Some(tree) = parser.parse(&source, None) else { return empty() };
 
     // Collect every capture, then paint widest-first so a nested capture (the
     // name inside a call, the escape inside a string) is drawn over the one
-    // enclosing it. Ties go to the earlier pattern, which is the convention
-    // every `highlights.scm` is written to.
+    // enclosing it. Two captures of the *same* span go to the later pattern:
+    // grammars put the general rule first and refine it below, so YAML's
+    // `(string_scalar) @string` is a mapping key's fallback and the
+    // `@property` rule further down is what it actually is.
     let names = query.capture_names();
     let mut caps: Vec<(usize, usize, usize, Color32)> = Vec::new();
     let mut cursor = QueryCursor::new();
     let mut hits = cursor.captures(query, tree.root_node(), source.as_bytes());
     while let Some((m, idx)) = hits.next() {
         let cap = m.captures[*idx];
-        let Some(name) = names.get(cap.index as usize) else {
-            continue;
-        };
-        let Some(color) = color_for(name) else {
-            continue;
-        };
+        let Some(name) = names.get(cap.index as usize) else { continue };
+        let Some(color) = color_for(name) else { continue };
         let range = cap.node.byte_range();
         if range.end > range.start && range.end <= source.len() {
             caps.push((range.start, range.end, m.pattern_index, color));
         }
     }
-    caps.sort_by_key(|(s, e, pattern, _)| (std::cmp::Reverse(e - s), std::cmp::Reverse(*pattern)));
+    caps.sort_by_key(|(s, e, pattern, _)| (std::cmp::Reverse(e - s), *pattern));
     let mut paint: Vec<Option<Color32>> = vec![None; source.len()];
     for (start, end, _, color) in caps {
         for color_entry in &mut paint[start..end] {
@@ -200,9 +196,7 @@ mod tests {
             .iter()
             .zip(lines)
             .map(|(runs, line)| {
-                runs.iter()
-                    .map(|(s, e, c)| (line[*s..*e].to_string(), *c))
-                    .collect()
+                runs.iter().map(|(s, e, c)| (line[*s..*e].to_string(), *c)).collect()
             })
             .collect()
     }
@@ -210,25 +204,9 @@ mod tests {
     #[test]
     fn rust_keywords_strings_and_comments_get_their_own_colours() {
         let out = colors("a.rs", &["// note", "fn f() -> u32 {", "    \"text\"", "}"]);
-        assert!(
-            out[0]
-                .iter()
-                .any(|(t, c)| t.contains("note") && *c == COMMENT),
-            "{:?}",
-            out[0]
-        );
-        assert!(
-            out[1].iter().any(|(t, c)| t == "fn" && *c == KEYWORD),
-            "{:?}",
-            out[1]
-        );
-        assert!(
-            out[2]
-                .iter()
-                .any(|(t, c)| t.contains("text") && *c == STRING),
-            "{:?}",
-            out[2]
-        );
+        assert!(out[0].iter().any(|(t, c)| t.contains("note") && *c == COMMENT), "{:?}", out[0]);
+        assert!(out[1].iter().any(|(t, c)| t == "fn" && *c == KEYWORD), "{:?}", out[1]);
+        assert!(out[2].iter().any(|(t, c)| t.contains("text") && *c == STRING), "{:?}", out[2]);
     }
 
     #[test]
@@ -253,10 +231,7 @@ mod tests {
                 assert!(line.is_char_boundary(*s) && line.is_char_boundary(*e));
             }
         }
-        assert!(
-            !spans[1].is_empty(),
-            "the middle of a block comment is still comment"
-        );
+        assert!(!spans[1].is_empty(), "the middle of a block comment is still comment");
     }
 
     #[test]
@@ -265,10 +240,7 @@ mod tests {
         let spans = line_spans("a.rs", &lines);
         for (runs, line) in spans.iter().zip(lines) {
             for (s, e, _) in runs {
-                assert!(
-                    line.is_char_boundary(*s) && line.is_char_boundary(*e),
-                    "{s}..{e}"
-                );
+                assert!(line.is_char_boundary(*s) && line.is_char_boundary(*e), "{s}..{e}");
             }
         }
     }
@@ -279,14 +251,27 @@ mod tests {
         // that language all of its colour, which is easy not to notice.
         for path in [
             "a.rs", "a.py", "a.js", "a.jsx", "a.ts", "a.tsx", "a.go", "a.java", "a.c", "a.h",
-            "a.cpp", "a.cs", "a.php",
+            "a.cpp", "a.cs", "a.php", "a.yml", "a.yaml",
         ] {
             let (language, src) = crate::scopes::highlight_grammar(path).expect(path);
-            assert!(
-                query_for(&language, src).is_some(),
-                "{path} has no usable highlight query"
-            );
+            assert!(query_for(&language, src).is_some(), "{path} has no usable highlight query");
         }
+    }
+
+    #[test]
+    fn yaml_separates_keys_from_values() {
+        // YAML is carried for colour only, so this is the one check that the
+        // highlight-only path reaches a grammar at all — and that a mapping
+        // key does not come out the same colour as its value, which is the
+        // whole reason to colour a config file.
+        let out = colors("ci.yml", &["# build", "name: CI", "on:", "  push: true", "  n: 3"]);
+        assert!(out[0].iter().any(|(_, c)| *c == COMMENT), "{:?}", out[0]);
+        let key = out[1].iter().find(|(t, _)| t == "name");
+        let value = out[1].iter().find(|(t, _)| t == "CI");
+        assert_eq!(key.map(|(_, c)| *c), Some(PROPERTY), "{:?}", out[1]);
+        assert_eq!(value.map(|(_, c)| *c), Some(STRING), "{:?}", out[1]);
+        assert!(out[3].iter().any(|(t, c)| t == "true" && *c == CONSTANT), "{:?}", out[3]);
+        assert!(out[4].iter().any(|(t, c)| t == "3" && *c == NUMBER), "{:?}", out[4]);
     }
 
     #[test]
