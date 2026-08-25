@@ -8,12 +8,12 @@ impl CraApp {
         let typing = ctx.wants_keyboard_input();
         if !typing {
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F)) {
-                self.screen = Screen::FilePicker;
+                self.goto(Screen::FilePicker);
                 return;
             }
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::B)) {
                 self.load_refs();
-                self.screen = Screen::RefPicker;
+                self.goto(Screen::RefPicker);
                 return;
             }
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::G))
@@ -105,15 +105,24 @@ impl CraApp {
                 self.open_eval();
                 return;
             }
+            if let Some(at) = self.review_in_progress() {
+                if ui
+                    .button(format!("◀ Back to {at}"))
+                    .on_hover_text("returns to the unit you left — nothing is re-asked")
+                    .clicked()
+                {
+                    self.goto(Screen::Review);
+                }
+            }
             if ui.button("Back to files [F]").clicked() {
-                self.screen = Screen::FilePicker;
+                self.goto(Screen::FilePicker);
             }
             if ui.button("Another branch/PR [B]").clicked() {
                 self.load_refs();
-                self.screen = Screen::RefPicker;
+                self.goto(Screen::RefPicker);
             }
             if ui.button("Another repo [Esc]").clicked() {
-                self.screen = Screen::RepoPicker;
+                self.goto(Screen::RepoPicker);
             }
         });
 
@@ -195,6 +204,10 @@ recorded and yours to dismiss — nothing is edited.",
                                 WholeBranchReviewState::Failed(e) => {
                                     ui.colored_label(theme::BAD, crate::app::truncate(e, 90));
                                 }
+                                WholeBranchReviewState::Paused(p) => {
+                                    theme::badge(ui, "PAUSED", theme::WARN);
+                                    ui.label(theme::dim(&p.line()));
+                                }
                                 WholeBranchReviewState::Idle => {}
                             }
                             ui.add_space(10.0);
@@ -202,6 +215,23 @@ recorded and yours to dismiss — nothing is edited.",
                     }
                 }
             });
+        }
+
+        // A model whose branch pass was stopped when the reviewer left this
+        // page: (model index, continue the same session?).
+        let mut rerun: Option<(usize, bool)> = None;
+        for (i, state) in self.whole_branch_review.iter().enumerate() {
+            let WholeBranchReviewState::Paused(call) = state else {
+                continue;
+            };
+            match crate::ui::procs_panel::paused_row(ui, call, &self.settings, "↻ Run again") {
+                crate::ui::procs_panel::PausedAction::Resume => rerun = Some((i, true)),
+                crate::ui::procs_panel::PausedAction::Restart => rerun = Some((i, false)),
+                crate::ui::procs_panel::PausedAction::None => {}
+            }
+        }
+        if let Some((i, resume)) = rerun {
+            self.rerun_branch_model(ctx, i, resume);
         }
 
         let mut dismiss: Option<i64> = None;

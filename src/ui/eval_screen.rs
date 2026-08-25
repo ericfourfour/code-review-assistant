@@ -455,7 +455,7 @@ impl CraApp {
     pub fn open_eval(&mut self) {
         if self.screen != Screen::Eval {
             self.prev_screen = self.screen;
-            self.screen = Screen::Eval;
+            self.goto(Screen::Eval);
             self.eval = None;
         }
     }

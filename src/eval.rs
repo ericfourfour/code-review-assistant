@@ -908,6 +908,7 @@ mod tests {
                 cost: cost.map(|usd| (usd, false)),
                 follow_up_id: None,
                 round: 1,
+                stopped: false,
             });
         }
         let unit = unit("src/lib.rs", c.line);
@@ -1053,6 +1054,7 @@ mod tests {
             cost: None,
             follow_up_id: None,
             round: 1,
+            stopped: false,
         });
 
         let board = Leaderboard::from_db(&db, &Filter::default());
@@ -1193,6 +1195,7 @@ mod tests {
             cost: Some((0.01, false)),
             follow_up_id: None,
             round: 1,
+            stopped: false,
         });
 
         let board = Leaderboard::from_db(&db, &Filter::default());
@@ -1540,6 +1543,7 @@ mod tests {
             cost: None,
             follow_up_id: None,
             round: 1,
+            stopped: false,
         });
         db.log_suggestion(&crate::db::SuggestionRecord {
             session_id: session,
@@ -1557,6 +1561,7 @@ mod tests {
             cost: None,
             follow_up_id: None,
             round: 2,
+            stopped: false,
         });
         log_label(&db, session, &judged, "rewrite", "m1");
 

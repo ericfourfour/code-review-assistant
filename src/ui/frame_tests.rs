@@ -210,6 +210,7 @@ fn the_evaluation_page_lays_out_with_real_history_and_stays_put() {
                 cost: Some((0.004, false)),
                 follow_up_id: None,
                 round: 1,
+                stopped: false,
             });
         }
         app.db.log_decision(&crate::db::DecisionRecord {
@@ -295,6 +296,7 @@ fn toggling_the_blinded_filter_rebuilds_the_aggregate() {
             cost: None,
             follow_up_id: None,
             round: 1,
+            stopped: false,
         });
         app.db.log_decision(&crate::db::DecisionRecord {
             session_id: session,
@@ -662,4 +664,203 @@ fn the_file_picker_lays_out_its_rows() {
     }
     assert!(frames[0].0 > 0, "the picker painted nothing");
     assert_eq!(frames[1], frames[2], "the picker shifted between repaints");
+}
+
+/// A call that was stopped, as a page would hold it after the reviewer walked
+/// away: a real pid, a session that can be continued, and a reason.
+fn paused_call(session: Option<&str>) -> crate::app::PausedCall {
+    crate::app::PausedCall {
+        owner: crate::procs::Owner::Review,
+        model_index: 0,
+        model: "claude".into(),
+        what: "src/lib.rs:2 · verdict".into(),
+        pid: Some(31337),
+        session: session.map(str::to_string),
+        ran_for: std::time::Duration::from_secs(42),
+        usage: crate::models::Usage {
+            input_tokens: 900,
+            output_tokens: 80,
+            cache_read_tokens: 0,
+            cost_usd: Some(0.0042),
+        },
+        prompt: "judge this comment".into(),
+        reason: "left the review screen".into(),
+    }
+}
+
+/// The banner is the only thing that makes "the processes were terminated" a
+/// fact the reviewer can check rather than a promise. It has to lay out — and
+/// keep laying out the same way, since it sits above every screen and any
+/// jitter there moves the whole app.
+#[test]
+fn the_stop_confirmation_banner_lays_out_and_stays_put() {
+    let (_dir, mut app) = review_app("nav_notice");
+    app.screen = Screen::Review;
+    let ctx = egui::Context::default();
+    crate::ui::theme::apply(&ctx);
+
+    // One call, started and then stopped the way leaving a page stops it.
+    let handle = app
+        .procs
+        .register(crate::procs::Owner::Review, 0, "claude", "src/lib.rs:2");
+    handle.started_process(31337);
+    handle.set_session(Some("2f9a1c44-0000-4444-8888-aaaabbbbcccc".into()));
+    app.goto(Screen::FilePicker);
+    let notice = app
+        .nav_notice
+        .as_ref()
+        .expect("leaving a page with work says so");
+    assert!(
+        !notice.all_confirmed(),
+        "nothing has confirmed the kill yet"
+    );
+    assert!(notice.headline().contains("0/1"), "{}", notice.headline());
+
+    let mut frames = Vec::new();
+    for _ in 0..3 {
+        let out = ctx.run(input(1480.0, 900.0), |ctx| {
+            crate::ui::procs_panel::nav_notice(&mut app, ctx);
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.label("content");
+            });
+        });
+        let clips: Vec<_> = out.shapes.iter().map(|s| s.clip_rect).collect();
+        frames.push((out.shapes.len(), format!("{clips:?}")));
+    }
+    assert!(frames[0].0 > 0, "the banner painted nothing");
+    assert_eq!(frames[1], frames[2], "the banner shifted between repaints");
+
+    // Once the worker confirms, the headline changes and the banner is still
+    // one row per process.
+    handle.ended(
+        crate::procs::Ended::Cancelled("left the review screen".into()),
+        Default::default(),
+    );
+    let notice = app.nav_notice.as_ref().unwrap();
+    assert!(notice.all_confirmed());
+    assert!(
+        notice.headline().contains("1/1 process(es) terminated"),
+        "{}",
+        notice.headline()
+    );
+}
+
+/// The ledger has to lay out with rows in every state, including the one with
+/// no session id — the case the card has to explain rather than offer a
+/// resume for.
+#[test]
+fn the_process_ledger_lays_out_every_state() {
+    let (_dir, mut app) = review_app("ledger");
+    app.show_procs = true;
+    let ctx = egui::Context::default();
+    crate::ui::theme::apply(&ctx);
+
+    let running = app
+        .procs
+        .register(crate::procs::Owner::Review, 0, "claude", "src/lib.rs:2");
+    running.started_process(101);
+    running.set_session(Some("aaaa1111-2222".into()));
+    let stopping = app
+        .procs
+        .register(crate::procs::Owner::Fix, 0, "codex", "3 note(s)");
+    stopping.started_process(102);
+    stopping.stop("left the follow-up screen");
+    let done = app
+        .procs
+        .register(crate::procs::Owner::Branch, 0, "agy", "feature vs main");
+    done.started_process(103);
+    done.ended(crate::procs::Ended::Finished, Default::default());
+    let never = app
+        .procs
+        .register(crate::procs::Owner::Review, 0, "claude", "src/lib.rs:4");
+    never.ended(crate::procs::Ended::SpawnFailed, Default::default());
+
+    let mut frames = Vec::new();
+    for _ in 0..3 {
+        let out = ctx.run(input(1480.0, 900.0), |ctx| {
+            crate::ui::procs_panel::window(&mut app, ctx);
+        });
+        let clips: Vec<_> = out.shapes.iter().map(|s| s.clip_rect).collect();
+        frames.push((out.shapes.len(), format!("{clips:?}")));
+    }
+    assert!(frames[0].0 > 0, "the ledger painted nothing");
+    assert_eq!(frames[1], frames[2], "the ledger shifted between repaints");
+    assert!(app.show_procs, "the window closed itself");
+}
+
+/// The paused card is what the reviewer comes back to. Both of its offers have
+/// to be drawn, and the one that cannot work has to be the disabled one.
+#[test]
+fn a_paused_card_offers_resume_only_when_there_is_a_session() {
+    let (_dir, mut app) = review_app("paused_card");
+    let ctx = egui::Context::default();
+    crate::ui::theme::apply(&ctx);
+    // Disabled, so laying out the screen queries nothing: the card under
+    // test is what a stopped call leaves behind, and the configuration is here
+    // only because whether a resume is possible is read off it.
+    app.settings.models = vec![crate::settings::ModelConfig {
+        name: "claude".into(),
+        command: "claude --session-id {session}".into(),
+        fix_command: "claude --session-id {session}".into(),
+        coauthor: String::new(),
+        enabled: false,
+        model: String::new(),
+        model_flag: "--model".into(),
+        effort: String::new(),
+        effort_flag: "--effort".into(),
+        resume_command: "claude --resume {session}".into(),
+        fix_resume_command: "claude --resume {session}".into(),
+        session_key: String::new(),
+        price_in: 0.0,
+        price_out: 0.0,
+    }];
+    app.start_review(&ctx, 0);
+
+    let with_session = paused_call(Some("2f9a1c44-0000"));
+    let without = paused_call(None);
+    assert!(with_session.resumable(&app.settings));
+    assert!(
+        !without.resumable(&app.settings),
+        "there is nothing to continue"
+    );
+    assert!(
+        without.session_line().contains("no session id"),
+        "{}",
+        without.session_line()
+    );
+    assert!(
+        with_session.line().contains("pid 31337 terminated"),
+        "{}",
+        with_session.line()
+    );
+
+    app.candidates = vec![crate::app::CandidateState::Paused(with_session)];
+    // The review screen sizes its panes from the previous frame's measurement,
+    // so a changed card takes a frame or two to settle. Shape *count* is what
+    // is asserted rather than exact geometry: this screen's editor pane
+    // converges on its scrollbar width over several frames, which is a
+    // sub-pixel drift, where a widget appearing and disappearing between
+    // frames — the failure worth catching — moves the count.
+    let mut counts = Vec::new();
+    for _ in 0..6 {
+        let out = ctx.run(input(1480.0, 900.0), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                app.ui_review(ctx, ui);
+            });
+        });
+        counts.push(out.shapes.len());
+    }
+    assert!(counts[0] > 0, "the review screen painted nothing");
+    assert_eq!(
+        counts[3..],
+        counts[2..counts.len() - 1],
+        "the paused card never settled"
+    );
+    // Drawing the card must not have started anything, and must not have
+    // quietly replaced it with a fresh ask.
+    assert_eq!(app.procs.running_total(), 0);
+    assert!(matches!(
+        app.candidates[0],
+        crate::app::CandidateState::Paused(_)
+    ));
 }

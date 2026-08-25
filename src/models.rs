@@ -4,9 +4,9 @@
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Write};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::procs::{self, Ended, ProcHandle};
 use crate::settings::ModelConfig;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -145,169 +145,10 @@ pub struct CandidateMsg {
     pub result: Result<Suggestion, String>,
     /// Everything the CLI printed, kept verbatim for the transcript.
     pub raw: String,
-}
-
-/// Shared view into a CLI call still running: when it started, how much it
-/// has printed, and the last recognisable thing it was seen doing. The worker
-/// thread feeds it as output arrives; the UI reads a snapshot each frame.
-/// Cheap to clone — both ends hold the same allocation.
-#[derive(Clone)]
-pub struct LiveHandle(Arc<Mutex<LiveInner>>);
-
-struct LiveInner {
-    started: Instant,
-    lines: u64,
-    activity: String,
-}
-
-/// One frame's view of a running call.
-pub struct LiveSnapshot {
-    pub elapsed: Duration,
-    /// Non-empty output lines seen so far — proof of life even when none of
-    /// them parsed into anything recognisable.
-    pub lines: u64,
-    /// The most recent recognisable step (a tool call, a shell command), or
-    /// empty when the stream has shown none yet.
-    pub activity: String,
-}
-
-impl LiveSnapshot {
-    /// Elapsed against the call's deadline: "47s / 240s".
-    pub fn clock(&self, timeout_secs: u64) -> String {
-        format!("{}s / {timeout_secs}s", self.elapsed.as_secs())
-    }
-
-    /// The activity worth a label: the last recognisable step, else how much
-    /// the CLI has printed, else nothing (it has been silent so far).
-    pub fn activity_line(&self) -> Option<String> {
-        if !self.activity.is_empty() {
-            return Some(self.activity.clone());
-        }
-        (self.lines > 0).then(|| format!("{} line(s) of output", self.lines))
-    }
-}
-
-impl LiveHandle {
-    pub fn new() -> LiveHandle {
-        LiveHandle(Arc::new(Mutex::new(LiveInner {
-            started: Instant::now(),
-            lines: 0,
-            activity: String::new(),
-        })))
-    }
-
-    pub fn snapshot(&self) -> LiveSnapshot {
-        let g = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        LiveSnapshot {
-            elapsed: g.started.elapsed(),
-            lines: g.lines,
-            activity: g.activity.clone(),
-        }
-    }
-
-    fn on_line(&self, line: &str) {
-        let line = line.trim();
-        if line.is_empty() {
-            return;
-        }
-        // Parse outside the lock; the UI reads snapshots while this runs.
-        let activity = live_activity(line);
-        let mut g = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        g.lines += 1;
-        if let Some(a) = activity {
-            g.activity = a;
-        }
-    }
-}
-
-impl Default for LiveHandle {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// What one streamed event says the model is doing, if it says anything a
-/// human would recognise. The streaming CLIs (`claude --output-format
-/// stream-json`, `codex --json`) emit one JSON event per line; a tool call is
-/// the reportable step in either stream. Everything else — text deltas,
-/// lifecycle events, non-JSON noise — is counted but not shown.
-fn live_activity(line: &str) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_str(line).ok()?;
-    if let Some(s) = tool_use_activity(&v) {
-        return Some(s);
-    }
-    // codex spells a shell step as a `command` field on the item rather than
-    // as a tool_use block.
-    find_command(&v).map(|c| format!("$ {}", clip_head(&c, 56)))
-}
-
-/// The first `tool_use` block anywhere in the event: the tool's name plus the
-/// most target-like thing in its input.
-fn tool_use_activity(v: &serde_json::Value) -> Option<String> {
-    match v {
-        serde_json::Value::Object(o) => {
-            if o.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
-                if let Some(name) = o.get("name").and_then(|n| n.as_str()) {
-                    let target = o.get("input").and_then(|input| {
-                        ["file_path", "path", "pattern", "command", "url", "query"]
-                            .iter()
-                            .find_map(|k| input.get(*k).and_then(|s| s.as_str()))
-                    });
-                    return Some(match target {
-                        Some(t) => format!("{name} {}", clip_tail(t, 48)),
-                        None => name.to_string(),
-                    });
-                }
-            }
-            o.values().find_map(tool_use_activity)
-        }
-        serde_json::Value::Array(a) => a.iter().find_map(tool_use_activity),
-        _ => None,
-    }
-}
-
-/// The first `command` value anywhere in the event — a string, or an argv
-/// array joined back into one.
-fn find_command(v: &serde_json::Value) -> Option<String> {
-    match v {
-        serde_json::Value::Object(o) => {
-            match o.get("command") {
-                Some(serde_json::Value::String(s)) if !s.trim().is_empty() => {
-                    return Some(s.clone())
-                }
-                Some(serde_json::Value::Array(a)) => {
-                    let parts: Vec<&str> = a.iter().filter_map(|x| x.as_str()).collect();
-                    if !parts.is_empty() {
-                        return Some(parts.join(" "));
-                    }
-                }
-                _ => {}
-            }
-            o.values().find_map(find_command)
-        }
-        serde_json::Value::Array(a) => a.iter().find_map(find_command),
-        _ => None,
-    }
-}
-
-/// Keep the start of a string — a command's program and first arguments are
-/// its informative end.
-fn clip_head(s: &str, n: usize) -> String {
-    if s.chars().count() <= n {
-        return s.to_string();
-    }
-    let head: String = s.chars().take(n - 1).collect();
-    format!("{head}…")
-}
-
-/// Keep the end of a string — a path's file name is its informative end.
-fn clip_tail(s: &str, n: usize) -> String {
-    let total = s.chars().count();
-    if total <= n {
-        return s.to_string();
-    }
-    let tail: String = s.chars().skip(total - (n - 1)).collect();
-    format!("…{tail}")
+    /// Whether this app stopped the call rather than the model failing it.
+    /// A stopped call is not a model's error and must not be scored as one —
+    /// the reviewer walked away, which says nothing about the model.
+    pub cancelled: bool,
 }
 
 /// Split the command template into argv, substituting `{prompt}` and `{repo}`
@@ -675,7 +516,7 @@ fn run_model(
     repo: &str,
     cli_home: &str,
     timeout: Duration,
-    live: Option<&LiveHandle>,
+    proc: Option<&ProcHandle>,
 ) -> (Result<Suggestion, String>, String) {
     let mut raw_output = String::new();
     let result = run_inner(
@@ -686,16 +527,28 @@ fn run_model(
         cli_home,
         timeout,
         &mut raw_output,
-        live,
+        proc,
     );
     (result, raw_output)
 }
 
+/// What one finished CLI call leaves behind for its caller to read.
+pub(crate) struct CliOutcome {
+    pub stdout: String,
+    pub stderr: String,
+    pub latency_ms: i64,
+}
+
 /// Run a model CLI to completion and collect what it printed: everything up
 /// to — but not including — parsing a verdict out of the output. Shared by
-/// the per-unit review and the whole-branch review, which parse different replies
-/// from the same process runner. Returns (stdout, stderr, latency_ms) and appends
-/// the transcript-worthy text to `raw_output`.
+/// the per-unit review and the whole-branch review, which parse different
+/// replies from the same process runner, and appends the transcript-worthy
+/// text to `raw_output`.
+///
+/// `proc` is how the rest of the app keeps hold of the process rather than
+/// losing it: the pid goes in the moment it exists, a stop asked for through
+/// it ends the call at the next poll, and the session id and usage are written
+/// back so a killed call still leaves behind what it was and what it spent.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn capture_cli(
     model_config: &ModelConfig,
@@ -705,11 +558,20 @@ pub(crate) fn capture_cli(
     cli_home: &str,
     timeout: Duration,
     raw_output: &mut String,
-    live: Option<&LiveHandle>,
-) -> Result<(String, String, i64), String> {
+    proc: Option<&ProcHandle>,
+) -> Result<CliOutcome, String> {
+    // Whatever happens from here, the handle must not be left claiming the
+    // call is still running: a row stuck at "running" is exactly the lost
+    // process this tracking exists to prevent.
+    let fail = |how: Ended, msg: String| -> Result<CliOutcome, String> {
+        if let Some(h) = proc {
+            h.ended(how, Usage::default());
+        }
+        Err(msg)
+    };
     let (argv, via_stdin) = build_argv(command, prompt, repo, cli_home, model_config);
     if argv.is_empty() {
-        return Err("empty command template".into());
+        return fail(Ended::SpawnFailed, "empty command template".into());
     }
     let started = Instant::now();
     let mut cmd = crate::gitio::hidden_command(&argv[0]);
@@ -724,9 +586,20 @@ pub(crate) fn capture_cli(
     if !repo.trim().is_empty() {
         cmd.current_dir(repo);
     }
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("spawn `{}`: {e}", argv[0]))?;
+    #[cfg(unix)]
+    {
+        // Lead a process group, so a kill can reach the helpers the CLI forks
+        // and not only the shim this app spawned. See `procs::kill_tree`.
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return fail(Ended::SpawnFailed, format!("spawn `{}`: {e}", argv[0])),
+    };
+    if let Some(h) = proc {
+        h.started_process(child.id());
+    }
     if via_stdin {
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(prompt.as_bytes());
@@ -741,33 +614,52 @@ pub(crate) fn capture_cli(
     let (out_rx, err_rx) = {
         let (out_tx, out_rx) = std::sync::mpsc::channel();
         let (err_tx, err_rx) = std::sync::mpsc::channel();
-        let (pipe, live_output) = (child.stdout.take(), live.cloned());
+        let (pipe, live_output) = (child.stdout.take(), proc.cloned());
         std::thread::spawn(move || {
             let _ = out_tx.send(read_pipe(pipe, live_output));
         });
-        let (pipe, live_output) = (child.stderr.take(), live.cloned());
+        let (pipe, live_output) = (child.stderr.take(), proc.cloned());
         std::thread::spawn(move || {
             let _ = err_tx.send(read_pipe(pipe, live_output));
         });
         (out_rx, err_rx)
     };
 
-    // Poll with a deadline; kill on timeout so a hung CLI cannot stop the review.
+    // Poll with a deadline; kill on timeout so a hung CLI cannot stop the
+    // review, and on request so leaving the page it belongs to actually ends
+    // it. Both kills go after the whole process tree — killing the npm shim
+    // alone leaves the CLI underneath it running, which is the failure this
+    // poll exists to prevent.
     let deadline = started + timeout;
-    let mut timed_out = false;
+    let mut killed: Option<Ended> = None;
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
             Ok(None) => {
-                if Instant::now() > deadline {
-                    let _ = child.kill();
+                if let Some(h) = proc.filter(|h| h.stop_requested()) {
+                    procs::kill_tree(&mut child);
                     let _ = child.wait();
-                    timed_out = true;
+                    killed = Some(Ended::Cancelled(h.stop_reason()));
+                    break;
+                }
+                if Instant::now() > deadline {
+                    procs::kill_tree(&mut child);
+                    let _ = child.wait();
+                    killed = Some(Ended::TimedOut);
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
-            Err(e) => return Err(format!("wait: {e}")),
+            Err(e) => {
+                // The one path that could still leave a process behind: the
+                // wait itself failed, so nothing here knows whether the child
+                // is alive. Kill the tree before giving up rather than
+                // returning an error and an orphan.
+                procs::kill_tree(&mut child);
+                let _ = child.wait();
+                let why = format!("lost track of the process: {e}");
+                return fail(Ended::Cancelled(why.clone()), format!("wait: {e}"));
+            }
         }
     }
     // On the normal path the child has exited and EOF is imminent, so block.
@@ -775,7 +667,7 @@ pub(crate) fn capture_cli(
     // a bonus, and whoever inherited the pipe is not ours to wait for.
     let grace = Duration::from_millis(300);
     let recv = |rx: std::sync::mpsc::Receiver<String>| {
-        if timed_out {
+        if killed.is_some() {
             rx.recv_timeout(grace).unwrap_or_default()
         } else {
             rx.recv().unwrap_or_default()
@@ -792,18 +684,37 @@ pub(crate) fn capture_cli(
         raw_output.push_str("[stderr] ");
         raw_output.push_str(stderr.trim());
     }
-    // The partial transcript stays in `raw_output` either way: what a killed
-    // call was doing when the deadline hit is exactly what explains it.
-    if timed_out {
-        return Err(format!("timed out after {}s", timeout.as_secs()));
+    // Account for the call before deciding whether it succeeded. A killed CLI
+    // has usually already printed what it spent, and a session id it managed
+    // to report is what makes resuming it possible — dropping either on the
+    // error path is how a process becomes untraceable.
+    if let Some(h) = proc {
+        h.set_session(extract_session_id(&stdout, &model_config.session_key));
+        h.ended(
+            killed.clone().unwrap_or(Ended::Finished),
+            extract_usage(&stdout),
+        );
     }
-    Ok((stdout, stderr, latency_ms))
+    // The partial transcript stays in `raw_output` either way: what a killed
+    // call was doing when it was stopped is exactly what explains it.
+    match killed {
+        Some(Ended::TimedOut) => Err(format!("timed out after {}s", timeout.as_secs())),
+        Some(Ended::Cancelled(why)) => Err(match why.trim() {
+            "" => "stopped".to_string(),
+            why => format!("stopped: {why}"),
+        }),
+        _ => Ok(CliOutcome {
+            stdout,
+            stderr,
+            latency_ms,
+        }),
+    }
 }
 
 /// Read one pipe to EOF, feeding each line to the live view as it arrives.
 /// Lossy per line rather than per stream; a UTF-8 character never spans a
 /// newline, so the boundaries are safe to convert at.
-fn read_pipe<R: std::io::Read>(pipe: Option<R>, live: Option<LiveHandle>) -> String {
+fn read_pipe<R: std::io::Read>(pipe: Option<R>, live: Option<ProcHandle>) -> String {
     let Some(pipe) = pipe else {
         return String::new();
     };
@@ -836,9 +747,9 @@ fn run_inner(
     cli_home: &str,
     timeout: Duration,
     raw_output: &mut String,
-    live: Option<&LiveHandle>,
+    proc: Option<&ProcHandle>,
 ) -> Result<Suggestion, String> {
-    let (stdout, stderr, latency_ms) = capture_cli(
+    let out = capture_cli(
         model_config,
         command,
         prompt,
@@ -846,8 +757,9 @@ fn run_inner(
         cli_home,
         timeout,
         raw_output,
-        live,
+        proc,
     )?;
+    let (stdout, stderr, latency_ms) = (out.stdout, out.stderr, out.latency_ms);
 
     let raw = extract_verdict(&stdout)
         .or_else(|| extract_verdict(&stderr))
@@ -866,6 +778,17 @@ fn run_inner(
         evidence: raw.evidence,
         latency_ms,
     })
+}
+
+/// Whether a finished call ended because this app stopped it. Read from the
+/// handle rather than from the error text: the reason is the reviewer's own
+/// words by the time it reaches the message, and matching on prose to decide
+/// whether to bill a model is exactly the kind of guess that goes wrong.
+pub(crate) fn was_cancelled(proc: &ProcHandle) -> bool {
+    matches!(
+        proc.snapshot().state,
+        crate::procs::RunState::Done(Ended::Cancelled(_))
+    )
 }
 
 /// Run a model outside the review loop — the evaluation replay uses this so a
@@ -891,7 +814,7 @@ pub fn spawn_model(
     repo: String,
     cli_home: String,
     timeout_secs: u64,
-    live: LiveHandle,
+    proc: ProcHandle,
     send: impl FnOnce(CandidateMsg) + Send + 'static,
     ctx: egui::Context,
 ) {
@@ -903,14 +826,16 @@ pub fn spawn_model(
             &repo,
             &cli_home,
             Duration::from_secs(timeout_secs.max(5)),
-            Some(&live),
+            Some(&proc),
         );
+        let cancelled = was_cancelled(&proc);
         send(CandidateMsg {
             seq,
             model_index,
             model: model_config.name.clone(),
             result,
             raw,
+            cancelled,
         });
         ctx.request_repaint();
     });
@@ -929,6 +854,8 @@ pub struct FixMsg {
     /// Latency on success; the CLI's own account of the work is in `raw`.
     pub result: Result<i64, String>,
     pub raw: String,
+    /// Whether this app stopped the turn rather than the CLI failing it.
+    pub cancelled: bool,
 }
 
 /// Run a CLI turn whose output is for a human, not a parser: the follow-up
@@ -943,7 +870,7 @@ pub fn spawn_freeform(
     repo: String,
     cli_home: String,
     timeout_secs: u64,
-    live: LiveHandle,
+    proc: ProcHandle,
     send: impl FnOnce(FixMsg) + Send + 'static,
     ctx: egui::Context,
 ) {
@@ -957,15 +884,17 @@ pub fn spawn_freeform(
             &cli_home,
             Duration::from_secs(timeout_secs.max(5)),
             &mut raw,
-            Some(&live),
+            Some(&proc),
         )
-        .map(|(_, _, latency_ms)| latency_ms);
+        .map(|o| o.latency_ms);
+        let cancelled = was_cancelled(&proc);
         send(FixMsg {
             seq,
             model_index,
             model: model_config.name.clone(),
             result,
             raw,
+            cancelled,
         });
         ctx.request_repaint();
     });
@@ -1379,44 +1308,6 @@ deny rule.\"}";
     }
 
     #[test]
-    fn live_activity_reads_a_tool_call_out_of_a_stream_event() {
-        // claude --output-format stream-json: an assistant message event
-        // carrying a tool_use block.
-        let ev = "{\"type\":\"assistant\",\"message\":{\"content\":[\
-{\"type\":\"tool_use\",\"name\":\"Read\",\"input\":{\"file_path\":\"src/config.rs\"}}]}}";
-        assert_eq!(live_activity(ev).unwrap(), "Read src/config.rs");
-        // codex --json: the step is a command on the item, argv-style.
-        let ev = "{\"type\":\"item.started\",\"item\":{\"type\":\"command_execution\",\
-\"command\":[\"bash\",\"-lc\",\"cargo test\"]}}";
-        assert_eq!(live_activity(ev).unwrap(), "$ bash -lc cargo test");
-        // Lifecycle noise and plain text are counted, never shown.
-        assert_eq!(live_activity("{\"type\":\"turn.started\"}"), None);
-        assert_eq!(live_activity("plain text, not an event"), None);
-    }
-
-    #[test]
-    fn a_live_handle_keeps_the_last_step_and_counts_the_stream() {
-        let live = LiveHandle::new();
-        live.on_line("{\"type\":\"system\",\"subtype\":\"init\"}");
-        live.on_line(
-            "{\"type\":\"assistant\",\"message\":{\"content\":[\
-{\"type\":\"tool_use\",\"name\":\"Grep\",\"input\":{\"pattern\":\"RETRY_LIMIT\"}}]}}",
-        );
-        live.on_line("   ");
-        let snap = live.snapshot();
-        assert_eq!(snap.lines, 2, "blank lines are not output");
-        assert_eq!(snap.activity, "Grep RETRY_LIMIT");
-        assert_eq!(snap.activity_line().unwrap(), "Grep RETRY_LIMIT");
-        // Output with no recognisable step in it still shows proof of life.
-        let quiet = LiveHandle::new();
-        quiet.on_line("warming up");
-        assert_eq!(
-            quiet.snapshot().activity_line().unwrap(),
-            "1 line(s) of output"
-        );
-    }
-
-    #[test]
     fn a_stream_json_transcript_still_yields_verdict_and_usage() {
         // The shape `claude -p --verbose --output-format stream-json` prints:
         // events as they happen, then a result envelope whose `result` string
@@ -1713,7 +1604,7 @@ mod spawn_tests {
             },
         );
         let model_config = cli.model_config("");
-        let live = LiveHandle::new();
+        let proc = ProcHandle::new();
         let (res, _) = run_model(
             &model_config,
             &model_config.command,
@@ -1721,16 +1612,76 @@ mod spawn_tests {
             "",
             "",
             Duration::from_secs(30),
-            Some(&live),
+            Some(&proc),
         );
         assert!(res.is_ok(), "{res:?}");
-        let snap = live.snapshot();
+        let snap = proc.snapshot();
         assert!(
             snap.lines >= 2,
             "the stream was read line by line, saw {}",
             snap.lines
         );
         assert_eq!(snap.activity, "Read src/config.rs");
+        // The call is accounted for even though nobody asked it to stop: the
+        // pid it ran under, and the fact that it is over.
+        assert!(snap.pid.is_some(), "a spawned process has a pid");
+        assert_eq!(snap.state, crate::procs::RunState::Done(Ended::Finished));
+    }
+
+    /// Stopping a call has to end the process, not just stop waiting for it.
+    /// A CLI left running after the reviewer walked away is the whole reason
+    /// any of this is tracked.
+    #[test]
+    fn a_stop_ends_a_running_call_and_says_why() {
+        let dir = TempDir::new("stop_call");
+        let cli = FakeCli::new(
+            &dir,
+            "slow",
+            FakeCliSpec {
+                reply: VERDICT,
+                delay_secs: 30,
+                ..Default::default()
+            },
+        );
+        let model_config = cli.model_config("");
+        let proc = ProcHandle::new();
+
+        // Stop it from another thread once it is actually running, the way the
+        // UI does when the reviewer leaves the page.
+        let stopper = proc.clone();
+        let waiter = std::thread::spawn(move || {
+            for _ in 0..200 {
+                if stopper.snapshot().pid.is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            stopper.stop("left the review screen");
+        });
+
+        let started = Instant::now();
+        let (res, _) = run_model(
+            &model_config,
+            &model_config.command,
+            "hi",
+            "",
+            "",
+            Duration::from_secs(120),
+            Some(&proc),
+        );
+        waiter.join().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(25),
+            "the call should end when stopped, not run its 30s course"
+        );
+        let err = res.unwrap_err();
+        assert!(err.contains("left the review screen"), "{err}");
+        let snap = proc.snapshot();
+        assert_eq!(
+            snap.state,
+            crate::procs::RunState::Done(Ended::Cancelled("left the review screen".into())),
+            "the handle has to confirm the kill, not just record the request"
+        );
     }
 }
 
