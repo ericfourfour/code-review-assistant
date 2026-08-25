@@ -31,10 +31,13 @@ enum Grammar {
     Php,
 }
 
-fn grammar_for(path: &str) -> Option<(Grammar, tree_sitter::Language)> {
+fn extension(path: &str) -> String {
     let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
-    let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
-    Some(match ext.as_str() {
+    name.rsplit('.').next().unwrap_or("").to_ascii_lowercase()
+}
+
+fn grammar_for(path: &str) -> Option<(Grammar, tree_sitter::Language)> {
+    Some(match extension(path).as_str() {
         "rs" => (Grammar::Rust, tree_sitter_rust::LANGUAGE.into()),
         "py" | "pyi" => (Grammar::Python, tree_sitter_python::LANGUAGE.into()),
         "js" | "jsx" | "mjs" | "cjs" => (Grammar::Js, tree_sitter_javascript::LANGUAGE.into()),
@@ -53,11 +56,27 @@ fn grammar_for(path: &str) -> Option<(Grammar, tree_sitter::Language)> {
     })
 }
 
+/// Grammars carried for colour alone. "Which definition encloses this line"
+/// is a question a config or markup language has no honest answer to, so
+/// these never reach [`parse`] — but a workflow file or a chart of values is
+/// still something a reviewer has to read, and it reads better coloured.
+fn highlight_only(path: &str) -> Option<(tree_sitter::Language, &'static str)> {
+    Some(match extension(path).as_str() {
+        "yaml" | "yml" => (
+            tree_sitter_yaml::LANGUAGE.into(),
+            tree_sitter_yaml::HIGHLIGHTS_QUERY,
+        ),
+        _ => return None,
+    })
+}
+
 /// The grammar for a path together with its bundled highlight query — the
 /// same parsers, reused for colour. A language with no grammar here simply
 /// shows as plain monospace, exactly as it does for scope detection.
 pub fn highlight_grammar(path: &str) -> Option<(tree_sitter::Language, &'static str)> {
-    let (grammar, language) = grammar_for(path)?;
+    let Some((grammar, language)) = grammar_for(path) else {
+        return highlight_only(path);
+    };
     let query = match grammar {
         Grammar::Rust => tree_sitter_rust::HIGHLIGHTS_QUERY,
         Grammar::Python => tree_sitter_python::HIGHLIGHTS_QUERY,

@@ -92,7 +92,9 @@ time, so building needs a C compiler alongside the Rust toolchain.
 The same grammars colour the code. Every excerpt on the review screen — the context pane,
 the original, the editable final text, the candidate previews, the evidence viewer — is
 syntax-highlighted from each grammar's own `highlights.scm`, so there is no second idea of
-what a keyword or a string is. Nothing wraps: indentation is how code says what encloses
+what a keyword or a string is. A few grammars are carried for colour alone: YAML has no
+honest answer to "which definition encloses this line", so it is never scoped, but a
+workflow file is still something a reviewer has to read and it reads better coloured. Nothing wraps: indentation is how code says what encloses
 what, so long lines scroll sideways instead of losing their leading space.
 
 A code candidate proposing **REVISE** previews as a diff against the original rather than as

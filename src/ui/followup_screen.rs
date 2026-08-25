@@ -204,7 +204,7 @@ right is where their fate is read.",
                                     snap.clock(deadline),
                                     snap.pid_label()
                                 )));
-                                if let Some(a) = snap.activity_line() {
+                                if let Some(a) = snap.activity_line(false) {
                                     ui.label(theme::dim(&a));
                                 }
                             }
@@ -225,12 +225,14 @@ right is where their fate is read.",
                 // The turn that was cut short when the reviewer left this
                 // page. Nothing has been restarted for them.
                 if let Some(call) = &self.fix_paused {
-                    match crate::ui::procs_panel::paused_row(
-                        ui,
-                        call,
-                        &self.settings,
-                        "↻ Start a new session",
-                    ) {
+                    // The fix session picks its model by name on this screen,
+                    // so there is nothing to blind here.
+                    let view = crate::ui::procs_panel::PausedView {
+                        name: &call.model,
+                        identifying: true,
+                        restart_label: "↻ Start a new session",
+                    };
+                    match crate::ui::procs_panel::paused_row(ui, call, &self.settings, view) {
                         crate::ui::procs_panel::PausedAction::Resume => resume_paused = true,
                         crate::ui::procs_panel::PausedAction::Restart => restart_paused = true,
                         crate::ui::procs_panel::PausedAction::None => {}
@@ -267,7 +269,7 @@ right is where their fate is read.",
                                                     "working… {}",
                                                     snap.clock(deadline)
                                                 )));
-                                                if let Some(a) = snap.activity_line() {
+                                                if let Some(a) = snap.activity_line(false) {
                                                     ui.label(theme::dim(&a));
                                                 }
                                             }
