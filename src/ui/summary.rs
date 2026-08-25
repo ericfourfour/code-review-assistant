@@ -27,23 +27,29 @@ impl CraApp {
         ui.add_space(6.0);
         if let Some(p) = &self.plan {
             let (decided, committed) = self.db.decision_counts(p.session_id);
-            egui::Grid::new("summary_grid").num_columns(2).spacing([12.0, 3.0]).show(ui, |ui| {
-                ui.label(theme::dim("ref"));
-                ui.label(RichText::new(format!("{} [{}]", p.ref_name, p.ref_kind.label())).monospace());
-                ui.end_row();
-                ui.label(theme::dim("base"));
-                ui.label(RichText::new(&p.base_ref).monospace());
-                ui.end_row();
-                ui.label(theme::dim("units reviewed"));
-                ui.label(RichText::new(format!("{decided} / {}", p.total_units())).monospace());
-                ui.end_row();
-                ui.label(theme::dim("commits made"));
-                ui.label(RichText::new(committed.to_string()).monospace());
-                ui.end_row();
-                ui.label(theme::dim("session"));
-                ui.label(RichText::new(format!("#{}", p.session_id)).monospace());
-                ui.end_row();
-            });
+            egui::Grid::new("summary_grid")
+                .num_columns(2)
+                .spacing([12.0, 3.0])
+                .show(ui, |ui| {
+                    ui.label(theme::dim("ref"));
+                    ui.label(
+                        RichText::new(format!("{} [{}]", p.ref_name, p.ref_kind.label()))
+                            .monospace(),
+                    );
+                    ui.end_row();
+                    ui.label(theme::dim("base"));
+                    ui.label(RichText::new(&p.base_ref).monospace());
+                    ui.end_row();
+                    ui.label(theme::dim("units reviewed"));
+                    ui.label(RichText::new(format!("{decided} / {}", p.total_units())).monospace());
+                    ui.end_row();
+                    ui.label(theme::dim("commits made"));
+                    ui.label(RichText::new(committed.to_string()).monospace());
+                    ui.end_row();
+                    ui.label(theme::dim("session"));
+                    ui.label(RichText::new(format!("#{}", p.session_id)).monospace());
+                    ui.end_row();
+                });
             ui.add_space(6.0);
             ui.label(theme::dim(
                 "saved-but-uncommitted edits are in the working tree — commit them with git when ready",
@@ -91,11 +97,19 @@ recorded and yours to dismiss — nothing is edited.",
             } else {
                 "↻ Re-run branch pass [G]"
             };
-            if ui.add_enabled(!running, egui::Button::new(RichText::new(label).strong())).clicked() {
+            if ui
+                .add_enabled(!running, egui::Button::new(RichText::new(label).strong()))
+                .clicked()
+            {
                 self.start_branch_pass(ctx);
             }
             let open = self.findings.iter().filter(|r| !r.dismissed).count();
-            if open > 0 && ui.button("⧉ copy findings").on_hover_text("as markdown").clicked() {
+            if open > 0
+                && ui
+                    .button("⧉ copy findings")
+                    .on_hover_text("as markdown")
+                    .clicked()
+            {
                 ctx.copy_text(self.findings_markdown());
             }
         });
@@ -118,7 +132,9 @@ recorded and yours to dismiss — nothing is edited.",
                                     ui.spinner();
                                 }
                                 BranchPassState::Done { n, latency_ms } => {
-                                    ui.label(theme::dim(&format!("{n} finding(s) · {latency_ms} ms")));
+                                    ui.label(theme::dim(&format!(
+                                        "{n} finding(s) · {latency_ms} ms"
+                                    )));
                                 }
                                 BranchPassState::Failed(e) => {
                                     ui.colored_label(theme::BAD, crate::app::truncate(e, 90));
@@ -164,7 +180,9 @@ recorded and yours to dismiss — nothing is edited.",
                                     |ui| {
                                         if ui
                                             .small_button("✕ dismiss")
-                                            .on_hover_text("keep it on the record, marked dismissed")
+                                            .on_hover_text(
+                                                "keep it on the record, marked dismissed",
+                                            )
                                             .clicked()
                                         {
                                             dismiss = Some(row.id);
@@ -174,10 +192,16 @@ recorded and yours to dismiss — nothing is edited.",
                             });
                             if !f.files.is_empty() {
                                 ui.label(
-                                    RichText::new(f.files.join("  ")).monospace().small().color(theme::ACCENT),
+                                    RichText::new(f.files.join("  "))
+                                        .monospace()
+                                        .small()
+                                        .color(theme::ACCENT),
                                 );
                             }
-                            ui.label(RichText::new(&f.detail).color(egui::Color32::from_rgb(196, 208, 220)));
+                            ui.label(
+                                RichText::new(&f.detail)
+                                    .color(egui::Color32::from_rgb(196, 208, 220)),
+                            );
                             if !f.evidence.is_empty() {
                                 ui.horizontal_wrapped(|ui| {
                                     ui.label(theme::dim("read:"));

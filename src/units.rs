@@ -265,7 +265,11 @@ diff --git a/src/main.rs b/src/main.rs
         let files = crate::diffparse::parse(DIFF);
         let comments_only = assemble(&dir.path().to_string_lossy(), &files, 12, true, false);
         assert!(comments_only[0].1.iter().all(|u| !u.is_code()));
-        assert_eq!(comments_only[0].1.len(), 2, "both comment runs, nothing absorbs them");
+        assert_eq!(
+            comments_only[0].1.len(),
+            2,
+            "both comment runs, nothing absorbs them"
+        );
         let code_only = assemble(&dir.path().to_string_lossy(), &files, 12, false, true);
         assert!(code_only[0].1.iter().all(|u| u.is_code()));
         assert_eq!(code_only[0].1.len(), 1);
@@ -314,17 +318,27 @@ diff --git a/src/main.rs b/src/main.rs
         let files = crate::diffparse::parse(DIFF);
         let out = assemble(&dir.path().to_string_lossy(), &files, 12, true, true);
         let code = &out[0].1[0];
-        assert_eq!(code.display_text(), code.raw_lines().join("\n"), "code shows as-is");
+        assert_eq!(
+            code.display_text(),
+            code.raw_lines().join("\n"),
+            "code shows as-is"
+        );
         assert_eq!(
             code.editor_to_lines(&code.display_text()),
             code.raw_lines(),
             "untouched code saves back exactly"
         );
-        assert!(code.editor_to_lines("   \n").is_empty(), "blank editor deletes");
+        assert!(
+            code.editor_to_lines("   \n").is_empty(),
+            "blank editor deletes"
+        );
         assert_eq!(code.replacement_display("    x();\n"), "    x();");
 
         let comment = &out[0].1[1];
-        assert_eq!(comment.display_text(), "// A standalone note about configuration");
+        assert_eq!(
+            comment.display_text(),
+            "// A standalone note about configuration"
+        );
         assert_eq!(
             comment.editor_to_lines("// tightened"),
             vec!["// tightened".to_string()],

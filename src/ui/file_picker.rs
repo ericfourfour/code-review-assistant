@@ -46,8 +46,12 @@ impl CraApp {
                 .iter()
                 .map(|f| {
                     let code = f.units.iter().filter(|u| u.is_code()).count();
-                    let risk =
-                        f.units.iter().map(|u| crate::triage::assess(u).score).max().unwrap_or(0);
+                    let risk = f
+                        .units
+                        .iter()
+                        .map(|u| crate::triage::assess(u).score)
+                        .max()
+                        .unwrap_or(0);
                     (f.path.clone(), f.units.len() - code, code, risk, f.decided)
                 })
                 .collect();

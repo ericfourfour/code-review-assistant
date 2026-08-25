@@ -38,7 +38,10 @@ fn grammar_for(path: &str) -> Option<(Grammar, tree_sitter::Language)> {
         "rs" => (Grammar::Rust, tree_sitter_rust::LANGUAGE.into()),
         "py" | "pyi" => (Grammar::Python, tree_sitter_python::LANGUAGE.into()),
         "js" | "jsx" | "mjs" | "cjs" => (Grammar::Js, tree_sitter_javascript::LANGUAGE.into()),
-        "ts" => (Grammar::Ts, tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+        "ts" => (
+            Grammar::Ts,
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        ),
         "tsx" => (Grammar::Ts, tree_sitter_typescript::LANGUAGE_TSX.into()),
         "go" => (Grammar::Go, tree_sitter_go::LANGUAGE.into()),
         "java" => (Grammar::Java, tree_sitter_java::LANGUAGE.into()),
@@ -89,8 +92,14 @@ impl ParsedFile {
             .get(target0)
             .map(|l| l.len() - l.trim_start().len())
             .unwrap_or(0);
-        let point = Point { row: target0, column };
-        let mut node = self.tree.root_node().descendant_for_point_range(point, point)?;
+        let point = Point {
+            row: target0,
+            column,
+        };
+        let mut node = self
+            .tree
+            .root_node()
+            .descendant_for_point_range(point, point)?;
         loop {
             if node.parent().is_some() && self.is_definition(&node) {
                 break;
@@ -159,53 +168,95 @@ impl ParsedFile {
         match self.grammar {
             Grammar::Rust => matches!(
                 k,
-                "function_item" | "struct_item" | "enum_item" | "union_item" | "trait_item"
-                    | "impl_item" | "mod_item" | "macro_definition" | "static_item"
-                    | "const_item" | "type_item"
+                "function_item"
+                    | "struct_item"
+                    | "enum_item"
+                    | "union_item"
+                    | "trait_item"
+                    | "impl_item"
+                    | "mod_item"
+                    | "macro_definition"
+                    | "static_item"
+                    | "const_item"
+                    | "type_item"
             ),
             Grammar::Python => {
-                matches!(k, "function_definition" | "class_definition" | "decorated_definition")
+                matches!(
+                    k,
+                    "function_definition" | "class_definition" | "decorated_definition"
+                )
             }
             Grammar::Js | Grammar::Ts => {
                 matches!(
                     k,
-                    "function_declaration" | "generator_function_declaration"
-                        | "class_declaration" | "method_definition" | "interface_declaration"
-                        | "enum_declaration" | "type_alias_declaration"
-                        | "abstract_class_declaration" | "module_declaration"
+                    "function_declaration"
+                        | "generator_function_declaration"
+                        | "class_declaration"
+                        | "method_definition"
+                        | "interface_declaration"
+                        | "enum_declaration"
+                        | "type_alias_declaration"
+                        | "abstract_class_declaration"
+                        | "module_declaration"
                 ) || declares_function(node)
             }
             Grammar::Go => {
-                matches!(k, "function_declaration" | "method_declaration" | "type_declaration")
+                matches!(
+                    k,
+                    "function_declaration" | "method_declaration" | "type_declaration"
+                )
             }
             Grammar::Java => matches!(
                 k,
-                "class_declaration" | "interface_declaration" | "enum_declaration"
-                    | "record_declaration" | "annotation_type_declaration" | "method_declaration"
+                "class_declaration"
+                    | "interface_declaration"
+                    | "enum_declaration"
+                    | "record_declaration"
+                    | "annotation_type_declaration"
+                    | "method_declaration"
                     | "constructor_declaration"
             ),
             Grammar::C => matches!(
                 k,
-                "function_definition" | "type_definition" | "struct_specifier"
-                    | "enum_specifier" | "union_specifier"
+                "function_definition"
+                    | "type_definition"
+                    | "struct_specifier"
+                    | "enum_specifier"
+                    | "union_specifier"
             ),
             Grammar::Cpp => matches!(
                 k,
-                "function_definition" | "type_definition" | "class_specifier"
-                    | "struct_specifier" | "enum_specifier" | "union_specifier"
-                    | "namespace_definition" | "template_declaration"
+                "function_definition"
+                    | "type_definition"
+                    | "class_specifier"
+                    | "struct_specifier"
+                    | "enum_specifier"
+                    | "union_specifier"
+                    | "namespace_definition"
+                    | "template_declaration"
             ),
             Grammar::CSharp => matches!(
                 k,
-                "method_declaration" | "class_declaration" | "struct_declaration"
-                    | "interface_declaration" | "enum_declaration" | "namespace_declaration"
-                    | "file_scoped_namespace_declaration" | "constructor_declaration"
-                    | "property_declaration" | "record_declaration" | "local_function_statement"
+                "method_declaration"
+                    | "class_declaration"
+                    | "struct_declaration"
+                    | "interface_declaration"
+                    | "enum_declaration"
+                    | "namespace_declaration"
+                    | "file_scoped_namespace_declaration"
+                    | "constructor_declaration"
+                    | "property_declaration"
+                    | "record_declaration"
+                    | "local_function_statement"
             ),
             Grammar::Php => matches!(
                 k,
-                "function_definition" | "method_declaration" | "class_declaration"
-                    | "interface_declaration" | "trait_declaration" | "enum_declaration"
+                "function_definition"
+                    | "method_declaration"
+                    | "class_declaration"
+                    | "interface_declaration"
+                    | "trait_declaration"
+                    | "enum_declaration"
             ),
         }
     }
@@ -233,7 +284,10 @@ impl ParsedFile {
             let contiguous = end_row + 1 == start;
             if !attached
                 || !contiguous
-                || node.start_position().row.saturating_sub(p.start_position().row)
+                || node
+                    .start_position()
+                    .row
+                    .saturating_sub(p.start_position().row)
                     > MAX_ATTACHED_LINES
             {
                 break;
@@ -257,7 +311,11 @@ impl ParsedFile {
             .map(|n| n.start_position().row)
             .unwrap_or_else(|| named.start_position().row);
         let text = self.lines.get(row).map(|s| s.trim()).unwrap_or("");
-        let cleaned = text.trim_end_matches('{').trim_end().trim_end_matches(':').trim_end();
+        let cleaned = text
+            .trim_end_matches('{')
+            .trim_end()
+            .trim_end_matches(':')
+            .trim_end();
         crate::app::truncate(cleaned, 60)
     }
 }
@@ -298,7 +356,11 @@ mod tests {
         let p = parsed("a.rs", src);
         let s = p.scope_for(7).expect("scope");
         assert_eq!(s.header, "pub fn bar(&self) -> u32");
-        assert_eq!((s.start0, s.end0), (3, 10), "doc comment and attribute ride along");
+        assert_eq!(
+            (s.start0, s.end0),
+            (3, 10),
+            "doc comment and attribute ride along"
+        );
         // A line outside every definition scopes to nothing.
         assert!(p.scope_for(0).is_none() || p.scope_for(0).unwrap().header.contains("use"));
     }
@@ -313,7 +375,11 @@ mod tests {
         assert_eq!(s.header, "fn real()");
         assert_eq!((s.start0, s.end0), (2, 4));
         let spans = p.definition_spans(0, 5, 500);
-        assert_eq!(spans.len(), 2, "the const and the fn — no phantom items: {spans:?}");
+        assert_eq!(
+            spans.len(),
+            2,
+            "the const and the fn — no phantom items: {spans:?}"
+        );
     }
 
     #[test]
@@ -321,7 +387,11 @@ mod tests {
         let src = "#include <stdio.h>\n\nstatic int\nhelper(int a,\n       int b)\n{\n    return a + b;\n}\n";
         let p = parsed("a.c", src);
         let s = p.scope_for(6).expect("scope");
-        assert_eq!((s.start0, s.end0), (2, 7), "the return type line belongs to the function");
+        assert_eq!(
+            (s.start0, s.end0),
+            (2, 7),
+            "the return type line belongs to the function"
+        );
     }
 
     #[test]
@@ -329,7 +399,11 @@ mod tests {
         let src = "package main\n\nfunc (s *Server) Handle(w http.ResponseWriter) {\n\tif s.ok {\n\t\tserve(w)\n\t}\n}\n";
         let p = parsed("a.go", src);
         let s = p.scope_for(4).expect("scope");
-        assert!(s.header.starts_with("func (s *Server) Handle"), "{}", s.header);
+        assert!(
+            s.header.starts_with("func (s *Server) Handle"),
+            "{}",
+            s.header
+        );
     }
 
     #[test]
@@ -358,7 +432,11 @@ mod tests {
         let s = p.scope_for(3).expect("scope");
         assert!(s.header.contains("handler"), "{}", s.header);
         let spans = p.definition_spans(0, 8, 500);
-        assert_eq!(spans.len(), 2, "the export wrapper is transparent: {spans:?}");
+        assert_eq!(
+            spans.len(),
+            2,
+            "the export wrapper is transparent: {spans:?}"
+        );
     }
 
     #[test]

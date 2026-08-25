@@ -84,8 +84,8 @@ impl Corpus {
     }
 
     pub fn load(path: &std::path::Path) -> Result<Corpus, String> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| format!("read {}: {e}", path.display()))?;
+        let text =
+            std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
         serde_json::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))
     }
 
@@ -149,7 +149,9 @@ pub fn replay(
         for (_, slot) in &slots {
             // A replay is one-shot per entry, so no session id is threaded
             // through; `{session}` would be meaningless without a follow-up.
-            let command = slot.command.replace("{session}", &uuid::Uuid::new_v4().to_string());
+            let command = slot
+                .command
+                .replace("{session}", &uuid::Uuid::new_v4().to_string());
             let (result, _raw) =
                 models::run_for_eval(slot, &command, &prompt, &repo, &cli_home, timeout);
             let answer = match result {
@@ -273,7 +275,13 @@ impl Report {
             }
         }
 
-        Report { models, repeat_total, repeat_agreed, blinded, decisions }
+        Report {
+            models,
+            repeat_total,
+            repeat_agreed,
+            blinded,
+            decisions,
+        }
     }
 
     /// Build from a replay against a labelled corpus.
@@ -281,7 +289,9 @@ impl Report {
         let mut models: BTreeMap<String, ModelScore> = BTreeMap::new();
         let mut blinded = 0;
         for answer in &results.answers {
-            let Some(entry) = corpus.entries.get(answer.entry) else { continue };
+            let Some(entry) = corpus.entries.get(answer.entry) else {
+                continue;
+            };
             let score = models.entry(answer.model.clone()).or_default();
             score.judged += 1;
             if entry.blinded {
@@ -386,7 +396,9 @@ mod tests {
             end_line: line,
             raw_lines: vec!["    // a".into()],
             indent: "    ".into(),
-            style: CommentStyle::Line { prefix: "//".into() },
+            style: CommentStyle::Line {
+                prefix: "//".into(),
+            },
             context: String::new(),
             hunk_header: String::new(),
             has_added: true,
@@ -462,19 +474,28 @@ mod tests {
         let dir = crate::testkit::TempDir::new("corpus");
         let path = dir.path().join("corpus.json");
         let corpus = Corpus {
-            entries: vec![entry("rewrite", "    // better", true), entry("keep", "    // a", false)],
+            entries: vec![
+                entry("rewrite", "    // better", true),
+                entry("keep", "    // a", false),
+            ],
         };
         corpus.save(&path).unwrap();
 
         let loaded = Corpus::load(&path).unwrap();
         assert_eq!(loaded.entries.len(), 2);
         assert_eq!(loaded.entries[0].action, "rewrite");
-        assert!(!loaded.entries[0].unit.is_code(), "the kind must survive the round trip");
+        assert!(
+            !loaded.entries[0].unit.is_code(),
+            "the kind must survive the round trip"
+        );
         assert!(loaded.entries[0].blinded);
         assert!(!loaded.entries[1].blinded);
         // The unit has to survive intact, or a replay is not asking the same
         // question the human answered.
-        assert_eq!(loaded.entries[0].unit.raw_lines(), vec!["    // a".to_string()]);
+        assert_eq!(
+            loaded.entries[0].unit.raw_lines(),
+            vec!["    // a".to_string()]
+        );
     }
 
     #[test]
@@ -532,8 +553,15 @@ mod tests {
         assert_eq!(m1.judged, 3);
         assert_eq!(m1.errors, 0);
         assert_eq!(m1.action_agreed, 2);
-        assert!((m1.agreement_pct() - 66.6).abs() < 1.0, "{}", m1.agreement_pct());
-        assert_eq!(m1.accepted, 1, "the matching rewrite should count as accepted");
+        assert!(
+            (m1.agreement_pct() - 66.6).abs() < 1.0,
+            "{}",
+            m1.agreement_pct()
+        );
+        assert_eq!(
+            m1.accepted, 1,
+            "the matching rewrite should count as accepted"
+        );
         assert_eq!(m1.mean_latency_ms(), 200);
 
         let m2 = &report.models["m2"];
@@ -606,11 +634,16 @@ mod tests {
 
     #[test]
     fn the_report_says_what_it_does_not_know() {
-        let corpus = Corpus { entries: vec![entry("keep", "    // a", false)] };
+        let corpus = Corpus {
+            entries: vec![entry("keep", "    // a", false)],
+        };
         let results = ReplayResults { answers: vec![] };
         let text = Report::from_replay(&corpus, &results).render();
         assert!(text.contains("self-agreement: unknown"), "{text}");
-        assert!(text.contains("names\n visible") || text.contains("names"), "{text}");
+        assert!(
+            text.contains("names\n visible") || text.contains("names"),
+            "{text}"
+        );
         assert!(text.contains("not with any ground truth"), "{text}");
     }
 }

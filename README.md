@@ -19,6 +19,28 @@ Either kind can be switched off in Settings; both are on by default. A comment r
 *between* changed code lines is judged with that code rather than separately — units in a
 file stay disjoint and ordered so sequential edits land exactly where they should.
 
+## Installation
+
+Install the latest binary release for your platform:
+
+### Linux x86_64
+
+```sh
+tmp="$(mktemp)" && curl -fsSL https://github.com/ericfourfour/code-review-assistant/releases/latest/download/code-review-assistant-linux-x86_64 -o "$tmp" && sudo mkdir -p /usr/local/bin && sudo install -m 0755 "$tmp" /usr/local/bin/code-review-assistant && rm -f "$tmp"
+```
+
+### macOS Apple Silicon
+
+```sh
+tmp="$(mktemp)" && curl -fsSL https://github.com/ericfourfour/code-review-assistant/releases/latest/download/code-review-assistant-macos-arm64 -o "$tmp" && sudo mkdir -p /usr/local/bin && sudo install -m 0755 "$tmp" /usr/local/bin/code-review-assistant && rm -f "$tmp"
+```
+
+### Windows x86_64 (PowerShell)
+
+```powershell
+$ErrorActionPreference = 'Stop'; $dir = Join-Path $env:LOCALAPPDATA 'Programs\code-review-assistant'; New-Item -ItemType Directory -Force $dir | Out-Null; Invoke-WebRequest 'https://github.com/ericfourfour/code-review-assistant/releases/latest/download/code-review-assistant-windows-x86_64.exe' -OutFile (Join-Path $dir 'code-review-assistant.exe'); $userPath = [Environment]::GetEnvironmentVariable('Path', 'User'); if (($userPath -split ';') -notcontains $dir) { [Environment]::SetEnvironmentVariable('Path', ("$userPath;$dir").Trim(';'), 'User') }; if (($env:Path -split ';') -notcontains $dir) { $env:Path = "$env:Path;$dir" }
+```
+
 ## Flow
 
 ```
@@ -238,6 +260,14 @@ cargo run --release
 Requires `git` on PATH; `gh` (authenticated) for the PR picker; and whichever model CLIs you
 configure. `cargo test` runs the unit tests (diff parsing, comment and code-unit extraction,
 scope detection, provenance, edit application and revert, validation, model-output parsing).
+
+Run the same checks used in pull requests with:
+
+```console
+cargo fmt --all --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-targets --all-features
+```
 
 ## Scope notes
 
