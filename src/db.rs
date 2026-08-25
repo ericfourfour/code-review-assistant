@@ -21,7 +21,9 @@ fn db_path() -> PathBuf {
 }
 
 fn now() -> String {
-    chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string()
+    chrono::Local::now()
+        .format("%Y-%m-%d %H:%M:%S%.3f")
+        .to_string()
 }
 
 impl Db {
@@ -98,7 +100,11 @@ impl Db {
 
     pub fn get_setting(&self, key: &str) -> Option<String> {
         self.conn
-            .query_row("SELECT value FROM settings WHERE key = ?1", params![key], |r| r.get(0))
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![key],
+                |r| r.get(0),
+            )
             .ok()
     }
 
@@ -136,8 +142,19 @@ impl Db {
             "INSERT INTO suggestions(ts, session_id, file, line_start, line_end, model,
                                      action, comment, justification, latency_ms, error)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![now(), session_id, file, line_start, line_end, model, action, comment,
-                    justification, latency_ms, error],
+            params![
+                now(),
+                session_id,
+                file,
+                line_start,
+                line_end,
+                model,
+                action,
+                comment,
+                justification,
+                latency_ms,
+                error
+            ],
         );
     }
 

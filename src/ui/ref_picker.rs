@@ -81,21 +81,29 @@ impl CraApp {
         }
         ui.add_space(4.0);
 
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            match self.ref_tab {
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| match self.ref_tab {
                 RefTab::Branches => {
-                    let default = self.repo.as_ref().map(|r| r.default_branch.clone()).unwrap_or_default();
+                    let default = self
+                        .repo
+                        .as_ref()
+                        .map(|r| r.default_branch.clone())
+                        .unwrap_or_default();
                     for (i, b) in self.branches.clone().iter().enumerate() {
                         let is_base = b.name == default;
                         let mut text = format!(
                             "{:<40} {} {:>18}  {}",
-                            b.name, b.sha, b.age,
+                            b.name,
+                            b.sha,
+                            b.age,
                             crate::app::truncate(&b.subject, 60)
                         );
                         if is_base {
                             text.push_str("  [base]");
                         }
-                        let resp = ui.selectable_label(i == self.ref_sel, RichText::new(text).monospace());
+                        let resp =
+                            ui.selectable_label(i == self.ref_sel, RichText::new(text).monospace());
                         if resp.clicked() {
                             self.ref_sel = i;
                         }
@@ -118,7 +126,11 @@ impl CraApp {
                         ui.colored_label(theme::BAD, format!("gh: {e}"));
                     }
                     for (i, pr) in self.prs.clone().iter().enumerate() {
-                        let author = pr.author.as_ref().map(|a| a.login.clone()).unwrap_or_default();
+                        let author = pr
+                            .author
+                            .as_ref()
+                            .map(|a| a.login.clone())
+                            .unwrap_or_default();
                         let text = format!(
                             "#{:<5} {:<60} {} → {}  @{}",
                             pr.number,
@@ -127,7 +139,8 @@ impl CraApp {
                             pr.base_ref,
                             author
                         );
-                        let resp = ui.selectable_label(i == self.ref_sel, RichText::new(text).monospace());
+                        let resp =
+                            ui.selectable_label(i == self.ref_sel, RichText::new(text).monospace());
                         if resp.clicked() {
                             self.ref_sel = i;
                         }
@@ -139,8 +152,7 @@ impl CraApp {
                         ui.label(theme::dim("no open PRs"));
                     }
                 }
-            }
-        });
+            });
 
         match action {
             Some(RefAction::Branch(name)) => self.select_branch(&name),

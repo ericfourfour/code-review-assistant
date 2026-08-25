@@ -51,7 +51,10 @@ pub fn parse(diff: &str) -> Vec<DiffFile> {
                 cur_file = None;
             } else {
                 let path = path.strip_prefix("b/").unwrap_or(path);
-                cur_file = Some(DiffFile { path: path.to_string(), hunks: Vec::new() });
+                cur_file = Some(DiffFile {
+                    path: path.to_string(),
+                    hunks: Vec::new(),
+                });
             }
         } else if line.starts_with("@@") {
             close_hunk(&mut cur_file, &mut cur_hunk);
@@ -106,7 +109,12 @@ pub fn parse(diff: &str) -> Vec<DiffFile> {
                     (Some(o), Some(n))
                 }
             };
-            h.lines.push(HunkLine { origin, text: text.to_string(), new_lineno, old_lineno });
+            h.lines.push(HunkLine {
+                origin,
+                text: text.to_string(),
+                new_lineno,
+                old_lineno,
+            });
         }
     }
     close_hunk(&mut cur_file, &mut cur_hunk);
@@ -148,7 +156,10 @@ index 111..222 100644
         let added: Vec<_> = h.lines.iter().filter(|l| l.origin == '+').collect();
         assert_eq!(added.len(), 3);
         assert_eq!(added[0].new_lineno, Some(2));
-        assert_eq!(added[0].text, "    // Increment the counter by one to increment it");
+        assert_eq!(
+            added[0].text,
+            "    // Increment the counter by one to increment it"
+        );
         // context line after the removal keeps correct numbering
         let last = h.lines.iter().rev().find(|l| l.origin == ' ').unwrap();
         assert_eq!(last.new_lineno, Some(6));

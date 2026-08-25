@@ -122,10 +122,16 @@ fn run_model(slot: &ModelSlot, prompt: &str, timeout: Duration) -> Result<Sugges
     let started = Instant::now();
     let mut cmd = crate::gitio::hidden_command(&argv[0]);
     cmd.args(&argv[1..])
-        .stdin(if via_stdin { Stdio::piped() } else { Stdio::null() })
+        .stdin(if via_stdin {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = cmd.spawn().map_err(|e| format!("spawn `{}`: {e}", argv[0]))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("spawn `{}`: {e}", argv[0]))?;
     if via_stdin {
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(prompt.as_bytes());
@@ -184,7 +190,12 @@ pub fn spawn_model(
 ) {
     std::thread::spawn(move || {
         let result = run_model(&slot, &prompt, Duration::from_secs(timeout_secs.max(5)));
-        send(CandidateMsg { seq, slot_idx, model: slot.name.clone(), result });
+        send(CandidateMsg {
+            seq,
+            slot_idx,
+            model: slot.name.clone(),
+            result,
+        });
         ctx.request_repaint();
     });
 }

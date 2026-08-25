@@ -24,7 +24,9 @@ impl CraApp {
                 let removed = self.settings.recent_repos.remove(self.repo_sel);
                 self.settings.save(&self.db);
                 self.note("repo", &format!("forgot {removed}"));
-                self.repo_sel = self.repo_sel.min(self.settings.recent_repos.len().saturating_sub(1));
+                self.repo_sel = self
+                    .repo_sel
+                    .min(self.settings.recent_repos.len().saturating_sub(1));
             }
         }
 
@@ -38,8 +40,7 @@ impl CraApp {
                     .desired_width(420.0)
                     .font(egui::TextStyle::Monospace),
             );
-            let submitted =
-                resp.lost_focus() && ctx.input(|i| i.key_pressed(Key::Enter));
+            let submitted = resp.lost_focus() && ctx.input(|i| i.key_pressed(Key::Enter));
             if ui.button("Add + open").clicked() || submitted {
                 let p = self.repo_input.clone();
                 if !p.trim().is_empty() {
@@ -54,26 +55,25 @@ impl CraApp {
         ui.add_space(8.0);
         theme::section_title(ui, "RECENT REPOSITORIES");
         let mut open: Option<String> = None;
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            for (i, path) in self.settings.recent_repos.clone().iter().enumerate() {
-                let selected = i == self.repo_sel;
-                let name = crate::gitio::repo_name(path);
-                let label = format!("{name}  —  {path}");
-                let resp = ui.selectable_label(
-                    selected,
-                    RichText::new(label).monospace(),
-                );
-                if resp.clicked() {
-                    self.repo_sel = i;
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for (i, path) in self.settings.recent_repos.clone().iter().enumerate() {
+                    let selected = i == self.repo_sel;
+                    let name = crate::gitio::repo_name(path);
+                    let label = format!("{name}  —  {path}");
+                    let resp = ui.selectable_label(selected, RichText::new(label).monospace());
+                    if resp.clicked() {
+                        self.repo_sel = i;
+                    }
+                    if resp.double_clicked() {
+                        open = Some(path.clone());
+                    }
                 }
-                if resp.double_clicked() {
-                    open = Some(path.clone());
+                if self.settings.recent_repos.is_empty() {
+                    ui.label(theme::dim("none yet — enter a path above"));
                 }
-            }
-            if self.settings.recent_repos.is_empty() {
-                ui.label(theme::dim("none yet — enter a path above"));
-            }
-        });
+            });
         if let Some(p) = open {
             self.select_repo(p);
         }

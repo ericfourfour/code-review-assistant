@@ -248,7 +248,8 @@ impl CraApp {
         let path = repo.path.clone();
         if gitio::is_dirty(&path) {
             self.ref_error = Some(
-                "working tree has uncommitted changes; commit/stash before checking out a PR".into(),
+                "working tree has uncommitted changes; commit/stash before checking out a PR"
+                    .into(),
             );
             return;
         }
@@ -257,7 +258,11 @@ impl CraApp {
             self.ref_error = Some(e);
             return;
         }
-        self.build_plan(RefKind::Pr(pr.number), pr.head_ref.clone(), pr.base_ref.clone());
+        self.build_plan(
+            RefKind::Pr(pr.number),
+            pr.head_ref.clone(),
+            pr.base_ref.clone(),
+        );
     }
 
     fn build_plan(&mut self, kind: RefKind, ref_name: String, base: String) {
@@ -286,11 +291,21 @@ impl CraApp {
         let n_units: usize = extracted.iter().map(|(_, u)| u.len()).sum();
         let review_files = extracted
             .into_iter()
-            .map(|(path, units)| ReviewFile { path, units, line_offset: 0, decided: 0 })
+            .map(|(path, units)| ReviewFile {
+                path,
+                units,
+                line_offset: 0,
+                decided: 0,
+            })
             .collect::<Vec<_>>();
         self.note(
             "session",
-            &format!("#{session_id} {} — {} comments in {} files", ref_name, n_units, review_files.len()),
+            &format!(
+                "#{session_id} {} — {} comments in {} files",
+                ref_name,
+                n_units,
+                review_files.len()
+            ),
         );
         self.plan = Some(ReviewPlan {
             session_id,
@@ -330,7 +345,8 @@ impl CraApp {
         self.review_error = None;
 
         let Some((unit, file, line)) = self.plan.as_ref().and_then(|p| {
-            p.current().map(|(_, u)| (u.clone(), u.file.clone(), u.start_line))
+            p.current()
+                .map(|(_, u)| (u.clone(), u.file.clone(), u.start_line))
         }) else {
             self.screen = Screen::Summary;
             return;
@@ -347,7 +363,13 @@ impl CraApp {
             .settings
             .models
             .iter()
-            .map(|m| if m.enabled { CandidateState::Pending } else { CandidateState::Disabled })
+            .map(|m| {
+                if m.enabled {
+                    CandidateState::Pending
+                } else {
+                    CandidateState::Disabled
+                }
+            })
             .collect();
         for (idx, slot) in self.settings.enabled_models() {
             let tx = self.tx.clone();
@@ -367,13 +389,19 @@ impl CraApp {
     }
 
     pub fn current_unit(&self) -> Option<CommentUnit> {
-        self.plan.as_ref().and_then(|p| p.current().map(|(_, u)| u.clone()))
+        self.plan
+            .as_ref()
+            .and_then(|p| p.current().map(|(_, u)| u.clone()))
     }
 
     pub fn choose_candidate(&mut self, slot_idx: usize) {
-        let Some(CandidateState::Ready(s)) = self.candidates.get(slot_idx) else { return };
+        let Some(CandidateState::Ready(s)) = self.candidates.get(slot_idx) else {
+            return;
+        };
         let s = s.clone();
-        let Some(unit) = self.current_unit() else { return };
+        let Some(unit) = self.current_unit() else {
+            return;
+        };
         let text = match s.action {
             Action::Keep => self.original_display.clone(),
             Action::Delete => String::new(),
@@ -403,14 +431,20 @@ impl CraApp {
     /// Shared save/commit path. Applies the editor content to the working
     /// tree, logs the decision, optionally commits, then advances.
     pub fn save_and_continue(&mut self, ctx: &egui::Context, commit: bool) {
-        let Some(unit) = self.current_unit() else { return };
-        let Some(repo_path) = self.repo.as_ref().map(|r| r.path.clone()) else { return };
+        let Some(unit) = self.current_unit() else {
+            return;
+        };
+        let Some(repo_path) = self.repo.as_ref().map(|r| r.path.clone()) else {
+            return;
+        };
 
         let action = review::final_action(&self.editor, &self.original_display);
         let chosen_model = match &self.chosen {
-            Some(Choice::Candidate(i)) => {
-                self.settings.models.get(*i).map(|m| (m.name.clone(), m.coauthor.clone()))
-            }
+            Some(Choice::Candidate(i)) => self
+                .settings
+                .models
+                .get(*i)
+                .map(|m| (m.name.clone(), m.coauthor.clone())),
             _ => None,
         };
         let provenance = review::derive_provenance(
@@ -452,7 +486,8 @@ impl CraApp {
             if action == Action::Keep {
                 self.note("commit", "kept original — nothing to commit");
             } else {
-                let msg = review::commit_message(&unit, action, &provenance, justification.as_deref());
+                let msg =
+                    review::commit_message(&unit, action, &provenance, justification.as_deref());
                 match gitio::stage_and_commit(&repo_path, &unit.file, &msg) {
                     Ok(s) => {
                         committed = true;
@@ -488,7 +523,13 @@ impl CraApp {
         );
         self.note(
             "decision",
-            &format!("{} {}:{} ({})", action.as_str(), unit.file, unit.start_line, provenance.source_str()),
+            &format!(
+                "{} {}:{} ({})",
+                action.as_str(),
+                unit.file,
+                unit.start_line,
+                provenance.source_str()
+            ),
         );
 
         if let Some(plan) = &mut self.plan {
@@ -547,7 +588,8 @@ impl CraApp {
 
     fn handle_candidate(&mut self, c: CandidateMsg) {
         if c.seq != self.review_seq {
-            self.db.log("stale", &format!("discarded late reply from {}", c.model));
+            self.db
+                .log("stale", &format!("discarded late reply from {}", c.model));
             return;
         }
         let (file, start, end) = self
@@ -569,15 +611,31 @@ impl CraApp {
                     s.latency_ms,
                     None,
                 );
-                self.note("model", &format!("{} → {} ({} ms)", c.model, s.action.label(), s.latency_ms));
+                self.note(
+                    "model",
+                    &format!("{} → {} ({} ms)", c.model, s.action.label(), s.latency_ms),
+                );
                 if let Some(slot) = self.candidates.get_mut(c.slot_idx) {
                     *slot = CandidateState::Ready(s);
                 }
             }
             Err(e) => {
-                self.db
-                    .log_suggestion(session_id, &file, start, end, &c.model, None, None, None, 0, Some(&e));
-                self.note("model", &format!("{} failed: {}", c.model, truncate(&e, 120)));
+                self.db.log_suggestion(
+                    session_id,
+                    &file,
+                    start,
+                    end,
+                    &c.model,
+                    None,
+                    None,
+                    None,
+                    0,
+                    Some(&e),
+                );
+                self.note(
+                    "model",
+                    &format!("{} failed: {}", c.model, truncate(&e, 120)),
+                );
                 if let Some(slot) = self.candidates.get_mut(c.slot_idx) {
                     *slot = CandidateState::Failed(e);
                 }

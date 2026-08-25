@@ -113,7 +113,11 @@ pub enum Choice {
 /// Provenance of the final text, derived at save time.
 pub enum Provenance {
     Unchanged,
-    Model { name: String, coauthor: String, edited: bool },
+    Model {
+        name: String,
+        coauthor: String,
+        edited: bool,
+    },
     Human,
 }
 
@@ -121,8 +125,14 @@ impl Provenance {
     pub fn source_str(&self) -> String {
         match self {
             Provenance::Unchanged => "original".into(),
-            Provenance::Model { name, edited: false, .. } => name.clone(),
-            Provenance::Model { name, edited: true, .. } => format!("{name}+human-edited"),
+            Provenance::Model {
+                name,
+                edited: false,
+                ..
+            } => name.clone(),
+            Provenance::Model {
+                name, edited: true, ..
+            } => format!("{name}+human-edited"),
             Provenance::Human => "human-authored".into(),
         }
     }
@@ -142,7 +152,11 @@ pub fn derive_provenance(
     match (chosen, chosen_model) {
         (Some(Choice::Candidate(_)), Some((name, coauthor))) => {
             let edited = candidate_baseline.map(|b| b != editor_text).unwrap_or(true);
-            Provenance::Model { name: name.to_string(), coauthor: coauthor.to_string(), edited }
+            Provenance::Model {
+                name: name.to_string(),
+                coauthor: coauthor.to_string(),
+                edited,
+            }
         }
         _ => Provenance::Human,
     }
@@ -168,7 +182,8 @@ pub fn apply_edit(
     new_lines: &[String],
 ) -> Result<i64, String> {
     let path = Path::new(repo).join(&unit.file);
-    let content = std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let content =
+        std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let had_trailing_newline = content.ends_with('\n');
     let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
 
@@ -186,7 +201,10 @@ pub fn apply_edit(
     // Sanity check: the file should still contain what we think it does.
     let on_disk: Vec<&String> = lines[start..=end].iter().collect();
     let matches = on_disk.len() == unit.raw_lines.len()
-        && on_disk.iter().zip(&unit.raw_lines).all(|(a, b)| a.as_str() == b.as_str());
+        && on_disk
+            .iter()
+            .zip(&unit.raw_lines)
+            .all(|(a, b)| a.as_str() == b.as_str());
     if !matches {
         return Err(format!(
             "content mismatch at {}:{} — file changed on disk since the diff was taken",
@@ -227,7 +245,10 @@ pub fn commit_message(
         }
     }
     msg.push_str("Reviewed-with: code-review-assistant\n");
-    msg.push_str(&format!("Comment-provenance: {}\n", provenance.source_str()));
+    msg.push_str(&format!(
+        "Comment-provenance: {}\n",
+        provenance.source_str()
+    ));
     if let Provenance::Model { coauthor, .. } = provenance {
         msg.push_str(&format!("Co-authored-by: {coauthor}\n"));
     }
@@ -247,7 +268,9 @@ mod tests {
             end_line: 3,
             raw_lines: vec!["    // a".into(), "    // b".into()],
             indent: "    ".into(),
-            style: CommentStyle::Line { prefix: "//".into() },
+            style: CommentStyle::Line {
+                prefix: "//".into(),
+            },
             context: String::new(),
             hunk_header: String::new(),
             has_added: true,
@@ -298,7 +321,12 @@ mod tests {
             "fn main() {\n    // a\n    // b\n    x();\n}\n",
         )
         .unwrap();
-        let file = ReviewFile { path: "src/lib.rs".into(), units: vec![], line_offset: 0, decided: 0 };
+        let file = ReviewFile {
+            path: "src/lib.rs".into(),
+            units: vec![],
+            line_offset: 0,
+            decided: 0,
+        };
         let delta = apply_edit(
             dir.to_str().unwrap(),
             &file,

@@ -46,19 +46,21 @@ impl CraApp {
                 .iter()
                 .map(|f| (f.path.clone(), f.units.len(), f.decided))
                 .collect();
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                for (i, (path, units, decided)) in rows.iter().enumerate() {
-                    let text = format!("{path:<70} {units:>3} comments  ({decided} decided)");
-                    let resp =
-                        ui.selectable_label(i == self.file_sel, RichText::new(text).monospace());
-                    if resp.clicked() {
-                        self.file_sel = i;
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for (i, (path, units, decided)) in rows.iter().enumerate() {
+                        let text = format!("{path:<70} {units:>3} comments  ({decided} decided)");
+                        let resp = ui
+                            .selectable_label(i == self.file_sel, RichText::new(text).monospace());
+                        if resp.clicked() {
+                            self.file_sel = i;
+                        }
+                        if resp.double_clicked() {
+                            start_at = Some(i);
+                        }
                     }
-                    if resp.double_clicked() {
-                        start_at = Some(i);
-                    }
-                }
-            });
+                });
         } else {
             ui.label(theme::dim("no plan — pick a branch or PR first"));
         }

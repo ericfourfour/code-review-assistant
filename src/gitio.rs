@@ -3,9 +3,9 @@
 //! authenticated.
 
 use serde::Deserialize;
-use std::path::Path;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
+use std::path::Path;
 use std::process::Command;
 
 /// Build a `Command` that will not flash a console window on Windows. The
@@ -77,7 +77,11 @@ pub fn run(dir: &str, program: &str, args: &[&str]) -> Result<String, String> {
         Err(format!(
             "{program} {} failed: {}",
             args.join(" "),
-            if stderr.trim().is_empty() { stdout } else { stderr }
+            if stderr.trim().is_empty() {
+                stdout
+            } else {
+                stderr
+            }
         ))
     }
 }
@@ -118,13 +122,21 @@ pub fn is_dirty(dir: &str) -> bool {
 
 /// Resolve the repo's default branch: origin/HEAD if set, else the fallback.
 pub fn default_branch(dir: &str, fallback: &str) -> String {
-    if let Ok(s) = git(dir, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]) {
+    if let Ok(s) = git(
+        dir,
+        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+    ) {
         if let Some(b) = s.trim().strip_prefix("origin/") {
             return b.to_string();
         }
     }
     for cand in [fallback, "main", "master"] {
-        if git(dir, &["rev-parse", "--verify", &format!("refs/heads/{cand}")]).is_ok() {
+        if git(
+            dir,
+            &["rev-parse", "--verify", &format!("refs/heads/{cand}")],
+        )
+        .is_ok()
+        {
             return cand.to_string();
         }
     }
@@ -228,7 +240,13 @@ pub fn open_prs(dir: &str, gh: &str) -> Result<Vec<PrInfo>, String> {
         dir,
         gh,
         &[
-            "pr", "list", "--state", "open", "--limit", "50", "--json",
+            "pr",
+            "list",
+            "--state",
+            "open",
+            "--limit",
+            "50",
+            "--json",
             "number,title,headRefName,baseRefName,author",
         ],
     )?;

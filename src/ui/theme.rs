@@ -48,11 +48,23 @@ pub fn apply(ctx: &egui::Context) {
     style.spacing.window_margin = egui::Margin::same(6.0);
     style.spacing.scroll = egui::style::ScrollStyle::thin();
     style.text_styles = [
-        (TextStyle::Heading, FontId::new(15.0, FontFamily::Proportional)),
+        (
+            TextStyle::Heading,
+            FontId::new(15.0, FontFamily::Proportional),
+        ),
         (TextStyle::Body, FontId::new(12.5, FontFamily::Proportional)),
-        (TextStyle::Monospace, FontId::new(12.0, FontFamily::Monospace)),
-        (TextStyle::Button, FontId::new(12.5, FontFamily::Proportional)),
-        (TextStyle::Small, FontId::new(10.5, FontFamily::Proportional)),
+        (
+            TextStyle::Monospace,
+            FontId::new(12.0, FontFamily::Monospace),
+        ),
+        (
+            TextStyle::Button,
+            FontId::new(12.5, FontFamily::Proportional),
+        ),
+        (
+            TextStyle::Small,
+            FontId::new(10.5, FontFamily::Proportional),
+        ),
     ]
     .into();
 

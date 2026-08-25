@@ -9,8 +9,15 @@ use crate::review::{self, Choice};
 use crate::ui::theme;
 
 const NUM_KEYS: [Key; 9] = [
-    Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5,
-    Key::Num6, Key::Num7, Key::Num8, Key::Num9,
+    Key::Num1,
+    Key::Num2,
+    Key::Num3,
+    Key::Num4,
+    Key::Num5,
+    Key::Num6,
+    Key::Num7,
+    Key::Num8,
+    Key::Num9,
 ];
 
 impl CraApp {
@@ -62,9 +69,12 @@ impl CraApp {
         // ---- header ----
         ui.horizontal(|ui| {
             ui.label(
-                RichText::new(format!("{}:{}-{}", unit.file, unit.start_line, unit.end_line))
-                    .monospace()
-                    .strong(),
+                RichText::new(format!(
+                    "{}:{}-{}",
+                    unit.file, unit.start_line, unit.end_line
+                ))
+                .monospace()
+                .strong(),
             );
             theme::badge(ui, &unit.lang, theme::ACCENT);
             if let Some(p) = &self.plan {
@@ -125,16 +135,27 @@ impl CraApp {
                 let is_chosen = self.chosen == Some(Choice::Candidate(i));
                 let color = theme::model_color(i);
                 let frame = egui::Frame::group(ui.style())
-                    .fill(if is_chosen { theme::RAISED } else { theme::PANEL })
+                    .fill(if is_chosen {
+                        theme::RAISED
+                    } else {
+                        theme::PANEL
+                    })
                     .stroke(egui::Stroke::new(
-                        if is_chosen { 2.0 } else { 1.0 },
-                        if is_chosen { color } else { egui::Color32::from_gray(50) },
+                        if is_chosen { 2.0_f32 } else { 1.0_f32 },
+                        if is_chosen {
+                            color
+                        } else {
+                            egui::Color32::from_gray(50)
+                        },
                     ))
                     .inner_margin(egui::Margin::same(6.0));
                 frame.show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(
-                            RichText::new(format!("[{}]", i + 1)).monospace().strong().color(color),
+                            RichText::new(format!("[{}]", i + 1))
+                                .monospace()
+                                .strong()
+                                .color(color),
                         );
                         ui.label(RichText::new(&name).strong().color(color));
                         match self.candidates.get(i) {
@@ -146,7 +167,9 @@ impl CraApp {
                                 ui.spinner();
                                 ui.label(theme::dim("thinking…"));
                             }
-                            Some(CandidateState::Failed(_)) => theme::badge(ui, "ERROR", theme::BAD),
+                            Some(CandidateState::Failed(_)) => {
+                                theme::badge(ui, "ERROR", theme::BAD)
+                            }
                             _ => {
                                 ui.label(theme::dim("disabled"));
                             }
@@ -182,7 +205,11 @@ impl CraApp {
                             }
                         }
                         Some(CandidateState::Failed(e)) => {
-                            ui.label(RichText::new(crate::app::truncate(e, 220)).small().color(theme::BAD));
+                            ui.label(
+                                RichText::new(crate::app::truncate(e, 220))
+                                    .small()
+                                    .color(theme::BAD),
+                            );
                         }
                         _ => {}
                     }
