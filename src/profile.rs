@@ -123,10 +123,19 @@ mod tests {
     #[test]
     fn follow_up_questions_are_quoted_in_full_and_newest_first() {
         let (_dir, db) = db("profile_questions");
-        db.log_follow_up(1, "a.rs", 1, 1, 2, "Why does this comment restate the code?");
+        db.log_follow_up(
+            1,
+            "a.rs",
+            1,
+            1,
+            2,
+            "Why does this comment restate the code?",
+        );
         db.log_follow_up(1, "b.rs", 9, 9, 2, "This test needs to say why.");
         let p = preamble(&db, "").expect("preamble");
-        assert!(p.contains("- This test needs to say why.\n- Why does this comment restate the code?"));
+        assert!(
+            p.contains("- This test needs to say why.\n- Why does this comment restate the code?")
+        );
     }
 
     #[test]
@@ -146,12 +155,16 @@ mod tests {
         }
         db.log_follow_up(1, "a.rs", 1, 1, 2, "q");
         assert!(
-            !preamble(&db, "").expect("preamble").contains("past verdicts"),
+            !preamble(&db, "")
+                .expect("preamble")
+                .contains("past verdicts"),
             "nine decisions are not a pattern"
         );
         decide(&db, 9, "rewrite");
         let p = preamble(&db, "").expect("preamble");
-        assert!(p.contains("Across 10 past verdicts this reviewer kept 9, rewrote 1, and deleted 0"));
+        assert!(
+            p.contains("Across 10 past verdicts this reviewer kept 9, rewrote 1, and deleted 0")
+        );
     }
 
     #[test]

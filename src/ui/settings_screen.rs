@@ -394,7 +394,10 @@ hidden; one that only exists on GitHub is cloned into the clone directory when o
             ui.label(theme::dim("preferences text"));
             let mined = crate::profile::mined(&self.db);
             if ui
-                .add_enabled(mined.is_some(), egui::Button::new("fill from history").small())
+                .add_enabled(
+                    mined.is_some(),
+                    egui::Button::new("fill from history").small(),
+                )
                 .on_hover_text("copy what would be mined right now into the box, to edit")
                 .on_disabled_hover_text("no follow-ups or verdicts to mine yet")
                 .clicked()
