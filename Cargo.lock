@@ -641,6 +641,7 @@ dependencies = [
  "dirs",
  "eframe",
  "egui",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

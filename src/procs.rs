@@ -594,16 +594,21 @@ pub fn kill_tree(child: &mut std::process::Child) {
     }
     #[cfg(unix)]
     {
-        // The child leads its own process group (see `gitio::hidden_command`),
-        // so the negative pid addresses the CLI and every helper it forked.
-        // TERM first, so a CLI that cleans up after itself gets the chance.
-        for sig in ["-TERM", "-KILL"] {
-            let _ = crate::gitio::hidden_command("kill")
-                .args([sig, &format!("-{pid}")])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
+        // `models::run_model` asks the child to lead a new process group. Do
+        // not trust that assumption at the point where a negative pid could
+        // otherwise signal this app's own group: verify it against the OS.
+        // Calling libc directly also avoids platform-specific parsing of a
+        // negative pid by the external `kill` utility.
+        if let Ok(pid) = libc::pid_t::try_from(pid) {
+            let owns_group = unsafe { libc::getpgid(pid) } == pid;
+            if owns_group {
+                // TERM first for orderly cleanup, then make certain inherited
+                // helpers cannot outlive the review that started them.
+                unsafe {
+                    libc::kill(-pid, libc::SIGTERM);
+                    libc::kill(-pid, libc::SIGKILL);
+                }
+            }
         }
     }
     // Whatever the platform sweep managed, make sure the process this app is
