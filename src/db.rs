@@ -294,6 +294,35 @@ impl Db {
         .unwrap_or_default()
     }
 
+    /// Labelled decisions from one repository only. Re-checking runs models
+    /// in the selected checkout, so mixing another repository's relative
+    /// paths into that plan would show them unrelated code.
+    pub fn corpus_for_repo(&self, repo: &str, limit: usize) -> Vec<CorpusRow> {
+        let Ok(mut stmt) = self.conn.prepare(
+            "SELECT d.unit_json, d.action, d.final_text, d.source, d.human_edited, d.blinded,
+                    s.repo
+             FROM decisions d
+             JOIN sessions s ON s.id = d.session_id
+             WHERE d.unit_json IS NOT NULL AND d.unit_json <> '' AND s.repo = ?1
+             ORDER BY d.id DESC LIMIT ?2",
+        ) else {
+            return Vec::new();
+        };
+        stmt.query_map(params![repo, limit as i64], |r| {
+            Ok(CorpusRow {
+                unit_json: r.get(0)?,
+                action: r.get(1)?,
+                final_text: r.get(2)?,
+                source: r.get(3)?,
+                human_edited: r.get::<_, i64>(4)? != 0,
+                blinded: r.get::<_, i64>(5)? != 0,
+                repo: r.get(6)?,
+            })
+        })
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+    }
+
     /// Every model suggestion paired with the decision the human made on the
     /// same comment. This join is the whole evaluation dataset.
     pub fn agreement_rows(&self) -> Vec<AgreementRow> {
@@ -304,7 +333,16 @@ impl Db {
              JOIN decisions d
                ON s.session_id = d.session_id
               AND s.file = d.file
-              AND s.line_start = d.line_start",
+              AND s.line_start = d.line_start
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM suggestions newer
+                 WHERE newer.session_id = s.session_id
+                   AND newer.file = s.file
+                   AND newer.line_start = s.line_start
+                   AND newer.line_end = s.line_end
+                   AND newer.model = s.model
+                   AND newer.id > s.id
+             )",
         ) else {
             return Vec::new();
         };
@@ -328,7 +366,14 @@ impl Db {
     /// much of a model's disagreement is noise rather than error.
     pub fn repeated_decisions(&self) -> Vec<(String, Vec<String>)> {
         let Ok(mut stmt) = self.conn.prepare(
-            "SELECT file || ':' || original AS key, action FROM decisions ORDER BY id ASC",
+            "SELECT COALESCE(s.repo, '') || ':' ||
+                    COALESCE(NULLIF(d.unit_json, ''),
+                             d.file || ':' || d.line_start || ':' || d.line_end || ':' || d.original)
+                    AS key,
+                    d.action
+             FROM decisions d
+             LEFT JOIN sessions s ON s.id = d.session_id
+             ORDER BY d.id ASC",
         ) else {
             return Vec::new();
         };

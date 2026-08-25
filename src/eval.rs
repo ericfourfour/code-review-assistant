@@ -54,8 +54,17 @@ pub struct Corpus {
 impl Corpus {
     /// Pull the most recent labelled decisions out of the database.
     pub fn from_db(db: &Db, limit: usize) -> Corpus {
-        let entries = db
-            .corpus(limit)
+        Self::from_rows(db.corpus(limit))
+    }
+
+    /// Pull labels for a re-check in one selected repository. Each model call
+    /// will run in that checkout, so every entry must have been judged there.
+    pub fn from_db_for_repo(db: &Db, repo: &str, limit: usize) -> Corpus {
+        Self::from_rows(db.corpus_for_repo(repo, limit))
+    }
+
+    fn from_rows(rows: Vec<crate::db::CorpusRow>) -> Corpus {
+        let entries = rows
             .into_iter()
             .filter_map(|row| {
                 let unit: CommentUnit = serde_json::from_str(&row.unit_json).ok()?;
@@ -407,6 +416,27 @@ mod tests {
         }
     }
 
+    fn log_label(db: &Db, session_id: i64, unit: &CommentUnit, action: &str, source: &str) {
+        let original = unit.raw_lines.join("\n");
+        let unit_json = serde_json::to_string(unit).unwrap();
+        db.log_decision(&crate::db::DecisionRecord {
+            session_id,
+            file: &unit.file,
+            line_start: unit.start_line,
+            line_end: unit.end_line,
+            original: &original,
+            action,
+            final_text: &original,
+            source,
+            human_edited: false,
+            committed: false,
+            commit_sha: None,
+            justification: None,
+            unit_json: Some(&unit_json),
+            blinded: true,
+        });
+    }
+
     #[test]
     fn a_corpus_entry_remembers_the_repository_it_was_judged_in() {
         let dir = crate::testkit::TempDir::new("corpus_repo");
@@ -537,6 +567,65 @@ mod tests {
         // same as for a wrong answer.
         assert_eq!(m2.agreement_pct(), 0.0);
         assert_eq!(m2.judged.saturating_sub(m2.errors), 0);
+    }
+
+    #[test]
+    fn only_the_final_model_turn_is_scored() {
+        let dir = crate::testkit::TempDir::new("final-turn");
+        let db = Db::open_at(&dir.path().join("cra.db")).expect("open test db");
+        let session = db.new_session("C:/work/widgets", "branch", "feature", "main");
+        let judged = unit("src/lib.rs", 2);
+        db.log_suggestion(
+            session,
+            &judged.file,
+            2,
+            2,
+            "m1",
+            Some("keep"),
+            Some(""),
+            Some("first answer"),
+            10,
+            None,
+        );
+        db.log_suggestion(
+            session,
+            &judged.file,
+            2,
+            2,
+            "m1",
+            Some("rewrite"),
+            Some("better"),
+            Some("follow-up answer"),
+            20,
+            None,
+        );
+        log_label(&db, session, &judged, "rewrite", "m1");
+
+        let report = Report::from_db(&db);
+        let score = &report.models["m1"];
+        assert_eq!(score.judged, 1);
+        assert_eq!(score.action_agreed, 1);
+        assert_eq!(score.accepted, 1);
+    }
+
+    #[test]
+    fn repeat_identity_includes_repository_and_unit_occurrence() {
+        let dir = crate::testkit::TempDir::new("repeat-identity");
+        let db = Db::open_at(&dir.path().join("cra.db")).expect("open test db");
+        let repo_a = db.new_session("C:/repo/a", "branch", "feature", "main");
+        let repo_a_again = db.new_session("C:/repo/a", "re-check", "past", "n/a");
+        let repo_b = db.new_session("C:/repo/b", "branch", "feature", "main");
+        let at_two = unit("src/lib.rs", 2);
+        let at_nine = unit("src/lib.rs", 9);
+
+        log_label(&db, repo_a, &at_two, "keep", "original");
+        log_label(&db, repo_a_again, &at_two, "delete", "human-authored");
+        log_label(&db, repo_b, &at_two, "keep", "original");
+        log_label(&db, repo_a, &at_nine, "keep", "original");
+
+        let report = Report::from_db(&db);
+        assert_eq!(report.repeat_total, 1);
+        assert_eq!(report.repeat_agreed, 0);
     }
 
     #[test]

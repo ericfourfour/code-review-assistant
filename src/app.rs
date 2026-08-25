@@ -315,6 +315,10 @@ impl CraApp {
             ));
             return;
         }
+        // These belong to the plan being left, not merely to a relative file
+        // path that a later repository or session might happen to share.
+        self.pending.clear();
+        self.commit_each = false;
         let session_id =
             self.db
                 .new_session(&path, &kind.label(), &ref_name, gitio::base_label(&base));
@@ -372,10 +376,17 @@ impl CraApp {
     /// much of a model's disagreement is noise rather than error — without it
     /// an agreement score has no scale to be read against.
     pub fn start_recheck(&mut self, ctx: &egui::Context, limit: usize) {
-        let corpus = crate::eval::Corpus::from_db(&self.db, limit);
+        let repo_path = self
+            .repo
+            .as_ref()
+            .map(|r| r.path.clone())
+            .unwrap_or_default();
+        let corpus = crate::eval::Corpus::from_db_for_repo(&self.db, &repo_path, limit);
         if corpus.entries.is_empty() {
-            self.ref_error =
-                Some("no past decisions to re-check yet — review some comments first".into());
+            self.ref_error = Some(
+                "no past decisions in this repository to re-check yet — review some comments first"
+                    .into(),
+            );
             return;
         }
         // Group by file so the plan looks like any other review.
@@ -392,12 +403,11 @@ impl CraApp {
             }
         }
         let n_units: usize = files.iter().map(|f| f.units.len()).sum();
-        let session_id = self.db.new_session(
-            self.repo.as_ref().map(|r| r.path.as_str()).unwrap_or(""),
-            "re-check",
-            "past decisions",
-            "n/a",
-        );
+        self.pending.clear();
+        self.commit_each = false;
+        let session_id = self
+            .db
+            .new_session(&repo_path, "re-check", "past decisions", "n/a");
         self.note(
             "session",
             &format!("#{session_id} re-check — {n_units} past comment(s)"),
@@ -621,10 +631,10 @@ impl CraApp {
         }
     }
 
-    /// Whether model identities are currently hidden. Blinding lifts once a
-    /// choice is made, so the provenance being recorded is still visible.
+    /// Whether model identities are currently hidden. Once a blind choice
+    /// reveals them, the choice is locked until it is saved.
     pub fn names_hidden(&self) -> bool {
-        self.settings.blind_review && self.chosen.is_none()
+        self.settings.blind_review && !matches!(self.chosen, Some(Choice::Candidate(_)))
     }
 
     /// What to call slot `idx` at display position `pos` right now.
@@ -646,6 +656,9 @@ impl CraApp {
     }
 
     pub fn choose_candidate(&mut self, slot_idx: usize) {
+        if self.settings.blind_review && matches!(self.chosen, Some(Choice::Candidate(_))) {
+            return;
+        }
         let Some(CandidateState::Ready(s)) = self.candidates.get(slot_idx) else {
             return;
         };
@@ -670,6 +683,9 @@ impl CraApp {
     }
 
     pub fn choose_keep(&mut self) {
+        if self.settings.blind_review && matches!(self.chosen, Some(Choice::Candidate(_))) {
+            return;
+        }
         self.editor = self.original_display.clone();
         self.candidate_baseline = None;
         self.chosen = Some(Choice::KeepOriginal);
@@ -677,6 +693,9 @@ impl CraApp {
     }
 
     pub fn choose_delete(&mut self) {
+        if self.settings.blind_review && matches!(self.chosen, Some(Choice::Candidate(_))) {
+            return;
+        }
         self.editor.clear();
         self.candidate_baseline = None;
         self.chosen = Some(Choice::Delete);
@@ -1120,7 +1139,10 @@ mod state_tests {
                 name: "test-repo".into(),
                 default_branch: "main".into(),
             });
-            app.plan = Some(Self::plan(&repo));
+            let session_id = app
+                .db
+                .new_session(&repo.path(), "branch", "feature", "main");
+            app.plan = Some(Self::plan(&repo, session_id));
             Harness {
                 app,
                 repo,
@@ -1128,7 +1150,7 @@ mod state_tests {
             }
         }
 
-        fn plan(repo: &TempRepo) -> ReviewPlan {
+        fn plan(repo: &TempRepo, session_id: i64) -> ReviewPlan {
             let diff = gitio::review_diff(&repo.path(), "main", 12).expect("diff");
             let files = crate::diffparse::parse(&diff);
             let extracted = comments::extract_units(&files, 12);
@@ -1143,7 +1165,7 @@ mod state_tests {
                 })
                 .collect();
             ReviewPlan {
-                session_id: 1,
+                session_id,
                 ref_kind: RefKind::Branch,
                 ref_name: "feature".into(),
                 base_ref: "main".into(),
@@ -1245,7 +1267,8 @@ mod state_tests {
         // would be reasoning about a different tree than the first.
         std::fs::remove_file(dir.path().join("fake.cwd")).ok();
         h.app.sessions[0] = Some("s-1".into());
-        h.app.settings.models[0].resume_command = format!("{} --resume {{session}}", cli.command());
+        h.app.candidate_models[0].resume_command =
+            format!("{} --resume {{session}}", cli.command());
         h.app.follow_up = "why?".into();
         h.app.ask_followup(&egui::Context::default(), None);
         h.settle();
@@ -1678,7 +1701,7 @@ mod state_tests {
     }
 
     #[test]
-    fn blinding_hides_names_until_a_choice_is_made() {
+    fn a_blind_choice_cannot_be_changed_after_names_are_revealed() {
         let dir = TempDir::new("blind");
         let cli = FakeCli::new(
             &dir,
@@ -1707,9 +1730,77 @@ mod state_tests {
         // Picking the first card must select whichever slot it stands for.
         h.app.choose_candidate(order[0]);
         assert_eq!(h.app.chosen, Some(Choice::Candidate(order[0])));
-        // And once chosen, the names come back so provenance is visible.
+        // Once chosen, names come back, but the newly revealed identities
+        // must not let the reviewer shop for a different answer.
         assert!(!h.app.names_hidden());
         assert!(h.app.slot_label(order[0], 0) != "model A");
+        let chosen_text = h.app.editor.clone();
+        h.app.choose_candidate(order[1]);
+        h.app.choose_delete();
+        assert_eq!(h.app.chosen, Some(Choice::Candidate(order[0])));
+        assert_eq!(h.app.editor, chosen_text);
+    }
+
+    #[test]
+    fn a_new_plan_resets_commit_mode_and_pending_decisions() {
+        let mut h = Harness::new("session-reset");
+        h.app.commit_each = true;
+        h.app.pending.push((
+            7,
+            review::PendingDecision {
+                file: "src/lib.rs".into(),
+                line: 2,
+                action: Action::Rewrite,
+                provenance: review::Provenance::Human,
+                justification: None,
+                model_info: None,
+            },
+        ));
+
+        h.app
+            .build_plan(RefKind::Branch, "feature".into(), "main".into());
+
+        assert!(!h.app.commit_each);
+        assert!(h.app.pending.is_empty());
+    }
+
+    #[test]
+    fn a_recheck_uses_only_the_selected_repository() {
+        let mut h = Harness::new("recheck-repo");
+        let selected_repo = h.repo.path();
+        let selected_session = h
+            .app
+            .db
+            .new_session(&selected_repo, "branch", "feature", "main");
+        let other_session = h
+            .app
+            .db
+            .new_session("C:/different/repo", "branch", "feature", "main");
+        let unit = h.app.current_unit().unwrap();
+        let unit_json = serde_json::to_string(&unit).unwrap();
+        for session_id in [selected_session, other_session] {
+            h.app.db.log_decision(&crate::db::DecisionRecord {
+                session_id,
+                file: &unit.file,
+                line_start: unit.start_line,
+                line_end: unit.end_line,
+                original: &unit.raw_lines.join("\n"),
+                action: "keep",
+                final_text: &unit.raw_lines.join("\n"),
+                source: "original",
+                human_edited: false,
+                committed: false,
+                commit_sha: None,
+                justification: None,
+                unit_json: Some(&unit_json),
+                blinded: true,
+            });
+        }
+
+        h.app.settings.models.clear();
+        h.app.start_recheck(&egui::Context::default(), 10);
+
+        assert_eq!(h.app.plan.as_ref().unwrap().total_units(), 1);
     }
 
     #[test]
